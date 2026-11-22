@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "description": "Canonical engineering terms <- colloquial aliases",
+  "groups": [
+    {
+      "canonical": ["rate-limit", "HTTP-429", "burst-bucket"],
+      "aliases": ["throttling", "throttled", "too many requests", "限流"]
+    },
+    {
+      "canonical": ["cold-start", "firecracker-snapshot"],
+      "aliases": ["slow boot", "container warmup", "冷启动"]
+    },
+    {
+      "canonical": ["failover-rto", "multi-region-dr"],
+      "aliases": ["region outage switch", "disaster switch", "容灾切换"]
+    }
+  ]
+}

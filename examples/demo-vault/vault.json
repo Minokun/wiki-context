@@ -1,0 +1,8 @@
+{
+  "name": "AuroraEdge Engineering KB",
+  "layout": "en",
+  "max_doc_bytes": 2097152,
+  "sensitive": false,
+  "exclude_patterns": [],
+  "ocr_image_dirs": []
+}

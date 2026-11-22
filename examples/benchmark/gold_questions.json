@@ -1,0 +1,35 @@
+{
+  "vault": "AuroraEdge Engineering KB",
+  "questions": [
+    {
+      "id": "Q1",
+      "question": "What are the Sustained_RPS, Burst_Bucket, and Max_Payload_MB limits for the Enterprise-Dedicated tier?",
+      "answerable": true,
+      "strict_groups": [["Enterprise-Dedicated"], ["12000"], ["36000"], ["64"], ["Sustained_RPS"]]
+    },
+    {
+      "id": "Q2",
+      "question": "When requests get throttled at the edge, how often do workers sync counters and what headers are returned?",
+      "answerable": true,
+      "strict_groups": [["250ms"], ["Retry-After"], ["429"]]
+    },
+    {
+      "id": "Q3",
+      "question": "How fast is container warmup p95 latency and how do we prevent PRNG reuse?",
+      "answerable": true,
+      "strict_groups": [["115ms"], ["virtio-rng", "urandom"]]
+    },
+    {
+      "id": "Q4",
+      "question": "Compare Gateway circuit-breaker trip threshold and Multi-Region DR failover RTO target.",
+      "answerable": true,
+      "strict_groups": [["5%", "15s"], ["45s"]]
+    },
+    {
+      "id": "Q5",
+      "question": "What is the Kafka partition retention period for billing events?",
+      "answerable": false,
+      "missing_expect": ["Kafka"]
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+[build-system]
+requires = []
+build-backend = "_build_backend"
+backend-path = ["."]
+
+[project]
+name = "wiki-context"
+version = "0.1.0"
+description = "Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + Zero-Hallucination MCP Gateway"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+  { name = "wiki-context contributors" }
+]
+keywords = [
+  "mcp",
+  "context-engine",
+  "rag",
+  "fts5",
+  "bm25",
+  "llm-wiki",
+  "knowledge-base",
+  "ai-agents"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Text Processing :: Indexing"
+]
+dependencies = []
+
+[project.scripts]
+wctx = "wiki_context.cli:main"
+wiki-context = "wiki_context.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
