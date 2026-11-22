@@ -38,7 +38,7 @@ from .search import (
 MAX_READ_LINES = 400
 MAX_STDIN_BYTES = 4 * 1024 * 1024
 SNAPSHOT_DRAIN_SECONDS = 30.0
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2024-11-05")
+SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 _SECRET_PATTERNS = (
     (
@@ -1098,7 +1098,7 @@ def selftest_mcp(vault: Path | str) -> int:
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_status", "arguments": {"user": "spoofed_attacker"}}},
         )
         assert r_stat and json.loads(r_stat["result"]["content"][0]["text"])["identity"] == svc.identity
-        print(f"mcp selftest: OK (vault={svc.cfg.name}, tools=6)")
+        print(f"mcp selftest: OK (vault={svc.cfg.name}, tools={len(tool_names)})")
         return 0
     finally:
         svc.close()

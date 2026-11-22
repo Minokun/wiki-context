@@ -77,7 +77,7 @@ class ExtractedDocument:
 NATIVE_SUPPORTED_EXTS = frozenset({
     ".docx", ".pptx", ".xlsx", ".pdf",
     ".md", ".markdown", ".txt", ".rst", ".csv", ".tsv",
-    ".html", ".htm", ".eml", ".ipynb", ".srt", ".vtt", ".lrc",
+    ".html", ".htm", ".eml", ".ipynb", ".srt", ".vtt", ".lrc", ".svg",
     ".rtf", ".doc", ".xls", ".ppt",
 })
 
@@ -101,6 +101,8 @@ def extract_document(path: Path | str) -> ExtractedDocument:
         return _extract_delimited(p, delimiter="\t" if ext == ".tsv" else ",")
     if ext in {".html", ".htm"}:
         return _extract_html_file(p)
+    if ext == ".svg":
+        return _extract_svg(p)
     if ext == ".eml":
         return _extract_eml(p)
     if ext == ".ipynb":
@@ -400,6 +402,39 @@ def _extract_html_file(path: Path) -> ExtractedDocument:
         page_count=1 if md else 0,
         text_char_count=chars,
         usable=chars > 0,
+    )
+
+
+def _extract_svg(path: Path) -> ExtractedDocument:
+    """Extract human-readable flowchart/architecture labels from SVG XML (`<title>`, `<desc>`, `<text>`, `foreignObject`)."""
+    try:
+        root = ET.fromstring(_read_text_smart(path))
+    except ET.ParseError as exc:
+        return ExtractedDocument("native-svg", "", [], 0, [f"SVG XML parse error: {exc}"], usable=False)
+
+    labels: list[str] = []
+    seen: set[str] = set()
+    for el in root.iter():
+        ln = _local_name(el.tag).lower()
+        if ln in {"title", "desc", "text", "div", "span", "p"}:
+            txt = _clean_text("".join(el.itertext())).strip()
+            txt = re.sub(r"\s+", " ", txt)
+            if txt and len(txt) >= 2 and txt not in seen:
+                seen.add(txt)
+                labels.append(txt)
+
+    if not labels:
+        return ExtractedDocument("native-svg", "", [], 0, ["SVG contains no text labels (decorative icon)"], usable=False)
+
+    md = f"# {path.stem}\n\n" + "\n".join(f"- {lbl}" for lbl in labels) + "\n"
+    chars = _effective_chars("\n".join(labels))
+    return ExtractedDocument(
+        method="native-svg",
+        markdown=md,
+        pages=[{"page_num": 0, "page_label": path.stem, "blocks": [{"type": "Text", "content": md, "format": "markdown"}]}],
+        page_count=1,
+        text_char_count=chars,
+        usable=chars >= 6,
     )
 
 

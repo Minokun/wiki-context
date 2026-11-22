@@ -304,11 +304,17 @@ def sync_vault(
             prev = manifest.get(rel)
             mirror_rel = f"{rel}.md"
             mirror_file = cfg.mirrors_root / mirror_rel
+            legacy_stem_mirror = (
+                cfg.mirrors_root / f"{Path(rel).with_suffix('').as_posix()}.md"
+                if p.suffix.lower() in {".txt", ".md", ".markdown", ".rst"}
+                else None
+            )
+            has_mirror = mirror_file.is_file() or (legacy_stem_mirror is not None and legacy_stem_mirror.is_file())
             if (
                 not force
                 and isinstance(prev, dict)
                 and prev.get("hash") == digest
-                and mirror_file.is_file()
+                and has_mirror
             ):
                 up_to_date += 1
                 continue
