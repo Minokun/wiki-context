@@ -9,6 +9,7 @@ Features:
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import errno
 import itertools
@@ -200,11 +201,75 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
+        "name": "kb_inspect_visual",
+        "description": (
+            "Return crisp visual diagrams, embedded Office figures, standalone images, or rendered PDF visual pages "
+            "as native MCP multimodal `image` content blocks so VLM agents can visually inspect charts and schematics."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Primary source path (e.g. `sources/specs/arch.docx` or `史料/图纸/架构图.png`).",
+                },
+                "asset": {
+                    "type": "string",
+                    "description": "Optional `asset_id` (e.g. `fig-01-diagram.png` or `page-002.png`); defaults to first visual asset.",
+                },
+            },
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "kb_remember",
+        "description": (
+            "Save a domain operational finding, field troubleshooting insight, or source-anchored errata pin into Layer-4 "
+            "`notes/` (`记忆/`). Never mutates read-only `sources/`; automatically inherits `PrefixACLPolicy` from `related_sources`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Self-contained operational fact, decision, or errata note."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["insight", "errata", "decision", "glossary"],
+                    "description": "Use `errata` to attach a high-visibility override pin onto `related_sources`.",
+                },
+                "related_sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional primary source paths (e.g. `sources/specs/rfc-042.md`) for 1-hop pinning & ACL inheritance.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional topic tags.",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "kb_forget",
+        "description": "Archive/retract an obsolete or mistaken Layer-4 memory note by `note_id`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {"type": "string", "description": "Memory note ID (e.g. `mem-20261122-...`)."},
+            },
+            "required": ["note_id"],
+        },
+    },
+    {
         "name": "kb_status",
         "description": "Return index generation id, document/section counts, skip statistics, and coverage boundaries.",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
+
+
+MAX_VISUAL_IMAGE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -217,6 +282,7 @@ class KBSnapshot:
     mirror_by_source: dict[str, Path]
     pages_by_source: dict[str, list[dict]]
     duplicates_by_source: dict[str, list[str]]
+    assets_by_source: dict[str, list[dict]]
 
 
 class KBService:
@@ -310,6 +376,18 @@ class KBService:
                 if not is_excluded_source(src, self.exclude_patterns):
                     pages_by_source.setdefault(src, []).append(row)
 
+        assets_by_source: dict[str, list[dict]] = {}
+        for src, m_cand in mirror_by_source.items():
+            sc_path = m_cand.with_suffix("")  # `<rel>.md` -> `<rel>`
+            sc_json = Path(str(sc_path) + ".json")
+            if sc_json.is_file():
+                try:
+                    sc_data = json.loads(sc_json.read_text(encoding="utf-8"))
+                    if isinstance(sc_data, dict) and sc_data.get("assets"):
+                        assets_by_source[src] = list(sc_data["assets"])
+                except (OSError, ValueError):
+                    pass
+
         gen_id = str(summary.get("generation_id") or gen_dir.name)
         return KBSnapshot(
             generation_id=gen_id,
@@ -320,6 +398,7 @@ class KBService:
             mirror_by_source=mirror_by_source,
             pages_by_source=pages_by_source,
             duplicates_by_source=duplicates_by_source,
+            assets_by_source=assets_by_source,
         )
 
     def _get_snapshot(self) -> KBSnapshot:
@@ -387,7 +466,7 @@ class KBService:
         cheatsheet = self.context_engine.domain_cheatsheet()
         is_zh = self.cfg.layout == "zh"
         vault_tag = f"【{self.cfg.name}】" if is_zh else f"[{self.cfg.name}] "
-        allowed = {"kb_context", "kb_read", "kb_list"} if slim_remote else None
+        allowed = {"kb_context", "kb_read", "kb_inspect_visual", "kb_list"} if slim_remote else None
         out: list[dict] = []
 
         for t in TOOLS_SPEC:
@@ -674,53 +753,203 @@ class KBService:
             "oversized_skipped": s.get("oversized_skipped", 0),
             "orphan_docs": s.get("orphan_docs", 0),
             "docs_with_visual": s.get("docs_with_visual", 0),
+            "active_memory_notes": len(self.context_engine.memory_store.list_notes(status="active")),
             "failed_count": s.get("failed_count", 0),
             "failed_sources": (s.get("failed_sources") or [])[:20],
             "generated_at": s.get("generated_at"),
         }
 
+    def tool_inspect_visual(self, args: dict, *, principal: Principal | None = None) -> tuple[list[dict] | dict, bool]:
+        snap = self._get_snapshot()
+        user = principal or Principal(uid=self.identity)
+        raw_src = str(args.get("source") or "").strip().replace("\\", "/")
+        if not raw_src or ".." in raw_src.split("/"):
+            return {"error": "Invalid or disallowed source path"}, True
+        if not self.cfg.is_source_ref(raw_src):
+            return {"error": f"Source must start with '{self.cfg.source_prefix}'"}, True
+
+        norm_src = self.cfg.normalize_source_ref(raw_src)
+        if is_excluded_source(norm_src, self.exclude_patterns):
+            return {"error": f"Source excluded by vault policy: {norm_src}"}, True
+        if not self.policy.can_access_source(user, norm_src):
+            return {"error": f"Access denied (无权访问): {norm_src}"}, True
+
+        rel_s = self.cfg.strip_source_prefix(norm_src)
+        assets = list(snap.assets_by_source.get(norm_src) or ())
+
+        # Also support direct standalone images inside `sources/` even if not yet mirrored
+        s_root = self.cfg.sources_root.resolve()
+        raw_file = (s_root / rel_s).resolve()
+        if not assets and s_root in raw_file.parents and raw_file.is_file() and not raw_file.is_symlink():
+            if raw_file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+                assets = [{
+                    "asset_id": raw_file.name,
+                    "name": raw_file.name,
+                    "source_direct": True,
+                    "mime": mime_map.get(raw_file.suffix.lower(), "image/png"),
+                }]
+
+        if not assets:
+            return {"error": f"No extractable visual assets found for {norm_src}"}, True
+
+        req_asset = str(args.get("asset") or "").strip()
+        chosen = assets[0]
+        if req_asset:
+            matched = next((a for a in assets if a.get("asset_id") == req_asset or a.get("name") == req_asset), None)
+            if matched is None:
+                return {
+                    "error": f"Visual asset '{req_asset}' not found for {norm_src}",
+                    "available_assets": [a.get("asset_id") for a in assets],
+                }, True
+            chosen = matched
+
+        if chosen.get("source_direct"):
+            target_img = raw_file
+            jail_root = s_root
+        else:
+            aid = str(chosen.get("asset_id") or "")
+            if not aid or "/" in aid or ".." in aid:
+                return {"error": "Invalid visual asset id"}, True
+            jail_root = (self.cfg.mirrors_root / ".assets").resolve()
+            target_img = (jail_root / rel_s / aid).resolve()
+
+        if jail_root not in target_img.parents or not target_img.is_file():
+            return {"error": f"Visual asset file missing on disk for {norm_src}"}, True
+
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(str(target_img), flags)
+            try:
+                st = os.fstat(fd)
+                if st.st_size > MAX_VISUAL_IMAGE_BYTES:
+                    return {"error": f"Visual asset exceeds {MAX_VISUAL_IMAGE_BYTES} bytes"}, True
+                img_bytes = os.read(fd, st.st_size)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            return {"error": f"Failed to read visual asset: {exc}"}, True
+
+        mime = str(chosen.get("mime") or "image/png")
+        meta_summary = {
+            "source": norm_src,
+            "asset": chosen.get("asset_id"),
+            "mime": mime,
+            "bytes": len(img_bytes),
+            "available_assets": [a.get("asset_id") for a in assets],
+        }
+        blocks = [
+            {"type": "text", "text": json.dumps(meta_summary, ensure_ascii=False)},
+            {"type": "image", "data": base64.b64encode(img_bytes).decode("ascii"), "mimeType": mime},
+        ]
+        return blocks, False
+
+    def tool_remember(self, args: dict, *, principal: Principal | None = None, is_remote: bool = False) -> dict:
+        user = principal or Principal(uid=self.identity)
+        if is_remote and os.environ.get("WCTX_ALLOW_REMOTE_REMEMBER") != "1":
+            if not ({"admin", "all", "writer"} & set(user.groups)):
+                return {"error": "Access denied: remote memory write requires admin/writer group or WCTX_ALLOW_REMOTE_REMEMBER=1"}
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return {"error": "text must not be empty"}
+        kind = str(args.get("kind") or "insight").strip().lower()
+        rel_srcs = [str(x) for x in (args.get("related_sources") or ()) if str(x).strip()]
+        # Verify caller has read access to every source they anchor a note to
+        for s in rel_srcs:
+            norm_s = self.cfg.normalize_source_ref(s)
+            if not self.policy.can_access_source(user, norm_s):
+                return {"error": f"Access denied to related_source: {norm_s}"}
+        tags = [str(x) for x in (args.get("tags") or ()) if str(x).strip()]
+        try:
+            note = self.context_engine.memory_store.remember(
+                text,
+                kind=kind,
+                related_sources=rel_srcs,
+                tags=tags,
+                author=user.uid,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return {
+            "saved": True,
+            "note_id": note.note_id,
+            "kind": note.kind,
+            "related_sources": list(note.related_sources),
+            "file": f"{self.cfg.notes_dir}/{note.file_path.name}",
+        }
+
+    def tool_forget(self, args: dict, *, principal: Principal | None = None, is_remote: bool = False) -> dict:
+        user = principal or Principal(uid=self.identity)
+        if is_remote and os.environ.get("WCTX_ALLOW_REMOTE_REMEMBER") != "1":
+            if not ({"admin", "all", "writer"} & set(user.groups)):
+                return {"error": "Access denied: remote memory archival requires admin/writer group"}
+        nid = str(args.get("note_id") or "").strip()
+        if not nid:
+            return {"error": "note_id must not be empty"}
+        ok = self.context_engine.memory_store.update_status(nid, "archived")
+        if not ok:
+            return {"error": f"Memory note not found: {nid}"}
+        return {"archived": True, "note_id": nid}
+
     def dispatch_tool(
-        self, name: str, arguments: dict | None, *, principal: Principal | None = None
-    ) -> tuple[str, bool]:
-        """Execute an MCP tool and return ``(text_payload, is_error)``."""
+        self, name: str, arguments: dict | None, *, principal: Principal | None = None, is_remote: bool = False
+    ) -> tuple[str | list[dict], bool]:
+        """Execute an MCP tool and return ``(text_or_blocks, is_error)``."""
         args = dict(arguments) if isinstance(arguments, dict) else {}
         args.pop("user", None)  # Never trust client-supplied identity
 
         t0 = time.perf_counter()
         user = principal or Principal(uid=self.identity)
         is_err = False
+        payload_out: str | list[dict]
 
         if name == "kb_context":
             out = self.tool_context(args, principal=user)
             if "error" in out:
                 is_err = True
-                text = json.dumps(out, ensure_ascii=False)
+                payload_out = json.dumps(out, ensure_ascii=False)
             else:
-                text = out["context_markdown"]
+                payload_out = out["context_markdown"]
         elif name == "kb_search":
             out = self.tool_search(args, principal=user)
             is_err = "error" in out
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
         elif name == "kb_read":
             out = self.tool_read(args, principal=user)
             is_err = "error" in out
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
+        elif name == "kb_inspect_visual":
+            vis_res, is_err = self.tool_inspect_visual(args, principal=user)
+            if isinstance(vis_res, list):
+                out = {"asset_blocks": len(vis_res)}
+                payload_out = vis_res
+            else:
+                out = vis_res
+                payload_out = json.dumps(out, ensure_ascii=False)
         elif name == "kb_route":
             out = self.tool_route(args)
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
         elif name == "kb_list":
             out = self.tool_list(args, principal=user)
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
+        elif name == "kb_remember":
+            out = self.tool_remember(args, principal=user, is_remote=is_remote)
+            is_err = "error" in out
+            payload_out = json.dumps(out, ensure_ascii=False)
+        elif name == "kb_forget":
+            out = self.tool_forget(args, principal=user, is_remote=is_remote)
+            is_err = "error" in out
+            payload_out = json.dumps(out, ensure_ascii=False)
         elif name == "kb_status":
             out = self.tool_status(principal=user)
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
         else:
             out = {"error": f"Unknown tool: {name}"}
             is_err = True
-            text = json.dumps(out, ensure_ascii=False)
+            payload_out = json.dumps(out, ensure_ascii=False)
 
         self._write_audit(user.uid, name, args, out, round((time.perf_counter() - t0) * 1000, 2))
-        return text, is_err
+        return payload_out, is_err
 
     def _write_audit(self, uid: str, tool: str, args: dict, out: dict, elapsed_ms: float) -> None:
         if not self._audit_log:
@@ -775,7 +1004,7 @@ def handle_jsonrpc_message(
             "result": {
                 "protocolVersion": proto_ver,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": f"wiki-context ({svc.cfg.name})", "version": "0.1.0"},
+                "serverInfo": {"name": f"wiki-context ({svc.cfg.name})", "version": "0.2.0"},
             },
         }
     if method == "ping":
@@ -790,20 +1019,21 @@ def handle_jsonrpc_message(
         params = msg.get("params") or {}
         tname = str(params.get("name") or "")
         targs = params.get("arguments")
-        if slim_remote and tname not in {"kb_context", "kb_read", "kb_list"}:
+        if slim_remote and tname not in {"kb_context", "kb_read", "kb_inspect_visual", "kb_remember", "kb_forget", "kb_list"}:
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": f"Tool '{tname}' disabled on remote gateway"}], "isError": True},
             }
         try:
-            payload, is_err = svc.dispatch_tool(tname, targs, principal=principal)
+            payload, is_err = svc.dispatch_tool(tname, targs, principal=principal, is_remote=slim_remote)
         except IndexUnavailableError as exc:
             payload, is_err = json.dumps({"error": str(exc)}, ensure_ascii=False), True
+        content_blocks = payload if isinstance(payload, list) else [{"type": "text", "text": payload}]
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {"content": [{"type": "text", "text": payload}], "isError": is_err},
+            "result": {"content": content_blocks, "isError": is_err},
         }
 
     return {
@@ -852,7 +1082,8 @@ def selftest_mcp(vault: Path | str) -> int:
         assert handle_jsonrpc_message(svc, {"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
 
         r_tools = handle_jsonrpc_message(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        assert r_tools and len(r_tools["result"]["tools"]) == 6
+        tool_names = [t["name"] for t in (r_tools or {}).get("result", {}).get("tools", ())]
+        assert r_tools and {"kb_context", "kb_search", "kb_read", "kb_inspect_visual", "kb_route", "kb_list", "kb_status"}.issubset(set(tool_names))
 
         # Path traversal check
         r_trav = handle_jsonrpc_message(

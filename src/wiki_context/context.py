@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from .config import VaultConfig
+from .memory import MemoryNote, MemoryStore
 from .search import (
     BM25Index,
     CJK_RUN_RE,
@@ -301,11 +302,19 @@ def build_query_plan(
     core_tokens_raw, _ = tokenize_query(core_text_clean)
     core_token_set = set(core_tokens_raw)
 
+    primary_surface_toks = {m.group(0) for m in LATIN_NUM_RE.finditer(q.lower())}
     weights: dict[str, float] = {}
     core_weights: dict[str, float] = {}
     for tok in raw_tokens:
         if tok in core_token_set:
-            w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
+            base_w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
+            # Derived sub-variants of a compound code shouldn't stack 3x-5x weight over other query concepts
+            is_derived_sub = (
+                bool(re.search(r"[a-z0-9]", tok))
+                and tok not in primary_surface_toks
+                and any(tok in g and len(g) > 1 for g in groups)
+            )
+            w = base_w * 0.48 if is_derived_sub else base_w
             weights[tok] = weights.get(tok, 0.0) + w
             core_weights[tok] = core_weights.get(tok, 0.0) + w
         else:
@@ -508,6 +517,7 @@ class ContextPackEngine:
         self.policy = policy or policy_for_vault(self.cfg)
         self.catalog = CatalogCache(self.cfg)
         self._scrub = scrub_fn or (lambda s: s)
+        self.memory_store = MemoryStore(self.vault, scrub_fn=self._scrub)
         self._inline_src_re = re.compile(
             rf"(?:{re.escape(self.cfg.sources_dir)}|sources|史料)/[^\s`\"'<>)\]）】；，,]+"
         )
@@ -639,11 +649,56 @@ class ContextPackEngine:
 
         formatted_l2 = self._format_l2_blocks(selected_l2, plan, l2_char_budget, snap=snap)
 
+        # Layer-4 Operational Memory & 1-hop Source-Anchored Errata Pins
+        retrieved_src_set: set[str] = set()
+        for s_blk in formatted_l2:
+            retrieved_src_set.add(s_blk["source"])
+            for twin in (s_blk.get("also_at") or ()):
+                retrieved_src_set.add(twin)
+
+        errata_by_src, standalone_notes = self.memory_store.match_for_context(
+            weighted_tokens=plan.weighted_tokens,
+            retrieved_sources=retrieved_src_set,
+            policy=self.policy,
+            principal=user,
+        )
+        pinned_errata_texts: list[str] = []
+        for s_blk in formatted_l2:
+            cand_srcs = [s_blk["source"], *(s_blk.get("also_at") or ())]
+            pins: list[dict] = []
+            seen_pin_ids: set[str] = set()
+            for cs in cand_srcs:
+                for enote in errata_by_src.get(cs, ()):
+                    if enote.note_id not in seen_pin_ids:
+                        seen_pin_ids.add(enote.note_id)
+                        pins.append({
+                            "id": enote.note_id,
+                            "author": enote.author,
+                            "text": enote.text,
+                        })
+                        pinned_errata_texts.append(enote.text)
+            if pins:
+                s_blk["errata_pins"] = pins
+
+        memory_blocks = [
+            {
+                "id": n.note_id,
+                "kind": n.kind,
+                "author": n.author,
+                "created_at": n.created_at,
+                "related_sources": list(n.related_sources),
+                "text": n.text,
+            }
+            for n in standalone_notes
+        ]
+
         # Step 5: Anti-hallucination missing-concept & unmirrored boundary check
         combined_text = "\n".join(
             [
                 *(w["content"] + " " + w["heading"] for w in formatted_wiki),
                 *(s["content"] + " " + s["heading"] + " " + s["source"] for s in formatted_l2),
+                *pinned_errata_texts,
+                *(m["text"] for m in memory_blocks),
             ]
         ).lower()
         missing_concepts = self._detect_missing_concepts(plan, combined_text)
@@ -654,6 +709,7 @@ class ContextPackEngine:
             plan=plan,
             wiki_blocks=formatted_wiki,
             l2_blocks=formatted_l2,
+            memory_blocks=memory_blocks,
             missing_concepts=missing_concepts,
             boundary_notes=boundary_notes,
         )
@@ -670,9 +726,11 @@ class ContextPackEngine:
             "boundary_notes": boundary_notes,
             "wiki_count": len(formatted_wiki),
             "primary_count": len(formatted_l2),
+            "memory_count": len(memory_blocks) + len(pinned_errata_texts),
             "elapsed_ms": elapsed_ms,
             "wiki_hits": formatted_wiki,
             "primary_hits": formatted_l2,
+            "memory_hits": memory_blocks,
             "context_markdown": context_md,
         }
 
@@ -877,13 +935,26 @@ class ContextPackEngine:
         return picked
 
     @staticmethod
-    def _is_near_duplicate(cand_text: str, picked_sets: list[set[str]]) -> bool:
-        if not cand_text or not picked_sets:
+    def _fold_into_picked(cand: dict, picked: list[dict], picked_sets: list[set[str]]) -> bool:
+        """Return True if ``cand`` is a cross-source near-duplicate of an already-picked chunk (recording provenance)."""
+        cand_text = cand.get("text") or ""
+        cand_src = cand.get("source") or ""
+        if not cand_text or not picked:
             return False
         ctoks = set(tokenize(cand_text[:1200]))
-        if len(ctoks) < 12:
+        if len(ctoks) < 10:
             return False
-        return any(pset and len(ctoks & pset) / min(len(ctoks), len(pset)) >= 0.75 for pset in picked_sets)
+        for p, pset in zip(picked, picked_sets):
+            p_src = p.get("source") or ""
+            if p_src == cand_src or not pset:
+                continue
+            overlap = len(ctoks & pset) / min(len(ctoks), len(pset))
+            if overlap >= 0.75:
+                folded = p.setdefault("_folded_sources", [])
+                if cand_src and cand_src not in folded:
+                    folded.append(cand_src)
+                return True
+        return False
 
     def _select_l2_with_elastic_cap(
         self, candidates: list[dict], facets: list[tuple[str, set[str]]], *, max_k: int
@@ -905,7 +976,7 @@ class ContextPackEngine:
             src = c.get("source") or ""
             cnt = per_src.get(src, 0)
             limit = 4 if (src == top_src and float(c.get("score") or 0.0) >= other_best * 1.4) else 3
-            if cnt >= limit or self._is_near_duplicate(c.get("text") or "", picked_sets):
+            if cnt >= limit or self._fold_into_picked(c, picked, picked_sets):
                 continue
             picked.append(c)
             picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
@@ -924,7 +995,7 @@ class ContextPackEngine:
                 if lbl.lower() in cov_blob or any(t in cov_blob for t in f_toks if len(t) >= 2):
                     continue
                 for c in candidates:
-                    if c in picked or self._is_near_duplicate(c.get("text") or "", picked_sets):
+                    if c in picked or self._fold_into_picked(c, picked, picked_sets):
                         continue
                     c_blob = f"{c.get('source', '')} {c.get('heading', '')} {c.get('text', '')[:800]}".lower()
                     if lbl.lower() in c_blob or any(t in c_blob for t in f_toks):
@@ -941,7 +1012,7 @@ class ContextPackEngine:
             if c in picked:
                 continue
             src = c.get("source") or ""
-            if per_src.get(src, 0) >= 3 or self._is_near_duplicate(c.get("text") or "", picked_sets):
+            if per_src.get(src, 0) >= 3 or self._fold_into_picked(c, picked, picked_sets):
                 continue
             picked.append(c)
             picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
@@ -1085,6 +1156,7 @@ class ContextPackEngine:
         weights = [1.30 if i == 0 else (1.10 if i == 1 else 0.90) for i in range(n)]
         w_sum = sum(weights) or 1.0
         dup_map = getattr(snap, "duplicates_by_source", {}) or {}
+        assets_map = getattr(snap, "assets_by_source", {}) or {}
         out: list[dict] = []
 
         for idx, (h, wt) in enumerate(zip(l2_hits, weights), 1):
@@ -1122,15 +1194,22 @@ class ContextPackEngine:
             elif h.get("kind") == "page" and h.get("page_num") is not None and windowed:
                 entry["read_more"] = {"source": src, "page_num": h.get("page_num")}
 
-            dups = dup_map.get(src)
+            dups = list(dup_map.get(src) or ())
+            for fs in (h.get("_folded_sources") or ()):
+                if fs not in dups and fs != src:
+                    dups.append(fs)
             if dups:
-                entry["also_at"] = dups[:3]
+                entry["also_at"] = dups[:4]
+            v_assets = assets_map.get(src)
+            if v_assets:
+                entry["visual_assets"] = [str(a.get("asset_id") or "") for a in v_assets[:4] if a.get("asset_id")]
             out.append(entry)
         return out
 
     def _detect_missing_concepts(self, plan: QueryPlan, combined_text_lower: str) -> list[str]:
         if not plan.core_concepts:
             return []
+        compact_combined = re.sub(r"[.\-/+_\s]+", "", combined_text_lower)
         missing: list[str] = []
         for lbl, tset in plan.core_concepts:
             low_lbl = lbl.lower()
@@ -1138,18 +1217,21 @@ class ContextPackEngine:
                 continue
             if low_lbl in combined_text_lower:
                 continue
+            compact_lbl = re.sub(r"[.\-/+_\s]+", "", low_lbl)
+            if len(compact_lbl) >= 3 and compact_lbl in compact_combined:
+                continue
             syns = self.synonym_book.expand(lbl)
             if any(s.lower() in combined_text_lower for s in syns):
                 continue
             if len(low_lbl) >= 3 and len(tset) >= 2 and all(t in combined_text_lower for t in tset):
                 continue
-            if (
-                len(low_lbl) == 4
-                and CJK_RUN_RE.fullmatch(low_lbl)
-                and low_lbl[:2] in combined_text_lower
-                and low_lbl[2:] in combined_text_lower
-            ):
-                continue
+            if len(low_lbl) >= 4 and CJK_RUN_RE.fullmatch(low_lbl):
+                bgs = [low_lbl[i:i + 2] for i in range(len(low_lbl) - 1)]
+                hits = sum(1 for bg in bgs if bg in combined_text_lower)
+                if (len(low_lbl) == 4 and low_lbl[:2] in combined_text_lower and low_lbl[2:] in combined_text_lower) or (
+                    len(bgs) >= 3 and hits >= len(bgs) - 1
+                ):
+                    continue
             missing.append(lbl)
         return missing
 
@@ -1204,6 +1286,7 @@ class ContextPackEngine:
         plan: QueryPlan,
         wiki_blocks: list[dict],
         l2_blocks: list[dict],
+        memory_blocks: list[dict] | None = None,
         missing_concepts: list[str],
         boundary_notes: list[str],
     ) -> str:
@@ -1269,8 +1352,30 @@ class ContextPackEngine:
                 if s.get("also_at"):
                     dup_lbl = "同内容副本亦见" if is_zh else "Identical/near-duplicate copies"
                     lines.append(f"> {dup_lbl}: {', '.join(s['also_at'])}")
+                if s.get("visual_assets"):
+                    va_list = ", ".join(s["visual_assets"])
+                    if is_zh:
+                        lines.append(f'> 🖼️ 关联高清附图: {va_list}（可按需调用 kb_inspect_visual(source="{s["source"]}") 查看原图）')
+                    else:
+                        lines.append(f'> 🖼️ Visual figures available: {va_list} (call kb_inspect_visual(source="{s["source"]}") to view image)')
+                for ep in (s.get("errata_pins") or ()):
+                    if is_zh:
+                        lines.append(f"> 📌 [原件勘误/变更通知 {ep['id']} by {ep['author']}]: {ep['text']}")
+                    else:
+                        lines.append(f"> 📌 [Errata / Field Override {ep['id']} by {ep['author']}]: {ep['text']}")
                 lines.append(s["content"].strip())
                 lines.append("")
+
+        if memory_blocks:
+            lines.append(
+                "## 附加、 领域实战经验与工作记忆（待沉淀笔记，请结合一手史料核验）"
+                if is_zh
+                else "## Operational Memory & Field Notes (Uncompiled Session/Team Notes — Verify Against Primary Sources)"
+            )
+            for m in memory_blocks:
+                refs_s = f" (refs: {', '.join(m['related_sources'])})" if m.get("related_sources") else ""
+                lines.append(f"- **[{m['id']} | {m['kind']} by {m['author']}]**{refs_s}: {m['text']}")
+            lines.append("")
 
         lines.append(
             "## 三、 缺口诊断与作答硬约束（必读）"

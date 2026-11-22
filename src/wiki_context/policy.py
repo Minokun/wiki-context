@@ -1,29 +1,41 @@
 """Document admission policy shared across sync, indexer, and MCP read gates.
 
-Only human-readable documents enter mirrors and the FTS5 index:
-- Text documents (`.md`, `.txt`, `.csv`, `.rst`) -> mirrored directly
-- Structured documents (`.docx`, `.pptx`, `.xlsx`, `.pdf`, legacy Office) -> extracted
+Only human-readable or extractable documents enter mirrors and the FTS5 index:
+- Text & transcript documents (`.md`, `.txt`, `.csv`, `.tsv`, `.rst`, `.srt`, `.vtt`, `.lrc`)
+- Rich & structured documents (`.docx`, `.pptx`, `.xlsx`, `.pdf`, `.html`, `.htm`, `.eml`, `.ipynb`, `.rtf`, legacy Office)
+- Audio/video recordings (`.mp3`, `.m4a`, `.wav`, `.mp4`, etc.) when an ASR hook is configured or explicitly synced
 - Machine logs/dumps (`.log`, `.json`, `.xml`, `.db`, `.sql`, etc.), archives,
-  media binaries, secret files (`.env`, `.pem`, `.key`), oversized exports (>2 MiB
-  by default), and pure image placeholders -> excluded with explicit skip reasons.
+  secret files (`.env`, `.pem`, `.key`), oversized exports (>2 MiB by default),
+  and pure image placeholders -> excluded with explicit skip reasons.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path, PurePosixPath
 
 from .config import DEFAULT_MAX_DOC_BYTES, VaultConfig
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 
 TEXT_EXTS = frozenset({".md", ".markdown", ".txt", ".csv", ".tsv", ".rst"})
+TRANSCRIPT_EXTS = frozenset({".srt", ".vtt", ".lrc"})
+RICH_STDLIB_EXTS = frozenset({".html", ".htm", ".eml", ".ipynb", ".rtf"})
 NATIVE_OOXML_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
 LEGACY_OFFICE_EXTS = frozenset({".doc", ".ppt", ".xls"})
 PDF_EXTS = frozenset({".pdf"})
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
+AUDIO_VIDEO_EXTS = frozenset({".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm"})
 
-READABLE_EXTS = TEXT_EXTS | NATIVE_OOXML_EXTS | LEGACY_OFFICE_EXTS | PDF_EXTS
+READABLE_EXTS = (
+    TEXT_EXTS
+    | TRANSCRIPT_EXTS
+    | RICH_STDLIB_EXTS
+    | NATIVE_OOXML_EXTS
+    | LEGACY_OFFICE_EXTS
+    | PDF_EXTS
+)
 
 SECRET_EXTS = frozenset({".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"})
 SECRET_NAMES = frozenset({
@@ -33,19 +45,18 @@ SECRET_NAMES = frozenset({
 MACHINE_DATA_EXTS = frozenset({
     ".log", ".json", ".jsonl", ".xml", ".yaml", ".yml", ".toml", ".ini",
     ".db", ".sqlite", ".sqlite3", ".sql", ".parquet", ".feather", ".npy", ".npz",
-    ".svg", ".html", ".htm", ".css", ".js", ".mjs", ".ts", ".pyc", ".Lock", ".drawnix",
+    ".svg", ".css", ".js", ".mjs", ".ts", ".pyc", ".lock", ".drawnix",
 })
 
 BINARY_MEDIA_ARCHIVE_EXTS = frozenset({
     ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
-    ".mp3", ".wav", ".m4a", ".flac", ".mp4", ".mov", ".avi", ".mkv", ".webm",
     ".exe", ".dll", ".so", ".dylib", ".bin", ".dmg", ".iso", ".apk", ".ipa",
     ".dwg", ".dxf", ".step", ".stp", ".iges", ".stl", ".blend", ".psd", ".ai",
 })
 
 SKIP_DIR_NAMES = frozenset({
     ".git", ".svn", ".hg", ".obsidian", "__pycache__", "node_modules",
-    ".tmp", ".previous", ".index", "complete",
+    ".tmp", ".previous", ".index", ".assets", "complete",
 })
 
 _PLACEHOLDER_IMG_ONLY_RE = re.compile(
@@ -86,6 +97,7 @@ def source_skip_reason(
     cfg: VaultConfig | None = None,
     explicit: bool = False,
     include_all_images: bool = False,
+    has_asr: bool | None = None,
 ) -> str | None:
     """Return human-readable skip reason for a raw file under ``sources/``, or ``None`` to admit."""
     rel = rel_from_sources.replace("\\", "/").lstrip("/")
@@ -106,12 +118,21 @@ def source_skip_reason(
     except OSError:
         return "unreadable"
 
+    # Audio/video files can legitimately exceed 2 MiB when ASR is configured
+    is_media = ext in AUDIO_VIDEO_EXTS
+    asr_ready = bool(has_asr) if has_asr is not None else bool(os.environ.get("WCTX_ASR_CMD", "").strip())
+    if is_media:
+        if explicit or asr_ready:
+            return None
+        return "audio-video-requires-asr"
+
     if st.st_size > max_bytes and not explicit:
         return f"oversized(>{max_bytes}B)"
 
     if ext in IMAGE_EXTS:
         ocr_dirs = cfg.ocr_image_dirs if cfg is not None else frozenset()
-        if explicit or include_all_images or _in_ocr_image_dir(rel, ocr_dirs):
+        vlm_ready = bool(os.environ.get("WCTX_VLM_MODEL", "").strip() and os.environ.get("WCTX_VLM_API_KEY", os.environ.get("WCTX_API_KEY", "")).strip())
+        if explicit or include_all_images or _in_ocr_image_dir(rel, ocr_dirs) or vlm_ready:
             return None
         return "image-skipped-by-default"
 
@@ -176,8 +197,13 @@ def mirror_skip_reason(
 
     if orig_ext in IMAGE_EXTS:
         ocr_dirs = cfg.ocr_image_dirs if cfg is not None else frozenset()
-        if not (explicit or _in_ocr_image_dir(rel[:-3], ocr_dirs)):
-            return "unwhitelisted-image-mirror"
+        conv = str((manifest_entry or {}).get("converter") or "")
+        if not (explicit or conv in {"vlm-caption", "cmd-ocr", "visual-asset"} or _in_ocr_image_dir(rel[:-3], ocr_dirs)):
+            if manifest_entry is None:
+                # Pre-existing image mirror generated by external OCR/MinerU
+                pass
+            else:
+                return "unwhitelisted-image-mirror"
         try:
             body = strip_frontmatter_quick(
                 mirror_path.read_text(encoding="utf-8", errors="replace")

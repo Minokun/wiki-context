@@ -26,6 +26,7 @@ from .config import VaultConfig
 from .freshness import check_vault_freshness, parse_wiki_frontmatter, snapshot_wiki_hashes, split_frontmatter
 from .indexer import rebuild_index
 from .lint import lint_vault
+from .memory import MemoryStore
 from .policy import mirror_skip_reason
 
 LLMCallable = Callable[[str, str], str]
@@ -162,12 +163,16 @@ def plan_compilation(vault: Path | str) -> dict:
             uncompiled.append({"source": src_ref, "mirror_path": m_path})
 
     stale_pages = check_vault_freshness(cfg.root, only_stale=True)
+    mem_store = MemoryStore(cfg.root)
+    active_notes = mem_store.list_notes(status="active")
     return {
         "vault": cfg.name,
         "uncompiled_sources": [u["source"] for u in uncompiled],
         "stale_pages": [s["page"] for s in stale_pages],
+        "active_notes": [n.note_id for n in active_notes],
         "_uncompiled_items": uncompiled,
         "_stale_items": stale_pages,
+        "_active_notes": active_notes,
     }
 
 
@@ -191,17 +196,20 @@ def compile_vault(
             "dry_run": True,
             "uncompiled_sources": plan["uncompiled_sources"],
             "stale_pages": plan["stale_pages"],
+            "active_notes": plan["active_notes"],
         }
 
     uncompiled_items = plan["_uncompiled_items"][:max_items]
     remaining_budget = max(0, max_items - len(uncompiled_items))
     stale_items = plan["_stale_items"][:remaining_budget]
+    active_notes = plan["_active_notes"]
 
-    if not uncompiled_items and not stale_items:
+    if not uncompiled_items and not stale_items and not active_notes:
         return {
             "vault": cfg.name,
             "compiled_pages": [],
             "refreshed_pages": [],
+            "consolidated_notes": [],
             "noop": True,
         }
 
@@ -304,6 +312,55 @@ def compile_vault(
             wp.write_text(updated_md.rstrip() + "\n", encoding="utf-8")
             refreshed_pages.append(wp.name)
 
+    # 2.5) Consolidate Layer-4 Operational Memory (`notes/` / `记忆/`) into Compiled Wiki
+    consolidated_notes: list[str] = []
+    if active_notes:
+        mem_store = MemoryStore(cfg.root)
+        notes_title = "实战经验与勘误汇总" if is_zh else "Operational-Notes-and-Errata"
+        notes_wp = cfg.wiki_root / f"{notes_title}.md"
+        existing_notes_wiki = notes_wp.read_text(encoding="utf-8", errors="replace") if notes_wp.is_file() else ""
+        all_note_srcs: list[str] = []
+        note_blobs: list[str] = []
+        for n in active_notes[:20]:
+            for rs in n.related_sources:
+                if rs not in all_note_srcs:
+                    all_note_srcs.append(rs)
+            note_blobs.append(f"- [{n.note_id} | {n.kind} | author={n.author} | refs={list(n.related_sources)}]: {n.text}")
+
+        srcs_yaml = ("\n" + "\n".join(f"  - {s}" for s in all_note_srcs)) if all_note_srcs else " []"
+        note_prompt = (
+            f"Consolidate the following verified operational field notes and errata into a clean Wiki synthesis page "
+            f"titled `{notes_title}`.\n"
+            f"Start with YAML frontmatter:\n---\ntitle: \"{notes_title}\"\ntype: synthesis\nstatus: reviewed\n"
+            f"updated: {today}\nsources:{srcs_yaml}\n---\n\n"
+            f"Include `{overview_link}` under Related Pages.\n\n"
+            + (f"=== Previous Page ===\n{existing_notes_wiki[:4000]}\n\n" if existing_notes_wiki else "")
+            + "=== Pending Operational Notes ===\n"
+            + "\n".join(note_blobs)
+        )
+        gen_notes_md = _strip_outer_markdown_fence(caller(sys_prompt, note_prompt))
+        if not gen_notes_md.startswith("---"):
+            gen_notes_md = (
+                f'---\ntitle: "{notes_title}"\ntype: synthesis\nstatus: reviewed\nupdated: {today}\n'
+                f"sources:{srcs_yaml}\n---\n\n{gen_notes_md}\n"
+            )
+        if overview_link not in gen_notes_md:
+            gen_notes_md = gen_notes_md.rstrip() + f"\n\n## {'关联页面' if is_zh else 'Related Pages'}\n\n{overview_link}\n"
+        was_existing = notes_wp.is_file()
+        notes_wp.write_text(gen_notes_md.rstrip() + "\n", encoding="utf-8")
+        if was_existing:
+            if notes_wp.name not in refreshed_pages:
+                refreshed_pages.append(notes_wp.name)
+        else:
+            compiled_pages.append(notes_wp.name)
+            catalog_additions.append((notes_wp.stem, "Consolidated operational notes & field errata"))
+
+        for n in active_notes[:20]:
+            if n.kind != "errata":
+                # Keep `errata` active so 1-hop Errata Pins remain pinned onto read-only primary chunks!
+                mem_store.update_status(n.note_id, "consolidated", consolidated_into=f"{cfg.wiki_prefix}{notes_wp.name}")
+            consolidated_notes.append(n.note_id)
+
     # 3) Update catalog (`index.md` / `目录.md`) and append `log.md` / `日志.md`
     if catalog_additions and cfg.catalog_path.is_file():
         cat_txt = cfg.catalog_path.read_text(encoding="utf-8", errors="replace").rstrip()
@@ -337,6 +394,7 @@ def compile_vault(
         "vault": cfg.name,
         "compiled_pages": compiled_pages,
         "refreshed_pages": refreshed_pages,
+        "consolidated_notes": consolidated_notes,
         "lint": lint_report,
         "index": idx_summary,
     }

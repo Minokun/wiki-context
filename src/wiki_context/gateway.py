@@ -411,7 +411,7 @@ def selftest_gateway(vault_map: dict[str, Path | str]) -> int:
         )
         with urllib.request.urlopen(req_tools, timeout=5) as r:
             tools = [x["name"] for x in json.loads(r.read())["result"]["tools"]]
-            assert tools == ["kb_context", "kb_read", "kb_list"]
+            assert {"kb_context", "kb_read", "kb_list", "kb_inspect_visual"}.issubset(set(tools))
 
         print(f"gateway selftest: OK (port={port}, vaults={list(gw.services)}, tools={tools})")
         return 0

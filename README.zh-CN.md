@@ -215,35 +215,35 @@ wctx context --vault ./我的知识库 -q "系统网关限流规则与重试要�
 │
 ├── 史料/            (sources/)          # 【第 1 层：一手事实源 —— 你手动放原始文件的地方（严格只读）】
 │   ├── 01-公共架构规范/                 #   ├─ 支持按部门、业务域、保密等级自由创建任意多级子目录
-│   │   ├── rfc-042-网关限流规范.md      #   ├─ 支持 .md / .txt / .rst / .csv / .tsv
-│   │   └── 系统总体设计v2.docx          #   └─ 支持 .docx / .pptx / .xlsx / .pdf（配合 poppler）
+│   │   ├── rfc-042-网关限流规范.md      #   ├─ 文本/表格/富格式：.md / .txt / .csv / .html / .eml / .ipynb / .srt / .vtt
+│   │   └── 系统总体设计v2.docx          #   └─ 办公与旧版格式：.docx / .pptx / .xlsx / .pdf / .doc / .xls / .ppt / .rtf
 │   ├── 02-规格与配额表/
-│   │   └── 企业版档位配额表.xlsx
-│   ├── 03-架构图与扫描件/               #   (可选：在 vault.json 列入 ocr_image_dirs 后可调 OCR 提取图片)
+│   │   └── 企业版档位配额表.xlsx        #   (原生支持合并单元格展开、并排子表切分、标题横幅识别与流程图形状文本)
+│   ├── 03-架构图与音视频/               #   (支持图片 VLM/OCR 按需识别、MCP 原生看图及 WCTX_ASR_CMD 音视频时间戳转写)
 │   ├── 90-财务与商务底价/               #   (天然对应 PrefixACLPolicy 权限隔离目录前缀)
 │   └── 99-历史废弃归档/                 #   (可在 vault.json 的 exclude_patterns 中一键屏蔽旧版干扰)
 │
-├── 史料_md/         (mirrors/)          # 【第 2 层：派生镜像与索引 —— wctx 自动生成，请勿手改】
-│   ├── .manifest.json                  #   ├─ 原件 SHA-256 与 mtime 增量同步清单
-│   ├── 01-公共架构规范/                 #   ├─ 与 史料/ 保持 1:1 相对路径镜像：
-│   │   ├── 系统总体设计v2.docx.md       #   │   ├─ 提取出的结构化 Markdown（保留完整表格行）
-│   │   └── 系统总体设计v2.docx.json     #   │   └─ 页码 / Sheet / 幻灯片行号定位伴生元数据
-│   └── .index/                         #   └─ 分代不可变检索引擎目录（Git 建议忽略）
-│       ├── current.json                #       ├─ 指向当前生效代的原子指针（支持零停机热切换）
-│       └── gen-20261122T133553Z-xxxx/  #       └─ 每一代独立只读快照（bm25.sqlite + docs/sections.jsonl）
+├── 史料_md/         (mirrors/)          # 【第 2 层：派生镜像、内嵌附图与索引 —— wctx 自动生成，请勿手改】
+│   ├── .manifest.json                  #   ├─ 原件 SHA-256 与增量同步清单
+│   ├── .assets/                        #   ├─ 自动抽取的文档内嵌架构图与按需渲染的 PDF 视觉页
+│   ├── 01-公共架构规范/                 #   ├─ 与 史料/ 保持 1:1 相对路径镜像（.md + .json 页/表/附图坐标）
+│   └── .index/                         #   └─ 分代不可变检索引擎目录（gen-<id>/bm25.sqlite，Git 建议忽略）
 │
-└── 知识库/          (wiki/)             # 【第 3 层：编译式知识页 —— 扁平一层 *.md 高层跨文档综述】
-    ├── 知识库总览.md (Overview.md)      #   ├─ 默认总入口页
-    ├── 网关限流与SLO.md                 #   ├─ 专题综述页（顶部 YAML 声明 sources 与 source_hashes）
-    └── 容器运行时与容灾切换.md          #   └─ 页面间通过 [[网关限流与SLO]] 双向链接串联
+├── 知识库/          (wiki/)             # 【第 3 层：编译式知识页 —— 扁平一层 *.md 高层跨文档综述】
+│   ├── 知识库总览.md (Overview.md)      #   ├─ 默认总入口页
+│   └── 网关限流与SLO.md                 #   └─ 专题综述页（顶部 YAML 声明 sources 与 source_hashes）
+│
+└── 记忆/            (notes/)            # 【第 4 层：领域工作记忆与原件勘误收件箱 —— 隔离存储、继承原件 ACL】
+    └── mem-20261122-xxxx.md            #   └─ kb_remember 写入的实战经验或只读原件勘误钉子；wctx compile 可晋升进知识库
 ```
 
 | 层级 / 文件 | 谁来写入？ | 核心职责与黄金守则 | 是否建议提交 Git？ |
 | :--- | :---: | :--- | :---: |
 | **`史料/` (`sources/`)** | **仅人工放入** | 唯一事实真源（Ground Truth）；引擎与 Agent **绝对只读、绝不篡改** | 中小文本规范可提交；大型二进制可用 Git LFS 或共享盘 |
-| **`史料_md/` (`mirrors/`)** | **`wctx sync` 自动生成** | 结构化 Markdown 镜像、页码坐标与 `bm25.sqlite` 索引；随时可 100% 重建 | **不提交 `.index/`**（甚至可忽略整个 `史料_md/`） |
+| **`史料_md/` (`mirrors/`)** | **`wctx sync` 自动生成** | 结构化 Markdown 镜像、内嵌附图 `.assets/` 与 `bm25.sqlite`；100% 可重建 | **不提交 `.index/`**（甚至可忽略整个 `史料_md/`） |
 | **`知识库/` (`wiki/`)** | **Agent / 人工 / `wctx compile`** | 跨多份原件提炼架构脉络、结论对比与避坑指南；**保持扁平一层 `*.md`** | **强烈建议提交**（纯文本，PR 可审计知识演进） |
-| **`目录.md` / `vault.json` / `synonyms.json`** | **Agent / 人工** | 专题索引树、库级策略配置与团队口语同义词表 | **强烈建议提交** |
+| **`记忆/` (`notes/`)** | **`kb_remember` / `wctx remember`** | 沉淀会话期领域踩坑经验与只读原件 `📌 勘误钉子`（自动继承关联原件 ACL，绝不污染一手史料；跨项目个人偏好仍交由 `magpie-memory` 管理） | **建议提交**（纯文本 Markdown，支持 `wctx compile` 巩固晋升进 Wiki） |
+| **`目录.md` / `vault.json` / `synonyms.json`** | **Agent / 人工 / `wctx synonyms mine`** | 专题索引树、库级策略配置与团队口语同义词表 | **强烈建议提交** |
 
 ---
 
@@ -352,16 +352,19 @@ wctx sync --vault ./研发知识库
 
 ## 接入 AI Agent（MCP 工具与配置）
 
-`wiki-context` 向宿主 Agent 暴露 **6 个只读、边界清晰的 MCP 工具**（多库同时挂载时会自动在工具描述前注入 `[知识库名称]` 与领域词提示，防止 Agent 调错库）：
+`wiki-context` 向宿主 Agent 暴露 **9 个职责分明、权限受控的 MCP 工具**（多库同时挂载时会自动在工具描述前注入 `[知识库名称]` 与领域词提示，防止 Agent 调错库）：
 
 | MCP 工具 | 用途说明 |
 | :--- | :--- |
-| **`kb_context`** | **首选主力工具（95% 问答只需调一次）**：自动完成同义词对齐、Wiki 导读 + 一手原件检索、表头置顶与缺词防幻觉告警 |
+| **`kb_context`** | **首选主力工具（95% 问答只需调一次）**：自动完成同义词对齐、Wiki 导读 + 一手原件检索、表头置顶、附图提示、1-hop 原件勘误钉子与缺词防幻觉告警 |
+| `kb_inspect_visual` | **原生多模态看图**：将文档内嵌架构图、独立图片或按需渲染的 PDF 视觉页以标准 MCP `image`（base64）内容块返回给视觉 Agent 直接审阅 |
+| `kb_remember` | **领域工作记忆与原件勘误写入**：向第 4 层 `记忆/`（`notes/`）记录实战踩坑经验或只读原件 `errata` 勘误钉子（自动脱敏并继承关联原件 ACL） |
+| `kb_forget` | 归档撤回已过时或有误的第 4 层工作记忆笔记 |
 | `kb_search` | 细粒度 BM25/FTS5 检索，支持按 `section`（章节）、`page`（页/Sheet）、`wiki`（知识页）过滤 |
 | `kb_read` | 沙箱安全读取派生镜像、Wiki 页或 `目录.md` 的精确行区间（单次 `<=400` 行）或指定 `page_num` |
 | `kb_route` | 判断问题属于单点事实直答（`fact` 2.6k 预算）还是多跳综合分析（`complex` 4.8k 预算） |
 | `kb_list` | 列出知识库已索引文档清单与提取方式（支持路径子串过滤） |
-| `kb_status` | 查看当前索引代数、文档/切片规模、跳过文件统计与未镜像资料边界 |
+| `kb_status` | 查看当前索引代数、文档/切片规模、活跃记忆条数、跳过文件统计与未镜像资料边界 |
 
 ### 方式一：本机单用户 Stdio 接入（Claude Code / Cursor / Codex / DSH）
 
@@ -433,10 +436,14 @@ wctx compile --vault ./我的知识库
 | `wctx index --vault <V> [--check --deep]` | 构建或深度校验 `gen-<id>/bm25.sqlite` 分代索引快照 |
 | `wctx context --vault <V> -q "<Q>"` | 终端单次组装带精确引用的 `<kb_context>` 证据包 |
 | `wctx search --vault <V> -q "<Q>"` | 执行底层双层 BM25/FTS5 检索或 `--route` 复杂度判定 |
-| `wctx compile --vault <V> [--dry-run]` | 批量编译未覆盖镜像并刷新 `stale` 过期 Wiki 页 |
+| `wctx compile --vault <V> [--dry-run]` | 批量编译未覆盖镜像、刷新 `stale` 页并将第 4 层记忆巩固进 Wiki |
+| `wctx remember --vault <V> -t "<T>"` | 向第 4 层 `记忆/` 写入实战经验或 `--kind errata` 原件勘误钉子 |
+| `wctx notes [list\|forget\|import] --vault <V>` | 查看、归档撤回或从外部 JSON（如 `magpie-memory` 导出）导入领域记忆 |
+| `wctx synonyms mine --vault <V> [--apply]` | 自动从库内术语对照表与双语括号定义中挖掘同义词组写入 `synonyms.json` |
+| `wctx eval --vault <V> [--questions Q.json]` | 自助运行严格证据召回率、MRR、延迟与防幻觉护栏量化基准评测 |
 | `wctx freshness --vault <V> [check\|snapshot]` | 基于原件 SHA-256 检测过期 Wiki 页或更新哈希快照 |
 | `wctx lint --vault <V>` | 机械检查死链 `[[wikilinks]]`、缺失引用原件与目录漂移 |
-| `wctx serve --vault <V> [--test]` | 启动本地 Stdio MCP 服务（6 个工具，默认开启凭证脱敏） |
+| `wctx serve --vault <V> [--test]` | 启动本地 Stdio MCP 服务（9 个工具，默认开启凭证脱敏） |
 | `wctx gateway --vault id=path [--test]` | 启动多人多库 Streamable HTTP MCP + REST 知识网关 |
 | `wctx bridge --url <URL> --token <T>` | 将本地 Stdio MCP 客户端桥接至远端 HTTP 网关 |
 

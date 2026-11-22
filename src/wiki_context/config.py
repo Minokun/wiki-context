@@ -16,6 +16,7 @@ LAYOUT_PRESETS: dict[str, dict[str, str]] = {
         "sources_dir": "sources",
         "mirrors_dir": "mirrors",
         "wiki_dir": "wiki",
+        "notes_dir": "notes",
         "catalog_file": "index.md",
         "log_file": "log.md",
     },
@@ -23,6 +24,7 @@ LAYOUT_PRESETS: dict[str, dict[str, str]] = {
         "sources_dir": "史料",
         "mirrors_dir": "史料_md",
         "wiki_dir": "知识库",
+        "notes_dir": "记忆",
         "catalog_file": "目录.md",
         "log_file": "日志.md",
     },
@@ -39,6 +41,7 @@ class VaultConfig:
     sources_dir: str = "sources"
     mirrors_dir: str = "mirrors"
     wiki_dir: str = "wiki"
+    notes_dir: str = "notes"
     catalog_file: str = "index.md"
     log_file: str = "log.md"
     index_subdir: str = ".index"
@@ -76,6 +79,7 @@ class VaultConfig:
         sources_dir = str(raw_cfg.get("sources_dir") or preset["sources_dir"]).strip("/")
         mirrors_dir = str(raw_cfg.get("mirrors_dir") or preset["mirrors_dir"]).strip("/")
         wiki_dir = str(raw_cfg.get("wiki_dir") or preset["wiki_dir"]).strip("/")
+        notes_dir = str(raw_cfg.get("notes_dir") or preset["notes_dir"]).strip("/")
         catalog_file = str(raw_cfg.get("catalog_file") or preset["catalog_file"]).strip("/")
         log_file = str(raw_cfg.get("log_file") or preset["log_file"]).strip("/")
 
@@ -108,6 +112,7 @@ class VaultConfig:
             sources_dir=sources_dir,
             mirrors_dir=mirrors_dir,
             wiki_dir=wiki_dir,
+            notes_dir=notes_dir,
             catalog_file=catalog_file,
             log_file=log_file,
             max_doc_bytes=max_bytes,
@@ -129,6 +134,10 @@ class VaultConfig:
     @property
     def wiki_root(self) -> Path:
         return self.root / self.wiki_dir
+
+    @property
+    def notes_root(self) -> Path:
+        return self.root / self.notes_dir
 
     @property
     def index_root(self) -> Path:

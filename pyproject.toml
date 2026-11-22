@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "wiki-context"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + Zero-Hallucination MCP Gateway"
 readme = "README.md"
 license = "MIT"

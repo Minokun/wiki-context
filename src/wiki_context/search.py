@@ -32,7 +32,8 @@ class IndexUnavailableError(RuntimeError):
 
 LATIN_NUM_RE = re.compile(r"[a-z0-9]+(?:[._\-/+][a-z0-9]+)*", re.I)
 _UNIT_SPLIT_RE = re.compile(
-    r"^(\d+(?:\.\d+)?)(mm|cm|km|ms|us|ns|hz|khz|mhz|ghz|gb|mb|kb|tb|kv|mv|ma|kw|mw|db|fps|rps|qps)$",
+    r"^(\d+(?:\.\d+)?)(mm|cm|km|m|ms|us|ns|s|min|hr|h|hz|khz|mhz|ghz|gb|mb|kb|tb|"
+    r"kv|mv|vdc|vac|v|ka|ma|ua|a|kw|mw|w|kn|mn|n|mpa|kpa|pa|bar|kg|mg|g|mk|c|db|fps|rps|qps)$",
     re.I,
 )
 _ALPHA_NUM_SPLIT_RE = re.compile(r"^([a-z]{1,8})(\d{1,6})$", re.I)
@@ -90,28 +91,34 @@ def _expand_latin_token(tok: str) -> list[str]:
             seen.add(piece)
             out.append(piece)
 
-    add(tok)
-    parts = re.split(r"[.\-/+_]+", tok)
-    if len(parts) > 1:
-        for p in parts:
-            add(p)
-            m_u = _UNIT_SPLIT_RE.match(p)
-            if m_u:
-                add(m_u.group(1))
-                add(m_u.group(2))
-            m_a = _ALPHA_NUM_SPLIT_RE.match(p)
-            if m_a:
-                add(m_a.group(1))
-                add(m_a.group(2))
-    else:
-        m_u = _UNIT_SPLIT_RE.match(tok)
+    def expand_alnum_piece(p: str) -> None:
+        m_u = _UNIT_SPLIT_RE.match(p)
         if m_u:
             add(m_u.group(1))
             add(m_u.group(2))
-        m_a = _ALPHA_NUM_SPLIT_RE.match(tok)
+        m_a = _ALPHA_NUM_SPLIT_RE.match(p)
         if m_a:
             add(m_a.group(1))
             add(m_a.group(2))
+        # Handle mixed alpha+digit+alpha codes (e.g. `snk908x`, `k908x`, `yolov8x`)
+        if re.search(r"[a-z]", p) and re.search(r"\d", p):
+            for seg in re.findall(r"[a-z]{2,}|\d{2,}", p):
+                add(seg)
+            for tail in re.findall(r"[a-z]\d{2,}[a-z]?|\d{2,}[a-z]+", p):
+                add(tail)
+
+    add(tok)
+    parts = [x for x in re.split(r"[.\-/+_]+", tok) if x]
+    if len(parts) > 1:
+        compact = "".join(parts)
+        if len(compact) >= 2:
+            add(compact)
+            expand_alnum_piece(compact)
+        for p in parts:
+            add(p)
+            expand_alnum_piece(p)
+    else:
+        expand_alnum_piece(tok)
     return out
 
 
@@ -181,10 +188,20 @@ def encode_fts_token(tok: str) -> str:
     )
 
 
+_LAYER_ROOT_NAMES = frozenset({"sources", "史料", "mirrors", "史料_md", "wiki", "知识库", "notes", "记忆"})
+
+
 def _source_filename_tokens(source: str) -> list[str]:
     if not source:
         return []
-    return tokenize(PurePosixPath(source).stem)
+    p = PurePosixPath(source.replace("\\", "/"))
+    parts = [seg for seg in p.parts if seg and seg != "."]
+    if parts and parts[0] in _LAYER_ROOT_NAMES:
+        parts = parts[1:]
+    if not parts:
+        return []
+    parts[-1] = PurePosixPath(parts[-1]).stem
+    return tokenize(" ".join(parts))
 
 
 def load_exclude_patterns(vault: Path | str) -> tuple[str, ...]:
@@ -340,7 +357,7 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
             for t in tf:
                 l2_source_sets[t].add(src)
 
-            body_set_list = sorted(set(body_toks) | set(head_toks))
+            body_set_list = sorted(set(body_toks) | set(head_toks) | set(fname_toks))
             con.execute(
                 "INSERT INTO units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -622,7 +639,7 @@ class BM25Index:
             dl = max(1, len(btoks) + len(htoks))
             self.units.append(u)
             self.lengths.append(dl)
-            self.body_tok_sets.append(set(btoks) | set(htoks))
+            self.body_tok_sets.append(set(btoks) | set(htoks) | set(ftoks))
             for tok, freq in tf.items():
                 self.postings[tok][idx] = freq
                 src_sets[tok].add(src)

@@ -29,3 +29,6 @@ venv/
 # Generated demo mirrors/indexes during local runs
 examples/demo-vault/mirrors/
 examples/demo-vault/error_book.*
+
+# Local autoresearch workspace runs
+autoresearch/

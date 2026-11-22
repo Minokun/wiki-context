@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DIST_NAME = "wiki_context"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DIST_INFO = f"{DIST_NAME}-{VERSION}.dist-info"
 
 

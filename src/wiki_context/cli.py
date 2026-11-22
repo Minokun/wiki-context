@@ -11,15 +11,18 @@ from pathlib import Path
 
 from . import __version__
 from .compiler import compile_vault
+from .eval_harness import evaluate_vault
 from .freshness import check_vault_freshness, snapshot_wiki_hashes
 from .gateway import MultiVaultGateway, TokenRegistry, create_http_server, parse_vault_specs, selftest_gateway
 from .indexer import check_index, rebuild_index
 from .lint import lint_vault
-from .mcp_server import KBService, run_stdio_server, selftest_mcp
+from .mcp_server import KBService, run_stdio_server, scrub_secrets, selftest_mcp
+from .memory import MemoryStore
 from .remote_stdio import run_bridge
 from .scaffold import init_vault
 from .search import BM25Index, route
 from .sync import sync_vault
+from .synonym_miner import mine_synonyms
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -43,8 +46,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--source", help="Convert a single specific source file")
     p_sync.add_argument("--list", action="store_true", help="List pending changes without converting")
     p_sync.add_argument("--force", action="store_true", help="Re-extract even if SHA-256 is unchanged")
-    p_sync.add_argument("--all-images", action="store_true", help="Include image files via OCR provider")
+    p_sync.add_argument("--all-images", action="store_true", help="Include image files via VLM/OCR/visual-asset provider")
     p_sync.add_argument("--ocr-cmd", help="External OCR command template (e.g. 'marker_single {input}')")
+    p_sync.add_argument("--asr-cmd", help="External ASR command template for audio/video (or set WCTX_ASR_CMD)")
 
     # index
     p_idx = sub.add_parser("index", help="Build or verify the versioned SQLite FTS5 index")
@@ -113,6 +117,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p_br.add_argument("--url", help="Remote `/mcp` endpoint URL (or WCTX_REMOTE_URL)")
     p_br.add_argument("--token", help="Bearer token (or WCTX_TOKEN)")
 
+    # remember (Layer-4 operational memory & errata)
+    p_rem = sub.add_parser("remember", help="Record an operational insight or source-anchored errata note into Layer-4")
+    p_rem.add_argument("--vault", default=".", help="Vault root path")
+    p_rem.add_argument("-t", "--text", required=True, help="Fact, troubleshooting note, or errata text")
+    p_rem.add_argument("--kind", choices=["insight", "errata", "decision", "glossary"], default="insight")
+    p_rem.add_argument("--source", action="append", default=[], help="Related primary source path (repeatable)")
+    p_rem.add_argument("--tag", action="append", default=[], help="Topic tag (repeatable)")
+    p_rem.add_argument("--author", default="cli", help="Author identifier")
+
+    # notes (inspect / archive / import Layer-4 memory notes)
+    p_notes = sub.add_parser("notes", help="List, archive (forget), or import Layer-4 operational memory notes")
+    p_notes.add_argument("action", choices=["list", "forget", "import"], nargs="?", default="list")
+    p_notes.add_argument("--vault", default=".", help="Vault root path")
+    p_notes.add_argument("--status", choices=["active", "consolidated", "archived", "all"], default="active")
+    p_notes.add_argument("--id", help="Note ID for `forget`")
+    p_notes.add_argument("--file", help="JSON file path for `import` (e.g. exported magpie-memory items)")
+
+    # synonyms (auto-mine domain glossaries & acronyms)
+    p_syn = sub.add_parser("synonyms", help="Mine bilingual glossary tables & inline acronyms into synonyms.json")
+    p_syn.add_argument("action", choices=["mine"], nargs="?", default="mine")
+    p_syn.add_argument("--vault", default=".", help="Vault root path")
+    p_syn.add_argument("--apply", action="store_true", help="Write discovered groups into synonyms.json")
+
+    # eval (quantitative retrieval & guardrail benchmark)
+    p_eval = sub.add_parser("eval", help="Benchmark Strict Recall, MRR, Latency, and Anti-Hallucination Guardrails")
+    p_eval.add_argument("--vault", default=".", help="Vault root path")
+    p_eval.add_argument("--questions", help="Optional gold QA JSON path (auto-generates smoke suite if omitted)")
+    p_eval.add_argument("--json", action="store_true", help="Print full JSON report")
+
     return p
 
 
@@ -134,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
                 include_all_images=args.all_images,
                 ocr_cmd=args.ocr_cmd,
+                asr_cmd=args.asr_cmd,
             )
             print(json.dumps(res, ensure_ascii=False, indent=2))
             return 0
@@ -240,6 +274,78 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "bridge":
             return run_bridge(url=args.url, token=args.token)
+
+        if args.cmd == "remember":
+            store = MemoryStore(args.vault, scrub_fn=scrub_secrets)
+            note = store.remember(
+                args.text,
+                kind=args.kind,
+                related_sources=args.source,
+                tags=args.tag,
+                author=args.author,
+            )
+            print(json.dumps({
+                "note_id": note.note_id,
+                "kind": note.kind,
+                "status": note.status,
+                "related_sources": list(note.related_sources),
+                "file": str(note.file_path),
+            }, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "notes":
+            store = MemoryStore(args.vault, scrub_fn=scrub_secrets)
+            if args.action == "forget":
+                if not args.id:
+                    raise ValueError("--id is required for `wctx notes forget`")
+                ok = store.update_status(args.id, "archived")
+                print(json.dumps({"archived": ok, "note_id": args.id}, ensure_ascii=False, indent=2))
+                return 0 if ok else 1
+            if args.action == "import":
+                if not args.file:
+                    raise ValueError("--file is required for `wctx notes import`")
+                raw_items = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                items = raw_items.get("memories", raw_items) if isinstance(raw_items, dict) else raw_items
+                created = store.import_json_items(items if isinstance(items, list) else [])
+                print(json.dumps({"imported_count": len(created), "note_ids": created}, ensure_ascii=False, indent=2))
+                return 0
+            st_filter = None if args.status == "all" else args.status
+            rows = [
+                {
+                    "note_id": n.note_id,
+                    "kind": n.kind,
+                    "status": n.status,
+                    "author": n.author,
+                    "created_at": n.created_at,
+                    "related_sources": list(n.related_sources),
+                    "text": n.text,
+                }
+                for n in store.list_notes(status=st_filter)
+            ]
+            print(json.dumps({"vault": store.cfg.name, "count": len(rows), "notes": rows}, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "synonyms":
+            rep = mine_synonyms(args.vault, apply=args.apply)
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "eval":
+            rep = evaluate_vault(args.vault, questions_path=args.questions)
+            if args.json:
+                print(json.dumps(rep, ensure_ascii=False, indent=2))
+            else:
+                for r in rep["rows"]:
+                    st = ("PASS" if r["context_ok"] else "MISS") if r["answerable"] else ("GUARD_OK" if r["guard_ok"] else "GUARD_MISS")
+                    print(f"{r['id']:<16} {r['route']:<8} {st:<10} {r['elapsed_ms']:>6.2f}ms  {r['question'][:54]}")
+                print("-" * 88)
+                print(
+                    f"Strict Recall: {rep['context_pack_hits']}/{rep['answerable_total']} ({rep['strict_recall']:.1%}) "
+                    f"[Naive BM25: {rep['naive_bm25_recall']:.1%}] | MRR: {rep['mrr']:.3f} | "
+                    f"Guardrail: {rep['guardrail_accuracy']:.1%} | Median: {rep['median_latency_ms']:.2f}ms | "
+                    f"Composite: {rep['composite_score']}"
+                )
+            return 0 if (rep["strict_recall"] >= 1.0 and rep["guardrail_accuracy"] >= 1.0) else 1
 
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

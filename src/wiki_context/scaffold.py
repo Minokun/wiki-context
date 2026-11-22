@@ -36,6 +36,7 @@ def init_vault(
     sources_d = preset["sources_dir"]
     mirrors_d = preset["mirrors_dir"]
     wiki_d = preset["wiki_dir"]
+    notes_d = preset["notes_dir"]
     catalog_f = preset["catalog_file"]
     log_f = preset["log_file"]
     overview_name = "知识库总览.md" if lay == "zh" else "Overview.md"
@@ -44,6 +45,7 @@ def init_vault(
         f"{sources_d}/",
         f"{mirrors_d}/.index/",
         f"{wiki_d}/",
+        f"{notes_d}/",
         "vault.json",
         "synonyms.json",
         "AGENTS.md",
@@ -57,6 +59,7 @@ def init_vault(
     (root / sources_d).mkdir(parents=True, exist_ok=True)
     (root / mirrors_d / ".index").mkdir(parents=True, exist_ok=True)
     (root / wiki_d).mkdir(parents=True, exist_ok=True)
+    (root / notes_d).mkdir(parents=True, exist_ok=True)
 
     vault_cfg = {
         "name": vault_name,
