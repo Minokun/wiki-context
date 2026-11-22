@@ -35,6 +35,8 @@ def _metadata_bytes() -> bytes:
         "Summary: Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + MCP Gateway\n"
         "License: MIT\n"
         "Requires-Python: >=3.10\n"
+        "Project-URL: Homepage, https://github.com/Minokun/wiki-context\n"
+        "Project-URL: Repository, https://github.com/Minokun/wiki-context.git\n"
         "Description-Content-Type: text/markdown\n\n"
     )
     return (header + readme).encode("utf-8")

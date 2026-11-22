@@ -37,6 +37,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/Minokun/wiki-context"
+Repository = "https://github.com/Minokun/wiki-context.git"
+Issues = "https://github.com/Minokun/wiki-context/issues"
+
 [project.scripts]
 wctx = "wiki_context.cli:main"
 wiki-context = "wiki_context.cli:main"
