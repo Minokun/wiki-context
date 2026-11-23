@@ -3,7 +3,7 @@
 
 Compares:
 1. Fixed 600-char BM25 prefix chunks (naive chunk RAG)
-2. `wiki-context` one-shot `ContextPack` (`kb_context`)
+2. `wiki-context` one-shot `ContextPack` (`wiki_context`)
 """
 
 from __future__ import annotations

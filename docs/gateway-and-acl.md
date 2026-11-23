@@ -4,14 +4,25 @@
 
 ---
 
-## 1. Hosting Multiple Vaults
+## 1. Hosting Multiple Vaults (and Security Boundary vs `wctx ui`)
+
+> **Security Boundary (`wctx ui` vs `wctx gateway`)**:
+> - `wctx ui` is a **local loopback (`127.0.0.1`) admin console** for onboarding vaults, issuing tokens, syncing local AI clients, and editing Layer-4 memory. Its `/api/*` admin endpoints do not use a login password (relying on loopback binding + CSRF protection).
+> - `wctx gateway` is the **production multi-user team server**. It exposes **no admin UI or `/api/*` endpoints**—only `/healthz`, `/mcp*`, and `/v1/*`—and enforces SHA-256 Bearer Token authentication on every query/read route. When `--vault` is omitted, it automatically loads vaults and tokens managed in `~/.wiki-context/`.
 
 ```bash
+# Explicit vault & token file:
 wctx gateway \
   --vault eng=/srv/vaults/engineering \
   --vault sec=/srv/vaults/security \
   --token-file /etc/wiki-context/tokens.json \
   --host 127.0.0.1 --port 8090
+
+# Or reuse vaults & tokens configured in `wctx ui` (~/.wiki-context/), and install as a background daemon:
+wctx service install --target gateway --host 0.0.0.0 --port 8090
+
+# On Computer B (teammate's machine): connect via Web UI ("🌐 连接远程知识库") OR 1-line CLI (auto-configures all local AI clients, zero snippet copy-paste):
+wctx remote add --url http://192.168.1.25:8090 --token wctx_...
 ```
 
 ### HTTP Endpoints
@@ -44,7 +55,8 @@ Both `tokens` and `acl` rules in `--token-file` are **hot-reloaded on file save*
     {
       "uid": "contractor_bot",
       "token": "plain_secret_supported_for_dev_only",
-      "groups": ["partner"]
+      "groups": ["partner"],
+      "allowed_vaults": ["eng"]
     }
   ],
   "acl": {
@@ -56,10 +68,12 @@ Both `tokens` and `acl` rules in `--token-file` are **hot-reloaded on file save*
 }
 ```
 
+> **Tip**: Run `wctx ui` to manage tokens (`token_sha256`-only storage), `allowed_vaults` vault scoping, role `acl` prefixes, and live ACL sandbox simulation visually.
+
 ### Provenance-Inherited Wiki Security
 
 `PrefixACLPolicy` enforces two invariants:
-1. **`deny` always overrides `allow`** on primary source paths (`kb_context`, `kb_search`, `kb_read`, `kb_list`).
+1. **`deny` always overrides `allow`** on primary source paths (`wiki_context`, `wiki_search`, `wiki_read`, `wiki_list`).
 2. **No Confidentiality Downgrade via Wiki Summaries**: A user can view a compiled `wiki/*.md` page **if and only if** they are authorized to access **every** primary document listed in that Wiki page's `sources:` frontmatter.
 
 ---

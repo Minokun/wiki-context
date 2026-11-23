@@ -1,7 +1,7 @@
 """Deterministic 5-Step Context Pack Engine & Pluggable Access Control.
 
 Transforms a natural-language question into a single citation-anchored Markdown
-evidence bundle (`<kb_context>`) combining:
+evidence bundle (`<wiki_context>`) combining:
 1. Dynamic complexity routing (`fact` 2.6k vs `complex` 4.8k tokens) + hot-reloaded
    canonical synonym convergence (`synonyms.json`);
 2. Parallel Layer-3 (Compiled Wiki) + Layer-2 (Primary Source) FTS5/BM25 retrieval
@@ -45,6 +45,12 @@ from .search import (
 class Principal:
     uid: str = "anonymous"
     groups: tuple[str, ...] = ("all",)
+    allowed_vaults: tuple[str, ...] = ("*",)
+
+    def can_access_vault(self, vault_id: str) -> bool:
+        if "*" in self.allowed_vaults or "admin" in self.groups:
+            return True
+        return vault_id in self.allowed_vaults
 
 
 class AccessPolicy:
@@ -72,16 +78,24 @@ class PrefixACLPolicy(AccessPolicy):
 
     def __init__(
         self,
-        group_rules: dict[str, dict[str, list[str]]],
+        group_rules: dict[str, dict[str, list[str]]] | Callable[[], dict[str, dict[str, list[str]]]],
         *,
         public_wiki_without_sources: bool = True,
     ):
-        self.group_rules = group_rules
+        self._group_rules = group_rules
         self.public_wiki_without_sources = public_wiki_without_sources
+
+    @property
+    def group_rules(self) -> dict[str, dict[str, list[str]]]:
+        return self._group_rules() if callable(self._group_rules) else self._group_rules
 
     @staticmethod
     def _match_prefix(path: str, prefix: str) -> bool:
-        clean_p = prefix.rstrip("*").rstrip("/")
+        clean_p = prefix.strip().rstrip("*").rstrip("/")
+        if not clean_p and "*" in prefix:
+            return True
+        if not clean_p:
+            return False
         return path == clean_p or path.startswith(clean_p + "/")
 
     def can_access_source(self, principal: Principal, source: str) -> bool:
@@ -1292,7 +1306,7 @@ class ContextPackEngine:
     ) -> str:
         is_zh = self.cfg.layout == "zh"
         lines: list[str] = [
-            f'<kb_context vault="{self.cfg.name}" route="{plan.route_mode}" generation="{generation_id}">'
+            f'<wiki_context vault="{self.cfg.name}" route="{plan.route_mode}" generation="{generation_id}">'
         ]
         if plan.auto_synonyms:
             label = "术语自动对齐" if is_zh else "Auto-aligned synonyms"
@@ -1344,9 +1358,9 @@ class ContextPackEngine:
                 if rm:
                     lbl = "继续深读" if is_zh else "Read more"
                     if "start" in rm:
-                        more_s = f' | {lbl}: kb_read(source="{rm["source"]}", start={rm["start"]}, end={rm["end"]})'
+                        more_s = f' | {lbl}: wiki_read(source="{rm["source"]}", start={rm["start"]}, end={rm["end"]})'
                     elif "page_num" in rm:
-                        more_s = f' | {lbl}: kb_read(source="{rm["source"]}", page_num={rm["page_num"]})'
+                        more_s = f' | {lbl}: wiki_read(source="{rm["source"]}", page_num={rm["page_num"]})'
 
                 lines.append(f"### [{s['id']}] {' | '.join(meta_parts)}{tag_s}{more_s}")
                 if s.get("also_at"):
@@ -1355,9 +1369,9 @@ class ContextPackEngine:
                 if s.get("visual_assets"):
                     va_list = ", ".join(s["visual_assets"])
                     if is_zh:
-                        lines.append(f'> 🖼️ 关联高清附图: {va_list}（可按需调用 kb_inspect_visual(source="{s["source"]}") 查看原图）')
+                        lines.append(f'> 🖼️ 关联高清附图: {va_list}（可按需调用 wiki_inspect_visual(source="{s["source"]}") 查看原图）')
                     else:
-                        lines.append(f'> 🖼️ Visual figures available: {va_list} (call kb_inspect_visual(source="{s["source"]}") to view image)')
+                        lines.append(f'> 🖼️ Visual figures available: {va_list} (call wiki_inspect_visual(source="{s["source"]}") to view image)')
                 for ep in (s.get("errata_pins") or ()):
                     if is_zh:
                         lines.append(f"> 📌 [原件勘误/变更通知 {ep['id']} by {ep['author']}]: {ep['text']}")
@@ -1411,5 +1425,5 @@ class ContextPackEngine:
                 "- Grounding Rule: Every claim must be directly supported by [S1]~[Sn] above with explicit source citations; "
                 "if a figure, clause, or conclusion is not stated in the retrieved text, state clearly that the vault lacks sufficient evidence."
             )
-        lines.append("</kb_context>")
+        lines.append("</wiki_context>")
         return "\n".join(lines)

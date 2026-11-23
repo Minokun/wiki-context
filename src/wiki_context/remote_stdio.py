@@ -29,8 +29,11 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
         "Authorization": f"Bearer {secret}",
     }
 
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
+    while True:
+        raw_line = sys.stdin.buffer.readline()
+        if not raw_line:
+            break
+        line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:

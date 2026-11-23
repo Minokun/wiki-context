@@ -12,8 +12,8 @@ Builds a realistic multi-format synthetic hard-tech vault exercising:
 - H8: Parent-folder-scoped query (`2026-09 reimbursement` where `2026-09` is only in directory path)
 - H9: Chinese compound technical query with cross-word boundary bigrams (`受电弓羊角异常检测算法`)
 - H10: Cross-format near-duplicate folding (`.docx` + `.pdf`/`.md` duplicate not wasting Top-K slots)
-- H11: Multimodal MCP native visual inspection (`kb_inspect_visual` returning base64 PNG content block)
-- H12: Layer-4 source-anchored Errata Pin (`kb_remember(kind='errata')` surfacing on read-only primary spec)
+- H11: Multimodal MCP native visual inspection (`wiki_inspect_visual` returning base64 PNG content block)
+- H12: Layer-4 source-anchored Errata Pin (`wiki_remember(kind='errata')` surfacing on read-only primary spec)
 - H13: Automated synonym mining (`mine_synonyms`) discovering glossary abbreviations
 - H14: Unanswerable hallucination guardrail probe (`HyperLoopVacuumPump99`)
 
@@ -324,7 +324,7 @@ def main() -> int:
 
         svc = KBService(vault)
         try:
-            # Test P4: Layer-4 Errata Pin if `kb_remember` exists
+            # Test P4: Layer-4 Errata Pin if `wiki_remember` exists
             r_rem = handle_jsonrpc_message(
                 svc,
                 {
@@ -332,7 +332,7 @@ def main() -> int:
                     "id": 10,
                     "method": "tools/call",
                     "params": {
-                        "name": "kb_remember",
+                        "name": "wiki_remember",
                         "arguments": {
                             "text": "ERRATA-HOTFIX-812: 线阵相机行频已由 42kHz 上调至 68kHz（2026-11 现场技改通知）。",
                             "kind": "errata",
@@ -346,7 +346,7 @@ def main() -> int:
                 if "ERRATA-HOTFIX-812" in (ctx_err.get("context_markdown") or "") and "68kHz" in (ctx_err.get("context_markdown") or ""):
                     bonus_checks["errata_memory"] = True
 
-            # Test P3: Native MCP visual inspection if `kb_inspect_visual` exists
+            # Test P3: Native MCP visual inspection if `wiki_inspect_visual` exists
             r_vis = handle_jsonrpc_message(
                 svc,
                 {
@@ -354,7 +354,7 @@ def main() -> int:
                     "id": 11,
                     "method": "tools/call",
                     "params": {
-                        "name": "kb_inspect_visual",
+                        "name": "wiki_inspect_visual",
                         "arguments": {"source": "sources/specs/pantograph-4c-spec.docx"},
                     },
                 },

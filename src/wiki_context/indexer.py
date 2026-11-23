@@ -81,7 +81,7 @@ def split_markdown_sections(raw_text: str) -> list[dict]:
     """Split Markdown into table-aware sections (`<= MAX_SECTION_LINES` lines each).
 
     Line numbers (`line_start`, `line_end`) are 1-based over ``raw_text`` (including frontmatter)
-    so ``kb_read(start=line_start, end=line_end)`` aligns to the exact file lines.
+    so ``wiki_read(start=line_start, end=line_end)`` aligns to the exact file lines.
     """
     all_lines = raw_text.split("\n")
     fm_lines = 0

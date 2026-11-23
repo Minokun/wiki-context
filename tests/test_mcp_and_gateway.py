@@ -58,17 +58,28 @@ class TestMCPAndGateway(unittest.TestCase):
             hdrs = {"Authorization": "Bearer tok_alice_secret_1", "Content-Type": "application/json"}
 
             try:
-                # 1. Query specific vault via `/mcp/hr` Streamable HTTP route
+                # 1. Query specific vault via `/mcp/hr` Streamable HTTP route (`wiki_context` + legacy `kb_context` alias)
                 mcp_call = {
                     "jsonrpc": "2.0",
                     "id": 10,
                     "method": "tools/call",
-                    "params": {"name": "kb_context", "arguments": {"question": "入职满一年有几天年假？"}},
+                    "params": {"name": "wiki_context", "arguments": {"question": "入职满一年有几天年假？"}},
                 }
                 req = urllib.request.Request(f"{base}/mcp/hr", data=json.dumps(mcp_call).encode(), headers=hdrs, method="POST")
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read())
                     self.assertIn("10 天", data["result"]["content"][0]["text"])
+                    self.assertIn("<wiki_context", data["result"]["content"][0]["text"])
+
+                legacy_call = {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {"name": "kb_context", "arguments": {"question": "入职满一年有几天年假？"}},
+                }
+                req_leg = urllib.request.Request(f"{base}/mcp/hr", data=json.dumps(legacy_call).encode(), headers=hdrs, method="POST")
+                with urllib.request.urlopen(req_leg, timeout=5) as resp_leg:
+                    self.assertIn("10 天", json.loads(resp_leg.read())["result"]["content"][0]["text"])
 
                 # 2. Query default vault (`eng`) via REST `/v1/context` (spoofed `user` ignored)
                 rest_req = urllib.request.Request(

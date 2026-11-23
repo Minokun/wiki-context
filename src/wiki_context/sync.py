@@ -378,11 +378,11 @@ def sync_vault(
                         ocr_doc.embedded_media = saved_assets
                         doc = ocr_doc
                 if doc is None or not doc.usable:
-                    # Register visual asset stub so path-based queries and MCP kb_inspect_visual still work zero-dep
+                    # Register visual asset stub so path-based queries and MCP wiki_inspect_visual still work zero-dep
                     stub_md = (
                         f"# {p.stem}\n\n"
                         f"Visual figure `{cfg.source_prefix}{rel}` ({direct_asset['bytes']} bytes). "
-                        f"Inspect full image via MCP `kb_inspect_visual(source=\"{cfg.source_prefix}{rel}\")`.\n"
+                        f"Inspect full image via MCP `wiki_inspect_visual(source=\"{cfg.source_prefix}{rel}\")`.\n"
                     )
                     doc = ExtractedDocument(
                         method="visual-asset",

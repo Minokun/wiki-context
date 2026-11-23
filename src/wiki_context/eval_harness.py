@@ -1,7 +1,7 @@
 """Self-serve vault retrieval evaluator & synthetic benchmark generator (`wctx eval`).
 
 Computes deterministic metrics on any vault:
-- `strict_recall`: fraction of answerable questions where `<kb_context>` contains every required fact group
+- `strict_recall`: fraction of answerable questions where `<wiki_context>` contains every required fact group
 - `naive_bm25_recall`: baseline fixed-600c top-3 BM25 recall for head-to-head comparison
 - `mrr`: Mean Reciprocal Rank of expected primary sources in `[S1..Sn]`
 - `guardrail_accuracy`: fraction of unanswerable probes triggering `missing_concepts` alerts

@@ -75,5 +75,5 @@ source_hashes:
 ```
 
 - When `sources/specs/rfc-042-edge-gateway.md` is modified and `wctx sync` runs, its new SHA-256 no longer matches `source_hashes`.
-- During index build, `wiki-context` automatically marks that Wiki page `stale` (`0.5x` ranking demotion + explicit `⚠️ stale` warning badge in `<kb_context>`) without touching the raw file.
+- During index build, `wiki-context` automatically marks that Wiki page `stale` (`0.5x` ranking demotion + explicit `⚠️ stale` warning badge in `<wiki_context>`) without touching the raw file.
 - After reviewing or running `wctx compile`, run `wctx freshness --vault . snapshot` to record the verified hashes.

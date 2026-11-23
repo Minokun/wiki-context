@@ -1,8 +1,8 @@
 """Comprehensive unit & security tests for `wiki-context` v0.2.0 evolution:
 - P1: Deep Office/PDF/Rich-format extraction (XLSX merge/banner/side-by-side/drawing, DOCX sdt/txbx/spans/footnotes, PPTX SmartArt/notes, PDF layout table reconstruction, HTML/EML/IPYNB/SRT/VTT)
 - P2: High-recall code punctuation variants, directory-path tokens, and cross-source near-dedup
-- P3: Embedded visual asset extraction, VLM/ASR hooks, and ACL-guarded MCP `kb_inspect_visual`
-- P4: Layer-4 operational memory (`notes/`/`记忆/`), 1-hop Errata Pins, secret scrubbing, ACL inheritance, `kb_forget`, and `wctx compile` consolidation
+- P3: Embedded visual asset extraction, VLM/ASR hooks, and ACL-guarded MCP `wiki_inspect_visual`
+- P4: Layer-4 operational memory (`notes/`/`记忆/`), 1-hop Errata Pins, secret scrubbing, ACL inheritance, `wiki_forget`, and `wctx compile` consolidation
 - P5: Automated glossary & inline acronym synonym miner (`mine_synonyms`) and `wctx eval`
 """
 
@@ -154,7 +154,7 @@ class TestV2Evolution(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 1,
                         "method": "tools/call",
-                        "params": {"name": "kb_inspect_visual", "arguments": {"source": "史料/公开规范/网关设计.docx"}},
+                        "params": {"name": "wiki_inspect_visual", "arguments": {"source": "史料/公开规范/网关设计.docx"}},
                     },
                     principal=partner,
                 )
@@ -171,7 +171,7 @@ class TestV2Evolution(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 2,
                         "method": "tools/call",
-                        "params": {"name": "kb_inspect_visual", "arguments": {"source": "史料/机密图纸/核心电路图.png"}},
+                        "params": {"name": "wiki_inspect_visual", "arguments": {"source": "史料/机密图纸/核心电路图.png"}},
                     },
                     principal=partner,
                 )
@@ -185,7 +185,7 @@ class TestV2Evolution(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 3,
                         "method": "tools/call",
-                        "params": {"name": "kb_inspect_visual", "arguments": {"source": "史料/机密图纸/核心电路图.png"}},
+                        "params": {"name": "wiki_inspect_visual", "arguments": {"source": "史料/机密图纸/核心电路图.png"}},
                     },
                     principal=admin,
                 )
@@ -245,7 +245,7 @@ class TestV2Evolution(unittest.TestCase):
                 self.assertIn("72%", c_adm["context_markdown"])
                 self.assertIn("Operational Memory", c_adm["context_markdown"])
 
-                # 3. Admin pins an Errata onto public API spec -> visible to contractor on 1-hop primary hit, then retracted via kb_forget
+                # 3. Admin pins an Errata onto public API spec -> visible to contractor on 1-hop primary hit, then retracted via wiki_forget
                 pub_err = svc.tool_remember(
                     {
                         "text": "ERRATA-99: Default burst raised from 500 RPS to 1500 RPS.",

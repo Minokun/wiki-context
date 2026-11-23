@@ -29,7 +29,7 @@ Default SQLite FTS5 tokenizers split technical identifiers (`RFC-042`, `TB/T-207
 
 ## 3. Five-Step `ContextPackEngine` (`context.py`)
 
-When an agent calls `kb_context(question)`, the engine executes five deterministic steps in ~3–35 ms:
+When an agent calls `wiki_context(question)`, the engine executes five deterministic steps in ~3–35 ms:
 
 1. **Complexity Routing & One-Way Synonym Alignment**: Classifies the question into `fact` (2,600 tokens) or `complex` (4,800 tokens) and injects canonical domain terms from hot-reloaded `synonyms.json` into the triggering concept group without diluting coverage ratios.
 2. **Parallel Dual-Layer Retrieval & Multi-Facet Rescue**: Queries `fts_wiki` and `fts_units` simultaneously. If a query spans multiple distinct entities (e.g. comparing System A vs. System B), under-represented facets are rescued via targeted sub-queries.

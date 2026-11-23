@@ -12,12 +12,31 @@ import base64
 import csv
 import hashlib
 import io
+import re
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DIST_NAME = "wiki_context"
-VERSION = "0.2.0"
+
+
+def _read_version() -> str:
+    pyproject = ROOT / "pyproject.toml"
+    if pyproject.is_file():
+        text = pyproject.read_text(encoding="utf-8")
+        m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
+        if m:
+            return m.group(1).strip()
+    init_py = ROOT / "src" / "wiki_context" / "__init__.py"
+    if init_py.is_file():
+        text = init_py.read_text(encoding="utf-8")
+        m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
+        if m:
+            return m.group(1).strip()
+    return "0.3.0"
+
+
+VERSION = _read_version()
 DIST_INFO = f"{DIST_NAME}-{VERSION}.dist-info"
 
 

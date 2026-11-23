@@ -84,16 +84,26 @@ class TokenRegistry:
                     if not uid:
                         continue
                     groups = tuple(str(g) for g in (row.get("groups") or ["all"]))
+                    raw_av = row.get("allowed_vaults")
+                    if isinstance(raw_av, list) and raw_av:
+                        allowed_vaults = tuple(str(v).strip() for v in raw_av if str(v).strip()) or ("*",)
+                    else:
+                        allowed_vaults = ("*",)
                     tok_sha = str(row.get("token_sha256") or "").strip().lower()
                     if not tok_sha and row.get("token"):
                         tok_sha = _sha256_hex(str(row["token"]))
                     if len(tok_sha) == 64:
-                        entries.append((tok_sha, Principal(uid=uid, groups=groups)))
+                        entries.append((tok_sha, Principal(uid=uid, groups=groups, allowed_vaults=allowed_vaults)))
 
             acl_cfg = data.get("acl") if isinstance(data, dict) and isinstance(data.get("acl"), dict) else {}
             self._file_entries = entries
             self._file_acl = acl_cfg
             self._file_mtime_ns = st.st_mtime_ns
+
+    def force_reload(self) -> None:
+        with self._lock:
+            self._file_mtime_ns = None
+        self._reload_file_if_needed()
 
     @property
     def acl_rules(self) -> dict[str, dict[str, list[str]]]:
@@ -128,25 +138,70 @@ class MultiVaultGateway:
         vault_map: dict[str, Path | str],
         *,
         tokens: TokenRegistry,
+        allow_empty_vaults: bool = False,
     ):
-        if not vault_map:
+        if not vault_map and not allow_empty_vaults:
             raise ValueError("At least one vault must be configured for MultiVaultGateway")
         self.tokens = tokens
-        shared_policy = PrefixACLPolicy(tokens.acl_rules) if tokens.acl_rules else None
+        self._lock = threading.RLock()
         self.services: dict[str, KBService] = {}
-        self.default_vault_id = next(iter(vault_map))
+        self.default_vault_id: str = ""
         for vid, vpath in vault_map.items():
-            clean_id = vid.strip("/")
-            self.services[clean_id] = KBService(vpath, policy=shared_policy)
+            self.upsert_vault(vid, vpath)
+
+    def _build_policy(self, vpath: Path | str) -> PrefixACLPolicy:
+        from .config import VaultConfig
+
+        vcfg = VaultConfig.load(vpath)
+
+        def _rules() -> dict[str, dict[str, list[str]]]:
+            merged = dict(vcfg.acl_rules)
+            merged.update(self.tokens.acl_rules)
+            return merged
+
+        return PrefixACLPolicy(_rules)
+
+    def upsert_vault(self, vault_id: str, vault_path: Path | str) -> KBService:
+        clean_id = vault_id.strip().strip("/")
+        if not clean_id:
+            raise ValueError("vault_id cannot be empty")
+        svc = KBService(vault_path, policy=self._build_policy(vault_path))
+        with self._lock:
+            old = self.services.get(clean_id)
+            self.services[clean_id] = svc
+            if not self.default_vault_id or self.default_vault_id not in self.services:
+                self.default_vault_id = clean_id
+        if old is not None:
+            old.close()
+        return svc
+
+    def remove_vault(self, vault_id: str) -> bool:
+        clean_id = vault_id.strip().strip("/")
+        with self._lock:
+            old = self.services.pop(clean_id, None)
+            if self.default_vault_id == clean_id:
+                self.default_vault_id = next(iter(self.services), "")
+        if old is not None:
+            old.close()
+            return True
+        return False
 
     def close(self) -> None:
-        for svc in self.services.values():
+        with self._lock:
+            svcs = list(self.services.values())
+            self.services.clear()
+        for svc in svcs:
             svc.close()
 
+    def resolve_vault_and_service(self, vault_id: str | None) -> tuple[str, KBService | None]:
+        with self._lock:
+            vid = vault_id if vault_id else self.default_vault_id
+            if not vid:
+                return "", None
+            return vid, self.services.get(vid)
+
     def resolve_service(self, vault_id: str | None) -> KBService | None:
-        if not vault_id:
-            return self.services[self.default_vault_id]
-        return self.services.get(vault_id)
+        return self.resolve_vault_and_service(vault_id)[1]
 
 
 class _HighBacklogHTTPServer(ThreadingHTTPServer):
@@ -154,188 +209,252 @@ class _HighBacklogHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class GatewayRoutesMixin:
+    """Reusable HTTP route handlers for `/healthz`, `/mcp*`, and `/v1/*`."""
+
+    gateway: MultiVaultGateway
+
+    def _send_json(self, status: int, payload: dict | list, extra_headers: dict[str, str] | None = None) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)  # type: ignore[attr-defined]
+        self.send_header("Content-Type", "application/json; charset=utf-8")  # type: ignore[attr-defined]
+        self.send_header("Content-Length", str(len(raw)))  # type: ignore[attr-defined]
+        if extra_headers:
+            for hk, hv in extra_headers.items():
+                self.send_header(hk, hv)  # type: ignore[attr-defined]
+        self.end_headers()  # type: ignore[attr-defined]
+        self.wfile.write(raw)  # type: ignore[attr-defined]
+
+    def _send_empty(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)  # type: ignore[attr-defined]
+        self.send_header("Content-Length", "0")  # type: ignore[attr-defined]
+        if extra_headers:
+            for hk, hv in extra_headers.items():
+                self.send_header(hk, hv)  # type: ignore[attr-defined]
+        self.end_headers()  # type: ignore[attr-defined]
+
+    def _require_auth(self) -> Principal | None:
+        p = self.gateway.tokens.authenticate(self.headers.get("Authorization") or "")  # type: ignore[attr-defined]
+        if p is None:
+            self._send_json(
+                401,
+                {"error": "Unauthorized: valid Bearer token required"},
+                {"WWW-Authenticate": 'Bearer realm="wiki-context"'},
+            )
+        return p
+
+    def _read_json_body(self, max_bytes: int = MAX_HTTP_BODY_BYTES) -> tuple[dict | list | None, str | None]:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")  # type: ignore[attr-defined]
+        except ValueError:
+            return None, "Invalid Content-Length"
+        if length <= 0:
+            return {}, None
+        if length > max_bytes:
+            return None, f"Payload exceeds {max_bytes} bytes"
+        raw = self.rfile.read(length)  # type: ignore[attr-defined]
+        try:
+            return json.loads(raw.decode("utf-8")), None
+        except ValueError:
+            return None, "Invalid JSON payload"
+
+    def _match_mcp_route(self, path: str) -> tuple[bool, str, KBService | None]:
+        if path == "/mcp":
+            vid, svc = self.gateway.resolve_vault_and_service(None)
+            return True, vid, svc
+        if path.startswith("/mcp/"):
+            req_vid = path[len("/mcp/"):].strip("/")
+            vid, svc = self.gateway.resolve_vault_and_service(req_vid)
+            return True, vid, svc
+        return False, "", None
+
+    def try_gateway_get(self, path: str) -> bool:
+        if path == "/healthz":
+            auth_hdr = self.headers.get("Authorization") or ""
+            user = self.gateway.tokens.authenticate(auth_hdr) if auth_hdr else None
+            vaults_stat = {}
+            def_vid = ""
+            if user is not None:
+                with self.gateway._lock:
+                    items = list(self.gateway.services.items())
+                    raw_def = self.gateway.default_vault_id
+                for vid, svc in items:
+                    if user.can_access_vault(vid):
+                        st = svc.tool_status()
+                        vaults_stat[vid] = {
+                            "name": svc.cfg.name,
+                            "generation_id": st["generation_id"],
+                            "docs": st["docs"],
+                            "sections": st["sections"],
+                        }
+                def_vid = (
+                    raw_def
+                    if (raw_def and user.can_access_vault(raw_def))
+                    else (next(iter(vaults_stat), ""))
+                )
+            self._send_json(200, {"status": "ok", "default_vault": def_vid, "vaults": vaults_stat})
+            return True
+
+        is_mcp, vid, _ = self._match_mcp_route(path)
+        if is_mcp:
+            user = self._require_auth()
+            if user is None:
+                return True
+            if vid and not user.can_access_vault(vid):
+                self._send_json(403, {"error": f"Access denied to vault '{vid}'"})
+                return True
+            self._send_empty(405, {"Allow": "POST, DELETE"})
+            return True
+
+        if path == "/v1/whoami":
+            user = self._require_auth()
+            if user is None:
+                return True
+            self._send_json(
+                200,
+                {
+                    "uid": user.uid,
+                    "groups": list(user.groups),
+                    "allowed_vaults": list(user.allowed_vaults),
+                },
+            )
+            return True
+
+        if path == "/v1/vaults":
+            user = self._require_auth()
+            if user is None:
+                return True
+            with self.gateway._lock:
+                items = list(self.gateway.services.items())
+                def_vid = self.gateway.default_vault_id
+            visible = []
+            for vid, svc in items:
+                if user.can_access_vault(vid):
+                    st = svc.tool_status()
+                    visible.append({
+                        "id": vid,
+                        "name": svc.cfg.name,
+                        "layout": svc.cfg.layout,
+                        "docs": st["docs"],
+                        "sections": st["sections"],
+                        "generation_id": st["generation_id"],
+                    })
+            eff_def = def_vid if (def_vid and user.can_access_vault(def_vid)) else (visible[0]["id"] if visible else "")
+            self._send_json(200, {"default": eff_def, "vaults": visible})
+            return True
+
+        return False
+
+    def try_gateway_delete(self, path: str) -> bool:
+        is_mcp, vid, _ = self._match_mcp_route(path)
+        if is_mcp:
+            user = self._require_auth()
+            if user is None:
+                return True
+            if vid and not user.can_access_vault(vid):
+                self._send_json(403, {"error": f"Access denied to vault '{vid}'"})
+                return True
+            self._send_empty(200)
+            return True
+        return False
+
+    def try_gateway_post(self, path: str) -> bool:
+        is_mcp, mcp_vid, mcp_svc = self._match_mcp_route(path)
+        if not is_mcp and path not in {"/v1/context", "/v1/read"}:
+            return False
+
+        user = self._require_auth()
+        if user is None:
+            return True
+
+        if is_mcp:
+            if mcp_svc is None:
+                self._send_json(404, {"error": f"Unknown vault in MCP route: {path}"})
+                return True
+            if not user.can_access_vault(mcp_vid):
+                self._send_json(403, {"error": f"Access denied to vault '{mcp_vid}'"})
+                return True
+            body, err = self._read_json_body()
+            if err is not None:
+                status = 413 if "exceeds" in err else 400
+                self._send_json(status, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err}})
+                return True
+            if isinstance(body, list):
+                responses = []
+                for item in body:
+                    r = handle_jsonrpc_message(mcp_svc, item, principal=user, slim_remote=True)
+                    if r is not None:
+                        responses.append(r)
+                if not responses:
+                    self._send_empty(202)
+                else:
+                    self._send_json(200, responses)
+                return True
+            if isinstance(body, dict):
+                resp = handle_jsonrpc_message(mcp_svc, body, principal=user, slim_remote=True)
+                if resp is None:
+                    self._send_empty(202)
+                else:
+                    self._send_json(200, resp)
+                return True
+            self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
+            return True
+
+        # /v1/context or /v1/read
+        body, err = self._read_json_body()
+        if err is not None or not isinstance(body, dict):
+            self._send_json(400, {"error": err or "JSON object body required"})
+            return True
+        body = dict(body)
+        body.pop("user", None)
+        req_vid = str(body.pop("vault", "") or "").strip() or None
+        vid, svc = self.gateway.resolve_vault_and_service(req_vid)
+        if svc is None:
+            self._send_json(404, {"error": f"Unknown vault '{req_vid}'"})
+            return True
+        if not user.can_access_vault(vid):
+            self._send_json(403, {"error": f"Access denied to vault '{vid}'"})
+            return True
+        out = svc.tool_context(body, principal=user) if path == "/v1/context" else svc.tool_read(body, principal=user)
+        status = 400 if "error" in out else 200
+        if isinstance(out.get("error"), str) and "Access denied" in out["error"]:
+            status = 403
+        self._send_json(status, out)
+        return True
+
+
 def create_http_server(
     gateway: MultiVaultGateway,
     *,
     host: str = "127.0.0.1",
     port: int = 8090,
+    allow_zero_tokens: bool = False,
 ) -> ThreadingHTTPServer:
-    if not gateway.tokens.has_any_token:
+    if not allow_zero_tokens and not gateway.tokens.has_any_token:
         raise ValueError("Refusing to start gateway with 0 configured tokens (set WCTX_TOKENS or --token-file)")
 
-    class GatewayHandler(BaseHTTPRequestHandler):
+    class GatewayHandler(GatewayRoutesMixin, BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, format: str, *args) -> None:  # noqa: A002
             return  # Structured JSONL audit handles logging cleanly
 
-        def _send_json(self, status: int, payload: dict | list, extra_headers: dict[str, str] | None = None) -> None:
-            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            if extra_headers:
-                for hk, hv in extra_headers.items():
-                    self.send_header(hk, hv)
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def _send_empty(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
-            self.send_response(status)
-            self.send_header("Content-Length", "0")
-            if extra_headers:
-                for hk, hv in extra_headers.items():
-                    self.send_header(hk, hv)
-            self.end_headers()
-
-        def _require_auth(self) -> Principal | None:
-            p = gateway.tokens.authenticate(self.headers.get("Authorization") or "")
-            if p is None:
-                self._send_json(
-                    401,
-                    {"error": "Unauthorized: valid Bearer token required"},
-                    {"WWW-Authenticate": 'Bearer realm="wiki-context"'},
-                )
-            return p
-
-        def _read_json_body(self) -> tuple[dict | list | None, str | None]:
-            try:
-                length = int(self.headers.get("Content-Length") or "0")
-            except ValueError:
-                return None, "Invalid Content-Length"
-            if length <= 0:
-                return {}, None
-            if length > MAX_HTTP_BODY_BYTES:
-                return None, f"Payload exceeds {MAX_HTTP_BODY_BYTES} bytes"
-            raw = self.rfile.read(length)
-            try:
-                return json.loads(raw.decode("utf-8")), None
-            except ValueError:
-                return None, "Invalid JSON payload"
-
-        def _match_mcp_route(self, path: str) -> tuple[bool, KBService | None]:
-            if path == "/mcp":
-                return True, gateway.resolve_service(None)
-            if path.startswith("/mcp/"):
-                vid = path[len("/mcp/"):].strip("/")
-                return True, gateway.resolve_service(vid)
-            return False, None
-
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
-            if path == "/healthz":
-                vaults_stat = {}
-                for vid, svc in gateway.services.items():
-                    st = svc.tool_status()
-                    vaults_stat[vid] = {
-                        "name": svc.cfg.name,
-                        "generation_id": st["generation_id"],
-                        "docs": st["docs"],
-                        "sections": st["sections"],
-                    }
-                self._send_json(200, {"status": "ok", "default_vault": gateway.default_vault_id, "vaults": vaults_stat})
-                return
-
-            is_mcp, _ = self._match_mcp_route(path)
-            if is_mcp:
-                if self._require_auth() is None:
-                    return
-                self._send_empty(405, {"Allow": "POST, DELETE"})
-                return
-
-            if path == "/v1/whoami":
-                user = self._require_auth()
-                if user is None:
-                    return
-                self._send_json(200, {"uid": user.uid, "groups": list(user.groups)})
-                return
-
-            if path == "/v1/vaults":
-                user = self._require_auth()
-                if user is None:
-                    return
-                self._send_json(
-                    200,
-                    {
-                        "default": gateway.default_vault_id,
-                        "vaults": [
-                            {"id": vid, "name": svc.cfg.name, "layout": svc.cfg.layout}
-                            for vid, svc in gateway.services.items()
-                        ],
-                    },
-                )
-                return
-
-            self._send_json(404, {"error": f"Not found: {path}"})
+            if not self.try_gateway_get(path):
+                self._send_json(404, {"error": f"Not found: {path}"})
 
         def do_DELETE(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
-            is_mcp, _ = self._match_mcp_route(path)
-            if is_mcp:
-                if self._require_auth() is None:
-                    return
-                self._send_empty(200)
-                return
-            self._send_json(404, {"error": f"Not found: {path}"})
+            if not self.try_gateway_delete(path):
+                self._send_json(404, {"error": f"Not found: {path}"})
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
-            user = self._require_auth()
-            if user is None:
-                return
+            if not self.try_gateway_post(path):
+                self._send_json(404, {"error": f"Not found: {path}"})
 
-            is_mcp, mcp_svc = self._match_mcp_route(path)
-            if is_mcp:
-                if mcp_svc is None:
-                    self._send_json(404, {"error": f"Unknown vault in MCP route: {path}"})
-                    return
-                body, err = self._read_json_body()
-                if err is not None:
-                    status = 413 if "exceeds" in err else 400
-                    self._send_json(status, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err}})
-                    return
-                if isinstance(body, list):
-                    responses = []
-                    for item in body:
-                        r = handle_jsonrpc_message(mcp_svc, item, principal=user, slim_remote=True)
-                        if r is not None:
-                            responses.append(r)
-                    if not responses:
-                        self._send_empty(202)
-                    else:
-                        self._send_json(200, responses)
-                    return
-                if isinstance(body, dict):
-                    resp = handle_jsonrpc_message(mcp_svc, body, principal=user, slim_remote=True)
-                    if resp is None:
-                        self._send_empty(202)
-                    else:
-                        self._send_json(200, resp)
-                    return
-                self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
-                return
-
-            if path in {"/v1/context", "/v1/read"}:
-                body, err = self._read_json_body()
-                if err is not None or not isinstance(body, dict):
-                    self._send_json(400, {"error": err or "JSON object body required"})
-                    return
-                body = dict(body)
-                body.pop("user", None)
-                vid = str(body.pop("vault", "") or "").strip() or None
-                svc = gateway.resolve_service(vid)
-                if svc is None:
-                    self._send_json(404, {"error": f"Unknown vault '{vid}'"})
-                    return
-                out = svc.tool_context(body, principal=user) if path == "/v1/context" else svc.tool_read(body, principal=user)
-                status = 400 if "error" in out else 200
-                if isinstance(out.get("error"), str) and "Access denied" in out["error"]:
-                    status = 403
-                self._send_json(status, out)
-                return
-
-            self._send_json(404, {"error": f"Not found: {path}"})
-
+    GatewayHandler.gateway = gateway
     return _HighBacklogHTTPServer((host, port), GatewayHandler)
 
 
@@ -411,7 +530,7 @@ def selftest_gateway(vault_map: dict[str, Path | str]) -> int:
         )
         with urllib.request.urlopen(req_tools, timeout=5) as r:
             tools = [x["name"] for x in json.loads(r.read())["result"]["tools"]]
-            assert {"kb_context", "kb_read", "kb_list", "kb_inspect_visual"}.issubset(set(tools))
+            assert {"wiki_context", "wiki_read", "wiki_list", "wiki_inspect_visual"}.issubset(set(tools))
 
         print(f"gateway selftest: OK (port={port}, vaults={list(gw.services)}, tools={tools})")
         return 0

@@ -3,7 +3,7 @@
 Features:
 - Atomic immutable snapshot hot-reload (`KBSnapshot`) + 30s grace drain queue.
 - High-precision credential scrubbing (`PRIVATE KEY`, `sk-...`, `AKIA...`, `Bearer`, `Cookie`).
-- `O_NOFOLLOW` + `fstat` sandboxed `kb_read` over mirrors, wiki, and catalog.
+- `O_NOFOLLOW` + `fstat` sandboxed `wiki_read` over mirrors, wiki, and catalog.
 - Dynamic multi-vault tool description disambiguation (`[vault_name]` + domain cheatsheet).
 """
 
@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import __version__
 from .config import VaultConfig
 from .context import AccessPolicy, ContextPackEngine, Principal, SynonymBook, policy_for_vault
 from .policy import mirror_skip_reason
@@ -123,7 +124,7 @@ def make_snippet(
 
 TOOLS_SPEC: list[dict] = [
     {
-        "name": "kb_context",
+        "name": "wiki_context",
         "description": (
             "One-shot deterministic knowledge context assembler (Preferred default: answers 95% of questions in 1 call). "
             "Combines synonym alignment, compiled Wiki synthesis + primary source FTS5 retrieval, table-header pinning, "
@@ -147,7 +148,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_search",
+        "name": "wiki_search",
         "description": "Fine-grained BM25/FTS5 search returning primary hits (`hits`) and compiled Wiki hits (`wiki_hits`).",
         "inputSchema": {
             "type": "object",
@@ -164,7 +165,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_read",
+        "name": "wiki_read",
         "description": (
             "Read exact line ranges (`start`..`end`, <=400 lines) or `page_num` (0-based) from derived primary mirrors, "
             "compiled Wiki pages, or the vault catalog."
@@ -181,7 +182,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_route",
+        "name": "wiki_route",
         "description": "Classify whether a question is a single-lookup `fact` or multi-hop `complex` query.",
         "inputSchema": {
             "type": "object",
@@ -190,7 +191,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_list",
+        "name": "wiki_list",
         "description": "List indexed documents in the vault (with optional path substring filter).",
         "inputSchema": {
             "type": "object",
@@ -201,7 +202,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_inspect_visual",
+        "name": "wiki_inspect_visual",
         "description": (
             "Return crisp visual diagrams, embedded Office figures, standalone images, or rendered PDF visual pages "
             "as native MCP multimodal `image` content blocks so VLM agents can visually inspect charts and schematics."
@@ -222,7 +223,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_remember",
+        "name": "wiki_remember",
         "description": (
             "Save a domain operational finding, field troubleshooting insight, or source-anchored errata pin into Layer-4 "
             "`notes/` (`记忆/`). Never mutates read-only `sources/`; automatically inherits `PrefixACLPolicy` from `related_sources`."
@@ -251,7 +252,7 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_forget",
+        "name": "wiki_forget",
         "description": "Archive/retract an obsolete or mistaken Layer-4 memory note by `note_id`.",
         "inputSchema": {
             "type": "object",
@@ -262,11 +263,23 @@ TOOLS_SPEC: list[dict] = [
         },
     },
     {
-        "name": "kb_status",
+        "name": "wiki_status",
         "description": "Return index generation id, document/section counts, skip statistics, and coverage boundaries.",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
+
+_LEGACY_TOOL_ALIASES: dict[str, str] = {
+    "kb_context": "wiki_context",
+    "kb_search": "wiki_search",
+    "kb_read": "wiki_read",
+    "kb_route": "wiki_route",
+    "kb_list": "wiki_list",
+    "kb_inspect_visual": "wiki_inspect_visual",
+    "kb_remember": "wiki_remember",
+    "kb_forget": "wiki_forget",
+    "kb_status": "wiki_status",
+}
 
 
 MAX_VISUAL_IMAGE_BYTES = 4 * 1024 * 1024
@@ -297,12 +310,17 @@ class KBService:
     ):
         self.cfg = VaultConfig.load(vault)
         self.vault = self.cfg.root
-        self.identity = (os.environ.get("KB_USER") or os.environ.get("WCTX_USER") or "local").strip()
+        self.identity = (
+            os.environ.get("WIKI_USER")
+            or os.environ.get("WCTX_USER")
+            or os.environ.get("KB_USER")
+            or "local"
+        ).strip()
 
         if self.cfg.sensitive:
             if self.identity in {"", "anonymous", "local"} or os.environ.get("WCTX_INTERNAL_MODEL") != "1":
                 raise PermissionError(
-                    f"Vault '{self.cfg.name}' is marked sensitive=true; explicit KB_USER and WCTX_INTERNAL_MODEL=1 are required"
+                    f"Vault '{self.cfg.name}' is marked sensitive=true; explicit WCTX_USER and WCTX_INTERNAL_MODEL=1 are required"
                 )
 
         self.policy = policy or policy_for_vault(self.cfg)
@@ -316,7 +334,7 @@ class KBService:
 
         self._snap_lock = threading.Lock()
         self._retired: list[tuple[float, KBSnapshot]] = []
-        self._audit_log = (os.environ.get("KB_AUDIT_LOG") or os.environ.get("WCTX_AUDIT_LOG") or "").strip()
+        self._audit_log = (os.environ.get("WCTX_AUDIT_LOG") or os.environ.get("KB_AUDIT_LOG") or "").strip()
         self._audit_lock = threading.Lock()
         self._snapshot: KBSnapshot = self._load_snapshot()
 
@@ -466,7 +484,7 @@ class KBService:
         cheatsheet = self.context_engine.domain_cheatsheet()
         is_zh = self.cfg.layout == "zh"
         vault_tag = f"【{self.cfg.name}】" if is_zh else f"[{self.cfg.name}] "
-        allowed = {"kb_context", "kb_read", "kb_inspect_visual", "kb_list"} if slim_remote else None
+        allowed = {"wiki_context", "wiki_read", "wiki_inspect_visual", "wiki_list"} if slim_remote else None
         out: list[dict] = []
 
         for t in TOOLS_SPEC:
@@ -475,15 +493,15 @@ class KBService:
                 continue
             item = dict(t)
             desc = t["description"]
-            if name == "kb_context" and cheatsheet:
+            if name == "wiki_context" and cheatsheet:
                 if is_zh:
                     desc = f"{desc} 【本库领域参考】{cheatsheet}。若提问为口语，可在 expanded_terms 补充对应标准术语。"
                 else:
                     desc = f"{desc} [Vault Reference] {cheatsheet}. Supply 2-5 canonical terms in `expanded_terms` when queries use slang."
-            elif name == "kb_list" and slim_remote:
+            elif name == "wiki_list" and slim_remote:
                 desc = (
                     "Call ONLY when the user explicitly asks to list files/documents in the vault; "
-                    "for all domain questions, call `kb_context` directly."
+                    "for all domain questions, call `wiki_context` directly."
                 )
             item["description"] = f"{vault_tag}{desc}"
             out.append(item)
@@ -903,22 +921,23 @@ class KBService:
         is_err = False
         payload_out: str | list[dict]
 
-        if name == "kb_context":
+        canonical = _LEGACY_TOOL_ALIASES.get(name, name)
+        if canonical == "wiki_context":
             out = self.tool_context(args, principal=user)
             if "error" in out:
                 is_err = True
                 payload_out = json.dumps(out, ensure_ascii=False)
             else:
                 payload_out = out["context_markdown"]
-        elif name == "kb_search":
+        elif canonical == "wiki_search":
             out = self.tool_search(args, principal=user)
             is_err = "error" in out
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_read":
+        elif canonical == "wiki_read":
             out = self.tool_read(args, principal=user)
             is_err = "error" in out
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_inspect_visual":
+        elif canonical == "wiki_inspect_visual":
             vis_res, is_err = self.tool_inspect_visual(args, principal=user)
             if isinstance(vis_res, list):
                 out = {"asset_blocks": len(vis_res)}
@@ -926,21 +945,21 @@ class KBService:
             else:
                 out = vis_res
                 payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_route":
+        elif canonical == "wiki_route":
             out = self.tool_route(args)
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_list":
+        elif canonical == "wiki_list":
             out = self.tool_list(args, principal=user)
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_remember":
+        elif canonical == "wiki_remember":
             out = self.tool_remember(args, principal=user, is_remote=is_remote)
             is_err = "error" in out
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_forget":
+        elif canonical == "wiki_forget":
             out = self.tool_forget(args, principal=user, is_remote=is_remote)
             is_err = "error" in out
             payload_out = json.dumps(out, ensure_ascii=False)
-        elif name == "kb_status":
+        elif canonical == "wiki_status":
             out = self.tool_status(principal=user)
             payload_out = json.dumps(out, ensure_ascii=False)
         else:
@@ -1004,7 +1023,7 @@ def handle_jsonrpc_message(
             "result": {
                 "protocolVersion": proto_ver,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": f"wiki-context ({svc.cfg.name})", "version": "0.2.0"},
+                "serverInfo": {"name": f"wiki-context ({svc.cfg.name})", "version": __version__},
             },
         }
     if method == "ping":
@@ -1018,8 +1037,9 @@ def handle_jsonrpc_message(
     if method == "tools/call":
         params = msg.get("params") or {}
         tname = str(params.get("name") or "")
+        canonical_tname = _LEGACY_TOOL_ALIASES.get(tname, tname)
         targs = params.get("arguments")
-        if slim_remote and tname not in {"kb_context", "kb_read", "kb_inspect_visual", "kb_remember", "kb_forget", "kb_list"}:
+        if slim_remote and canonical_tname not in {"wiki_context", "wiki_read", "wiki_inspect_visual", "wiki_remember", "wiki_forget", "wiki_list"}:
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1083,19 +1103,19 @@ def selftest_mcp(vault: Path | str) -> int:
 
         r_tools = handle_jsonrpc_message(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tool_names = [t["name"] for t in (r_tools or {}).get("result", {}).get("tools", ())]
-        assert r_tools and {"kb_context", "kb_search", "kb_read", "kb_inspect_visual", "kb_route", "kb_list", "kb_status"}.issubset(set(tool_names))
+        assert r_tools and {"wiki_context", "wiki_search", "wiki_read", "wiki_inspect_visual", "wiki_route", "wiki_list", "wiki_status"}.issubset(set(tool_names))
 
         # Path traversal check
         r_trav = handle_jsonrpc_message(
             svc,
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_read", "arguments": {"source": "sources/../../etc/passwd"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "wiki_read", "arguments": {"source": "sources/../../etc/passwd"}}},
         )
         assert r_trav and r_trav["result"]["isError"] is True
 
         # Identity spoofing check
         r_stat = handle_jsonrpc_message(
             svc,
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_status", "arguments": {"user": "spoofed_attacker"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "wiki_status", "arguments": {"user": "spoofed_attacker"}}},
         )
         assert r_stat and json.loads(r_stat["result"]["content"][0]["text"])["identity"] == svc.identity
         print(f"mcp selftest: OK (vault={svc.cfg.name}, tools={len(tool_names)})")

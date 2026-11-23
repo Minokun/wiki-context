@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import __version__
 from .compiler import compile_vault
+from .console import ConsoleState, load_console_vault_map, probe_remote_gateway, run_console
 from .eval_harness import evaluate_vault
 from .freshness import check_vault_freshness, snapshot_wiki_hashes
 from .gateway import MultiVaultGateway, TokenRegistry, create_http_server, parse_vault_specs, selftest_gateway
@@ -18,6 +19,7 @@ from .indexer import check_index, rebuild_index
 from .lint import lint_vault
 from .mcp_server import KBService, run_stdio_server, scrub_secrets, selftest_mcp
 from .memory import MemoryStore
+from .ops import install_service, render_service_definition, run_doctor, service_status, uninstall_service
 from .remote_stdio import run_bridge
 from .scaffold import init_vault
 from .search import BM25Index, route
@@ -104,12 +106,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gw.add_argument(
         "--vault",
         action="append",
-        required=True,
-        help="Vault path or `id=path` (repeatable for hosting multiple vaults on `/mcp/<id>`)",
+        default=[],
+        help="Vault path or `id=path` (repeatable; defaults to vaults registered in ~/.wiki-context/console.json)",
     )
     p_gw.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     p_gw.add_argument("--port", type=int, default=8090, help="Bind port (default: 8090)")
-    p_gw.add_argument("--token-file", help="Path to hot-reloaded JSON token & ACL config")
+    p_gw.add_argument("--token-file", help="Path to hot-reloaded JSON token & ACL config (defaults to ~/.wiki-context/tokens.json if present)")
+    p_gw.add_argument("--config-dir", help="Console config directory when loading vaults/tokens automatically")
     p_gw.add_argument("--test", action="store_true", help="Run gateway HTTP self-test and exit")
 
     # bridge (local stdio -> remote HTTP MCP)
@@ -145,6 +148,50 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--vault", default=".", help="Vault root path")
     p_eval.add_argument("--questions", help="Optional gold QA JSON path (auto-generates smoke suite if omitted)")
     p_eval.add_argument("--json", action="store_true", help="Print full JSON report")
+
+    # ui / console (Web Control Console + Embedded Multi-Vault Gateway)
+    p_ui = sub.add_parser(
+        "ui",
+        aliases=["console"],
+        help="Launch the Web Control Console for vault onboarding, tokens/ACL, MCP client configs & memory",
+    )
+    p_ui.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_ui.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    p_ui.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
+    p_ui.add_argument("--vault", action="append", default=[], help="Extra vault spec `path` or `id=path` to register")
+    p_ui.add_argument("--no-browser", action="store_true", help="Do not auto-open browser window on startup")
+    p_ui.add_argument("--allow-remote-admin", action="store_true", help="Allow binding admin UI to non-loopback host")
+
+    # doctor (environment & setup diagnostic)
+    p_doc = sub.add_parser("doctor", help="Check Python, wctx PATH, poppler/PDF tools, AI clients & ports")
+    p_doc.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
+    p_doc.add_argument("--json", action="store_true", help="Print full JSON diagnostic report")
+
+    # service (background daemon helper for launchd / systemd --user)
+    p_svc = sub.add_parser("service", help="Render, install, inspect, or remove a background daemon (launchd / systemd)")
+    p_svc.add_argument("action", choices=["status", "render", "install", "uninstall"], nargs="?", default="status")
+    p_svc.add_argument("--target", choices=["ui", "gateway"], default="gateway", help="Daemon mode (default: gateway)")
+    p_svc.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_svc.add_argument("--port", type=int, help="Bind port (default: 8765 for ui, 8090 for gateway)")
+    p_svc.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
+    p_svc.add_argument("--vault", action="append", default=[], help="Vault path or `id=path` (repeatable)")
+    p_svc.add_argument("--token-file", help="Path to JSON token & ACL config (gateway target)")
+    p_svc.add_argument("--allow-remote-admin", action="store_true", help="Allow non-loopback bind when --target ui")
+    p_svc.add_argument("--dry-run", action="store_true", help="Preview service changes without writing or loading")
+    p_svc.add_argument("--json", action="store_true", help="Print structured JSON output")
+
+    # remote (connect Computer B directly to Computer A's gateway + auto-configure local AI clients)
+    p_remote = sub.add_parser(
+        "remote",
+        help="Connect to a remote wiki-context gateway (URL + Token) and auto-mount into local AI clients",
+    )
+    p_remote.add_argument("action", choices=["list", "probe", "add", "remove"], nargs="?", default="list")
+    p_remote.add_argument("--url", help="Remote gateway address, e.g. http://192.168.1.25:8090")
+    p_remote.add_argument("--token", help="Bearer token issued by remote gateway (wctx_...)")
+    p_remote.add_argument("--vault", action="append", default=[], help="Specific remote vault ID(s) to mount (default: all authorized)")
+    p_remote.add_argument("--id", help="Local vault ID to remove when action=remove")
+    p_remote.add_argument("--no-sync-clients", action="store_true", help="Register remote vaults without auto-writing local AI client configs")
+    p_remote.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
 
     return p
 
@@ -252,15 +299,29 @@ def main(argv: list[str] | None = None) -> int:
             return run_stdio_server(args.vault)
 
         if args.cmd == "gateway":
-            vmap = parse_vault_specs(args.vault)
+            console_vmap, default_tok_file = load_console_vault_map(args.config_dir)
+            vmap = parse_vault_specs(args.vault) if args.vault else console_vmap
+            if not vmap:
+                raise ValueError(
+                    "No vaults configured. Pass `--vault id=/path/to/vault` or onboard vaults first via `wctx ui`."
+                )
             if args.test:
                 return selftest_gateway(vmap)
-            reg = TokenRegistry(token_file=args.token_file)
+            tok_file = args.token_file or (str(default_tok_file) if default_tok_file.is_file() else None)
+            reg = TokenRegistry(token_file=tok_file)
+            if not reg.has_any_token:
+                print(
+                    "[WARNING] No active Bearer tokens found (set WCTX_TOKENS or create tokens in `wctx ui` / tokens.json); "
+                    "all /mcp and /v1/* requests will return 401 Unauthorized until a token is added.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             gw = MultiVaultGateway(vmap, tokens=reg)
-            srv = create_http_server(gw, host=args.host, port=args.port)
+            srv = create_http_server(gw, host=args.host, port=args.port, allow_zero_tokens=True)
             print(
                 f"wiki-context gateway listening on http://{args.host}:{args.port} "
-                f"(vaults={list(vmap)}, default='{gw.default_vault_id}')",
+                f"(vaults={list(vmap)}, default='{gw.default_vault_id}', "
+                f"token_file={tok_file or 'env-only'})",
                 flush=True,
             )
             try:
@@ -346,6 +407,99 @@ def main(argv: list[str] | None = None) -> int:
                     f"Composite: {rep['composite_score']}"
                 )
             return 0 if (rep["strict_recall"] >= 1.0 and rep["guardrail_accuracy"] >= 1.0) else 1
+
+        if args.cmd in {"ui", "console"}:
+            extra_v = parse_vault_specs(args.vault) if args.vault else {}
+            return run_console(
+                host=args.host,
+                port=args.port,
+                config_dir=args.config_dir,
+                extra_vault_specs=extra_v,
+                open_browser=not args.no_browser,
+                allow_remote_admin=args.allow_remote_admin,
+            )
+
+        if args.cmd == "doctor":
+            rep = run_doctor(config_dir=args.config_dir)
+            if args.json:
+                print(json.dumps(rep, ensure_ascii=False, indent=2))
+            else:
+                print(f"wiki-context v{rep['version']} ({rep['platform']})")
+                for chk in rep["checks"]:
+                    icon = "OK  " if chk["level"] == "ok" else ("WARN" if chk["level"] == "warn" else ("ERR " if chk["level"] == "error" else "INFO"))
+                    print(f"[{icon}] {chk['label']}: {chk['detail']}")
+                    if chk["fix"]:
+                        print(f"       -> {chk['fix']}")
+                print(
+                    f"Services: ui={rep['services']['ui']['detail']} | "
+                    f"gateway={rep['services']['gateway']['detail']}"
+                )
+            return 0 if rep["python"]["ok"] else 1
+
+        if args.cmd == "service":
+            if args.action == "status":
+                st = service_status(args.target)
+                print(json.dumps(st, ensure_ascii=False, indent=2))
+                return 0
+            if args.action == "render":
+                spec = render_service_definition(
+                    args.target,
+                    host=args.host,
+                    port=args.port,
+                    config_dir=args.config_dir,
+                    vault_specs=args.vault,
+                    token_file=args.token_file,
+                    allow_remote_admin=args.allow_remote_admin,
+                )
+                if args.json:
+                    print(json.dumps(spec, ensure_ascii=False, indent=2))
+                else:
+                    print(spec["content"], end="")
+                return 0
+            if args.action == "install":
+                res = install_service(
+                    args.target,
+                    host=args.host,
+                    port=args.port,
+                    config_dir=args.config_dir,
+                    vault_specs=args.vault,
+                    token_file=args.token_file,
+                    allow_remote_admin=args.allow_remote_admin,
+                    dry_run=args.dry_run,
+                )
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                return 0
+            res = uninstall_service(args.target, dry_run=args.dry_run)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "remote":
+            if args.action == "probe":
+                rep = probe_remote_gateway(args.url or "", args.token or "")
+                print(json.dumps(rep, ensure_ascii=False, indent=2))
+                return 0
+            st = ConsoleState(config_dir=args.config_dir)
+            try:
+                if args.action == "list":
+                    remotes = [v for v in st.list_vaults_detailed() if v.get("kind") == "remote"]
+                    print(json.dumps({"count": len(remotes), "remotes": remotes}, ensure_ascii=False, indent=2))
+                    return 0
+                if args.action == "add":
+                    res = st.connect_remote_gateway(
+                        gateway_url=args.url or "",
+                        token=args.token or "",
+                        selected_remote_ids=args.vault or None,
+                        sync_clients=not args.no_sync_clients,
+                    )
+                    print(json.dumps(res, ensure_ascii=False, indent=2))
+                    return 0
+                if not args.id:
+                    raise ValueError("Please specify --id <vault_id> for `wctx remote remove`")
+                ok = st.unregister_vault(args.id)
+                print(json.dumps({"removed": ok, "id": args.id}, ensure_ascii=False, indent=2))
+                return 0 if ok else 1
+            finally:
+                st.close()
 
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

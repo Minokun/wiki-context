@@ -7,7 +7,7 @@ Architectural separation:
   1. Never mutates or contaminates Layer-1 `sources/` ground truth;
   2. Automatically inherits `PrefixACLPolicy` restrictions from every linked `related_sources` entry;
   3. Attaches `kind="errata"` notes as 1-hop `📌 Errata Pins` directly onto retrieved `[S1..Sn]` chunks;
-  4. Renders non-errata `active` notes in a quarantined section of `<kb_context>`;
+  4. Renders non-errata `active` notes in a quarantined section of `<wiki_context>`;
   5. Consolidates `active` notes into permanent `wiki/*.md` pages during `wctx compile`.
 """
 
@@ -277,10 +277,13 @@ class MemoryStore:
             tokens=frozenset(tokenize(clean_text)),
         )
 
+    def get_note(self, note_id: str) -> MemoryNote | None:
+        return next((n for n in self.list_notes(status=None) if n.note_id == note_id), None)
+
     def update_status(self, note_id: str, new_status: str, *, consolidated_into: str = "") -> bool:
         if new_status not in VALID_MEMORY_STATUSES:
             raise ValueError(f"Invalid status: {new_status}")
-        target = next((n for n in self.list_notes(status=None) if n.note_id == note_id), None)
+        target = self.get_note(note_id)
         if target is None or not target.file_path.is_file():
             return False
         payload = _serialize_note(
@@ -297,6 +300,77 @@ class MemoryStore:
         tmp = target.file_path.with_name(f".{target.file_path.name}.tmp-{os.getpid()}")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(target.file_path)
+        with self._lock:
+            self._cache_sig = None
+        return True
+
+    def update_note(
+        self,
+        note_id: str,
+        *,
+        text: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        related_sources: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> MemoryNote | None:
+        target = self.get_note(note_id)
+        if target is None or not target.file_path.is_file():
+            return None
+
+        new_text = self._scrub(text.strip()) if text is not None else target.text
+        if not new_text:
+            raise ValueError("Memory text must not be empty")
+
+        new_kind = kind.strip().lower() if kind is not None else target.kind
+        if new_kind not in VALID_MEMORY_KINDS:
+            raise ValueError(f"Unsupported memory kind '{kind}'; choose from {sorted(VALID_MEMORY_KINDS)}")
+
+        new_status = status.strip().lower() if status is not None else target.status
+        if new_status not in VALID_MEMORY_STATUSES:
+            raise ValueError(f"Invalid status: {status}")
+
+        if related_sources is not None:
+            norm_srcs: list[str] = []
+            for s in related_sources:
+                s_str = str(s).strip()
+                if s_str:
+                    norm_srcs.append(self.cfg.normalize_source_ref(s_str))
+            final_srcs: Sequence[str] = norm_srcs
+        else:
+            final_srcs = target.related_sources
+
+        if tags is not None:
+            clean_tags = [re.sub(r"[^\w\u4e00-\u9fff._-]+", "-", str(t).strip()).strip("-") for t in tags]
+            final_tags: Sequence[str] = [t for t in clean_tags if t][:10]
+        else:
+            final_tags = target.tags
+
+        payload = _serialize_note(
+            note_id=target.note_id,
+            kind=new_kind,
+            status=new_status,
+            author=target.author,
+            created_at=target.created_at,
+            related_sources=final_srcs,
+            tags=final_tags,
+            text=new_text,
+        )
+        tmp = target.file_path.with_name(f".{target.file_path.name}.tmp-{os.getpid()}")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(target.file_path)
+        with self._lock:
+            self._cache_sig = None
+        return self.get_note(note_id)
+
+    def delete_note(self, note_id: str) -> bool:
+        target = self.get_note(note_id)
+        if target is None or not target.file_path.is_file():
+            return False
+        try:
+            target.file_path.unlink()
+        except OSError:
+            return False
         with self._lock:
             self._cache_sig = None
         return True

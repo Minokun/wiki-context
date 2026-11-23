@@ -19,7 +19,7 @@
 
 1. **「写链路重理解」与「读链路零大模型极速供料」彻底解耦**：
    - **离线写链路**：将散乱异构的 PDF、Word（`.docx`）、PPT（`.pptx`）、Excel（`.xlsx`）、CSV 与 Markdown 零依赖提取为带页码/行号/表头坐标的结构化镜像，并通过人机共创或 `wctx compile` 离线编译沉淀跨文档综述页（`wiki/` 或 `知识库/`），同时用 SHA-256 指纹锁死原件新鲜度。
-   - **在线读链路**：网关自身 **0 大模型 Token 消耗、0 外部 API 依赖、0 第三方 Python 包**。单次 `kb_context` 调用在 **~2–35 ms** 内，确定性地拼装出「高层 Wiki 全局导读（24% 预算）+ 一跳溯源的一手原件段落/自动置顶表头（76% 预算）+ 零命中缺词防幻觉护栏」。
+   - **在线读链路**：网关自身 **0 大模型 Token 消耗、0 外部 API 依赖、0 第三方 Python 包**。单次 `wiki_context` 调用在 **~2–35 ms** 内，确定性地拼装出「高层 Wiki 全局导读（24% 预算）+ 一跳溯源的一手原件段落/自动置顶表头（76% 预算）+ 零命中缺词防幻觉护栏」。
 2. **清晰的架构职责边界（`Context` vs. `State & Action`）**：
    - `wiki-context` 专注承载**只读背景认知（Context）**：技术规范（RFC/ADR）、产品选型手册、规格参数大表、商务报价红线、管理制度与故障复盘（Postmortem）。
    - 与企业事务型 MCP（SQL / ERP / GitHub / Jira MCP）天然并联互补：Agent 先花 3 ms 调一次 `wiki-context` 摸清业务规则与红线，再调用业务系统查询实时状态或执行变更动作。
@@ -38,7 +38,7 @@
                          ▼
          不可变快照 `gen-<id>/bm25.sqlite` ◄── `current.json` 原子热切换 (`?mode=ro&immutable=1` 无锁并发)
                          │
-                         │  3. 单次 `kb_context` 调用 (~2–35 ms，0 运行时 LLM Token)
+                         │  3. 单次 `wiki_context` 调用 (~2–35 ms，0 运行时 LLM Token)
                          ▼
      Claude Code / Codex / Cursor / DSH / 自研 Agent (支持 Stdio MCP、Streamable HTTP `/mcp` 与 REST)
 ```
@@ -90,14 +90,14 @@
 
 ---
 
-## 单次 `kb_context` 真实输出示例
+## 单次 `wiki_context` 真实输出示例
 
 ### 场景一：深层 CSV 大表查数 + Wiki 一跳溯源（耗时 `~3 ms`）
 
 提问：*`What are the Sustained_RPS, Burst_Bucket, and Max_Payload_MB limits for the Enterprise-Dedicated tier?`*
 
 ```markdown
-<kb_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
+<wiki_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
 ## 1. Compiled Wiki Synthesis (Verify exact figures & clauses against Primary Sources below)
 ### [W1] wiki/Gateway-Rate-Limiting-and-SLOs.md § Key Facts (L20-L24) [freshness:fresh]
 - **Token Bucket Enforcement**: Edge nodes enforce per-tenant token buckets using local atomic counters synced every `250ms`...
@@ -113,7 +113,7 @@
 
 ## 3. Gap Diagnostics & Grounding Guardrails (Mandatory)
 - Grounding Rule: Every claim must be directly supported by [S1]~[Sn] above with explicit source citations...
-</kb_context>
+</wiki_context>
 ```
 可以看到：`[W1]` 先给出经过哈希校验（`[freshness:fresh]`）的全局规则导读，同时一跳溯源拉出 `tier-quotas.csv` 第 `L24–L47` 行，并**自动将第 1 行的表头钉在片段最上方**。
 
@@ -122,13 +122,13 @@
 提问：*`What is the Kafka partition retention period for billing events?`*（库内实际采用 Raft WAL，根本没有 Kafka）
 
 ```markdown
-<kb_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
+<wiki_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
 ## 2. Primary Source Evidence (Authoritative Ground Truth)
 *(No directly matching primary source chunks found)*
 
 ## 3. Gap Diagnostics & Grounding Guardrails (Mandatory)
 - ⚠️ Missing-Concept Alert: Key query concept(s) 'Kafka', 'partition', 'retention', 'period', 'billing', 'events' had 0 hits across all retrieved chunks! This likely indicates a knowledge gap in the vault — do NOT hallucinate figures or clauses from pretraining.
-</kb_context>
+</wiki_context>
 ```
 
 ---
@@ -149,12 +149,21 @@
 ### 1. 安装
 
 ```bash
+# 推荐：一行全局安装（独立环境，避免 macOS/Linux 系统 Python 的 PEP 668 报错）：
+pipx install git+https://github.com/Minokun/wiki-context.git
+# 或使用 uv：
+uv tool install git+https://github.com/Minokun/wiki-context.git
+
+# 或从本地源码可编辑安装：
 git clone https://github.com/Minokun/wiki-context.git
 cd wiki-context
 pip install -e .
+
+# 首次安装后一键体检（检查 Python、PATH、poppler/PDF 提取工具与本机 AI 客户端）：
+wctx doctor
 ```
 
-*（全程无需下载任何第三方 Python 依赖包；如需原生提取 PDF 文本，可按需安装系统级 `poppler` 提供 `pdftotext`。）*
+*（全程无需下载任何第三方 Python 依赖包；如需原生提取 PDF 文本与渲染 PDF 视觉页，可按需安装系统级 `poppler`：`brew install poppler` 或 `sudo apt install poppler-utils`。）*
 
 ### 2. 运行内置可复现基准评测
 
@@ -193,7 +202,21 @@ wctx sync --vault ./我的知识库
 
 # 在终端直接测试单次证据包组装：
 wctx context --vault ./我的知识库 -q "系统网关限流规则与重试要求是什么？"
+
+# 或一键打开可视化 Web 控制中心（默认 http://127.0.0.1:8765）：
+wctx ui
 ```
+
+---
+
+## 可视化 Web 控制中心（`wctx ui`）
+
+不想手改多份配置文件？直接运行 `wctx ui`（零第三方依赖，默认绑定本机 `http://127.0.0.1:8765` 并内置 CSRF 防护，同时挂载多库 HTTP 网关），在一个清爽页面内完成全流程管控：
+
+1. **文件夹纳管与一键初始化**：内置本地目录浏览器，支持识别「空白目录」「已有知识库」以及「已存有零散文档的普通文件夹」（自动将现有资料安全归入只读 `史料/` 层并构建四层结构与 FTS5 索引），支持向现有库导入外部资料夹、一键增量同步、健康体检与 `wiki_context` 在线演练。
+2. **令牌签发与多级访问权限（RBAC）**：可视化签发 SHA-256 哈希令牌（明文仅展示一次），精确勾选每枚令牌**允许访问的知识库范围（`allowed_vaults`）**与**角色目录前缀白/黑名单（`allow`/`deny`）**，内置**权限沙盒验证器**即时预览被拦截的原件及因溯源继承自动隐藏的 Wiki 页面，保存即热生效。
+3. **多客户端 MCP 插件一键配置**：自动检测本机 **DeepSeek Harness (DSH)**、**Codex CLI**、**Claude Code**、**WorkBuddy**、**Cursor** 与 **Antigravity (AGY)**，支持本地直连（`stdio`）与令牌网关（`streamable-http` / `bridge`）双模式片段预览、自动备份（`.wctx.bak`）及无损合并写入（DSH 自动递增 `WCTX_MCP_VERSION` 热重载，并同步 Magpie 配置库）。
+4. **第 4 层记忆与勘误钉可视化管理**：按知识库、类型（`errata` 原件勘误钉 / `insight` / `decision` / `glossary`）与状态筛选搜索记忆，支持关联原件自动补全、新建、编辑、归档遗忘（`forget`）、恢复生效与 JSON 批量导入。
 
 ---
 
@@ -234,7 +257,7 @@ wctx context --vault ./我的知识库 -q "系统网关限流规则与重试要�
 │   └── 网关限流与SLO.md                 #   └─ 专题综述页（顶部 YAML 声明 sources 与 source_hashes）
 │
 └── 记忆/            (notes/)            # 【第 4 层：领域工作记忆与原件勘误收件箱 —— 隔离存储、继承原件 ACL】
-    └── mem-20261122-xxxx.md            #   └─ kb_remember 写入的实战经验或只读原件勘误钉子；wctx compile 可晋升进知识库
+    └── mem-20261122-xxxx.md            #   └─ wiki_remember 写入的实战经验或只读原件勘误钉子；wctx compile 可晋升进知识库
 ```
 
 | 层级 / 文件 | 谁来写入？ | 核心职责与黄金守则 | 是否建议提交 Git？ |
@@ -242,7 +265,7 @@ wctx context --vault ./我的知识库 -q "系统网关限流规则与重试要�
 | **`史料/` (`sources/`)** | **仅人工放入** | 唯一事实真源（Ground Truth）；引擎与 Agent **绝对只读、绝不篡改** | 中小文本规范可提交；大型二进制可用 Git LFS 或共享盘 |
 | **`史料_md/` (`mirrors/`)** | **`wctx sync` 自动生成** | 结构化 Markdown 镜像、内嵌附图 `.assets/` 与 `bm25.sqlite`；100% 可重建 | **不提交 `.index/`**（甚至可忽略整个 `史料_md/`） |
 | **`知识库/` (`wiki/`)** | **Agent / 人工 / `wctx compile`** | 跨多份原件提炼架构脉络、结论对比与避坑指南；**保持扁平一层 `*.md`** | **强烈建议提交**（纯文本，PR 可审计知识演进） |
-| **`记忆/` (`notes/`)** | **`kb_remember` / `wctx remember`** | 沉淀会话期领域踩坑经验与只读原件 `📌 勘误钉子`（自动继承关联原件 ACL，绝不污染一手史料；跨项目个人偏好仍交由 `magpie-memory` 管理） | **建议提交**（纯文本 Markdown，支持 `wctx compile` 巩固晋升进 Wiki） |
+| **`记忆/` (`notes/`)** | **`wiki_remember` / `wctx remember`** | 沉淀会话期领域踩坑经验与只读原件 `📌 勘误钉子`（自动继承关联原件 ACL，绝不污染一手史料；跨项目个人偏好仍交由 `magpie-memory` 管理） | **建议提交**（纯文本 Markdown，支持 `wctx compile` 巩固晋升进 Wiki） |
 | **`目录.md` / `vault.json` / `synonyms.json`** | **Agent / 人工 / `wctx synonyms mine`** | 专题索引树、库级策略配置与团队口语同义词表 | **强烈建议提交** |
 
 ---
@@ -266,7 +289,7 @@ wctx context --vault ./我的知识库 -q "系统网关限流规则与重试要�
 2. **旧版归档免删隔离**：文档迭代产生旧版（如 `v1` 废弃方案）时，不必物理删除，直接移入 `史料/99-历史废弃归档/`，并在 `vault.json` 中加上 `"exclude_patterns": ["99-历史废弃归档/"]`，即可让旧文档退出检索且保留审计底稿。
 3. **内置文件准入与防污染规则（无需人工挑拣杂物）**：
    - **自动提取入库**：`.md`、`.markdown`、`.txt`、`.rst`、`.csv`、`.tsv`、`.docx`、`.pptx`、`.xlsx`、`.pdf`（安装 `poppler` 后自动提取文本与页界）。
-   - **自动安全跳过**：私钥与凭证文件（`.env`、`*.pem`、`*.key`、`id_rsa`、`credentials.json`）、机器日志与数据库（`.log`、`.json`、`.yaml`、`.sql`、`.sqlite`）、压缩包与音视频、隐藏目录（`.git`、`.obsidian`、`*.assets`）以及超限单文件（默认 `>2 MiB`，可在 `vault.json` 调大 `max_doc_bytes`）会被自动拦截，并在 `kb_status` 中透明列出跳过原因；完全相同的重复文件（如 `规范 (1).docx`、`规范_副本.docx`）会自动折叠去重。
+   - **自动安全跳过**：私钥与凭证文件（`.env`、`*.pem`、`*.key`、`id_rsa`、`credentials.json`）、机器日志与数据库（`.log`、`.json`、`.yaml`、`.sql`、`.sqlite`）、压缩包与音视频、隐藏目录（`.git`、`.obsidian`、`*.assets`）以及超限单文件（默认 `>2 MiB`，可在 `vault.json` 调大 `max_doc_bytes`）会被自动拦截，并在 `wiki_status` 中透明列出跳过原因；完全相同的重复文件（如 `规范 (1).docx`、`规范_副本.docx`）会自动折叠去重。
    - **架构图与扫描件按需 OCR**：默认跳过普通 `.png`/`.jpg` 配图防噪声；若某目录专门存放扫描件或架构大图，在 `vault.json` 配置 `"ocr_image_dirs": ["03-架构图与扫描件"]` 并指定 `WCTX_OCR_CMD` 即可定向提取。
 
 #### 第三步：运行 `wctx sync`（此时知识库已立即可用！）
@@ -356,15 +379,15 @@ wctx sync --vault ./研发知识库
 
 | MCP 工具 | 用途说明 |
 | :--- | :--- |
-| **`kb_context`** | **首选主力工具（95% 问答只需调一次）**：自动完成同义词对齐、Wiki 导读 + 一手原件检索、表头置顶、附图提示、1-hop 原件勘误钉子与缺词防幻觉告警 |
-| `kb_inspect_visual` | **原生多模态看图**：将文档内嵌架构图、独立图片或按需渲染的 PDF 视觉页以标准 MCP `image`（base64）内容块返回给视觉 Agent 直接审阅 |
-| `kb_remember` | **领域工作记忆与原件勘误写入**：向第 4 层 `记忆/`（`notes/`）记录实战踩坑经验或只读原件 `errata` 勘误钉子（自动脱敏并继承关联原件 ACL） |
-| `kb_forget` | 归档撤回已过时或有误的第 4 层工作记忆笔记 |
-| `kb_search` | 细粒度 BM25/FTS5 检索，支持按 `section`（章节）、`page`（页/Sheet）、`wiki`（知识页）过滤 |
-| `kb_read` | 沙箱安全读取派生镜像、Wiki 页或 `目录.md` 的精确行区间（单次 `<=400` 行）或指定 `page_num` |
-| `kb_route` | 判断问题属于单点事实直答（`fact` 2.6k 预算）还是多跳综合分析（`complex` 4.8k 预算） |
-| `kb_list` | 列出知识库已索引文档清单与提取方式（支持路径子串过滤） |
-| `kb_status` | 查看当前索引代数、文档/切片规模、活跃记忆条数、跳过文件统计与未镜像资料边界 |
+| **`wiki_context`** | **首选主力工具（95% 问答只需调一次）**：自动完成同义词对齐、Wiki 导读 + 一手原件检索、表头置顶、附图提示、1-hop 原件勘误钉子与缺词防幻觉告警 |
+| `wiki_inspect_visual` | **原生多模态看图**：将文档内嵌架构图、独立图片或按需渲染的 PDF 视觉页以标准 MCP `image`（base64）内容块返回给视觉 Agent 直接审阅 |
+| `wiki_remember` | **领域工作记忆与原件勘误写入**：向第 4 层 `记忆/`（`notes/`）记录实战踩坑经验或只读原件 `errata` 勘误钉子（自动脱敏并继承关联原件 ACL） |
+| `wiki_forget` | 归档撤回已过时或有误的第 4 层工作记忆笔记 |
+| `wiki_search` | 细粒度 BM25/FTS5 检索，支持按 `section`（章节）、`page`（页/Sheet）、`wiki`（知识页）过滤 |
+| `wiki_read` | 沙箱安全读取派生镜像、Wiki 页或 `目录.md` 的精确行区间（单次 `<=400` 行）或指定 `page_num` |
+| `wiki_route` | 判断问题属于单点事实直答（`fact` 2.6k 预算）还是多跳综合分析（`complex` 4.8k 预算） |
+| `wiki_list` | 列出知识库已索引文档清单与提取方式（支持路径子串过滤） |
+| `wiki_status` | 查看当前索引代数、文档/切片规模、活跃记忆条数、跳过文件统计与未镜像资料边界 |
 
 ### 方式一：本机单用户 Stdio 接入（Claude Code / Cursor / Codex / DSH）
 
@@ -373,10 +396,10 @@ wctx sync --vault ./研发知识库
 ```json
 {
   "mcpServers": {
-    "kb": {
+    "wiki": {
       "command": "wctx",
       "args": ["serve", "--vault", "/absolute/path/to/我的知识库"],
-      "env": { "KB_USER": "dev" }
+      "env": { "WCTX_USER": "dev" }
     }
   }
 }
@@ -385,10 +408,10 @@ wctx sync --vault ./研发知识库
 **Codex CLI (`~/.codex/config.toml`)**：
 
 ```toml
-[mcp_servers.kb]
+[mcp_servers.wiki]
 command = "wctx"
 args = ["serve", "--vault", "/absolute/path/to/我的知识库"]
-env = { KB_USER = "dev" }
+env = { WCTX_USER = "dev" }
 ```
 
 ### 方式二：团队多人多库 HTTP 网关（`wctx gateway`）
@@ -431,10 +454,13 @@ wctx compile --vault ./我的知识库
 
 | 命令 | 功能说明 |
 | :--- | :--- |
-| `wctx init <path> [--layout en\|zh]` | 初始化中/英文三层结构知识库与 `AGENTS.md` 维护规约 |
+| `wctx ui [--port 8765]` | 启动本机可视化 Web 控制中心（仅绑定 `127.0.0.1`，管理文件夹、令牌、多端 MCP、记忆 + 开发网关） |
+| `wctx doctor [--json]` | 一键环境体检（Python、全局 `wctx` 路径、`pdftotext`/`pdftoppm`、AI 客户端与后台守护状态） |
+| `wctx service [status\|render\|install\|uninstall]` | 生成或安装 macOS `launchd` / Linux `systemd --user` 后台守护服务（推荐 `--target gateway`） |
+| `wctx init <path> [--layout en\|zh]` | 初始化中/英文四层结构知识库与 `AGENTS.md` 维护规约 |
 | `wctx sync --vault <V> [--list]` | 增量提取变更原件并重建不可变 FTS5 索引 |
 | `wctx index --vault <V> [--check --deep]` | 构建或深度校验 `gen-<id>/bm25.sqlite` 分代索引快照 |
-| `wctx context --vault <V> -q "<Q>"` | 终端单次组装带精确引用的 `<kb_context>` 证据包 |
+| `wctx context --vault <V> -q "<Q>"` | 终端单次组装带精确引用的 `<wiki_context>` 证据包 |
 | `wctx search --vault <V> -q "<Q>"` | 执行底层双层 BM25/FTS5 检索或 `--route` 复杂度判定 |
 | `wctx compile --vault <V> [--dry-run]` | 批量编译未覆盖镜像、刷新 `stale` 页并将第 4 层记忆巩固进 Wiki |
 | `wctx remember --vault <V> -t "<T>"` | 向第 4 层 `记忆/` 写入实战经验或 `--kind errata` 原件勘误钉子 |
@@ -445,6 +471,7 @@ wctx compile --vault ./我的知识库
 | `wctx lint --vault <V>` | 机械检查死链 `[[wikilinks]]`、缺失引用原件与目录漂移 |
 | `wctx serve --vault <V> [--test]` | 启动本地 Stdio MCP 服务（9 个工具，默认开启凭证脱敏） |
 | `wctx gateway --vault id=path [--test]` | 启动多人多库 Streamable HTTP MCP + REST 知识网关 |
+| `wctx remote [add\|list\|probe\|remove]` | 填入远程电脑网关地址与令牌（`--url` + `--token`），自动发现授权库并一键挂载至本机 AI 客户端 |
 | `wctx bridge --url <URL> --token <T>` | 将本地 Stdio MCP 客户端桥接至远端 HTTP 网关 |
 
 ---

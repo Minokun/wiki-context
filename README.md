@@ -17,7 +17,7 @@ Modern developers and teams already work inside capable AI agents (**Claude Code
 
 What agents actually lack is a **millisecond-latency, deterministic, citation-anchored librarian**:
 - **Decoupled Write vs. Read Paths**: Heavy comprehension happens **offline** (native document extraction + AI-compiled cross-document Wiki synthesis + SHA-256 freshness tracking). Online retrieval uses **zero runtime LLM calls**, **zero external APIs**, and **zero third-party Python packages**.
-- **One Call, Complete Context (`~2–35 ms`)**: A single `kb_context` tool call deterministically assembles **high-level Wiki synthesis (24% budget)** + **1-hop provenance-verified primary source excerpts with pinned table headers (76% budget)** + **explicit missing-concept hallucination guardrails**.
+- **One Call, Complete Context (`~2–35 ms`)**: A single `wiki_context` tool call deterministically assembles **high-level Wiki synthesis (24% budget)** + **1-hop provenance-verified primary source excerpts with pinned table headers (76% budget)** + **explicit missing-concept hallucination guardrails**.
 - **Clear Architectural Boundary (`Context` vs. `State & Action`)**: `wiki-context` serves read-only ground truth — RFCs, ADRs, product specs, pricing tiers, SOPs, and postmortems. Pair it alongside transactional MCP servers (SQL / ERP / GitHub / Jira MCP) so your agent reads the rules from `wiki-context` in 3 ms before querying live state or executing mutations.
 
 ```text
@@ -32,7 +32,7 @@ Derived Mirrors (`mirrors/` or `史料_md/`)    Compiled Wiki (`wiki/` or `知�
                        ▼
         Immutable `gen-<id>/bm25.sqlite`  ◄── Atomic `current.json` swap (lock-free `?immutable=1`)
                        │
-                       │  3. One-shot `kb_context` (~2–35 ms, 0 runtime LLM tokens)
+                       │  3. One-shot `wiki_context` (~2–35 ms, 0 runtime LLM tokens)
                        ▼
      Claude Code / Codex / Cursor / DSH / Custom Agents (Stdio MCP, Streamable HTTP `/mcp`, REST)
 ```
@@ -58,7 +58,7 @@ The "LLM Wiki" pattern replaces vector DBs with LLM-maintained Markdown synthesi
 
 ### 3. How `wiki-context` Synthesizes Both Worlds
 `wiki-context` treats knowledge like a **compiler + deterministic linker**:
-- **Keeps the Soul of LLM Wiki (Plain Markdown + Global Synthesis)**: Human-readable `wiki/*.md` pages with `[[wikilinks]]` (editable in Obsidian, Git-diffable), upgraded with **SHA-256 `source_hashes`** in YAML frontmatter. If any cited source changes by 1 byte, the indexer automatically flags the Wiki page `stale` (`0.5×` score demotion + explicit `⚠️ stale` warning badge in `<kb_context>`).
+- **Keeps the Soul of LLM Wiki (Plain Markdown + Global Synthesis)**: Human-readable `wiki/*.md` pages with `[[wikilinks]]` (editable in Obsidian, Git-diffable), upgraded with **SHA-256 `source_hashes`** in YAML frontmatter. If any cited source changes by 1 byte, the indexer automatically flags the Wiki page `stale` (`0.5×` score demotion + explicit `⚠️ stale` warning badge in `<wiki_context>`).
 - **Exceeds RAG Precision in One Deterministic Call**:
   - **Code-Preserving Bilingual FTS5 + Per-Source IDF**: Keeps intact identifiers (`RFC-042`, `350mm`, `v2.4`), segments CJK bigrams without external NLP deps, and computes IDF over **distinct source documents (`df_sources`)** rather than chunks.
   - **Controlled 1-Hop Wiki Provenance**: High-confidence Wiki hits contribute synthesized guidance **and** boost (`1.25×`) their cited primary documents — *only* when the primary chunk independently matches a high-IDF query concept, preventing broad overview pages from dragging in noise.
@@ -82,14 +82,14 @@ The "LLM Wiki" pattern replaces vector DBs with LLM-maintained Markdown synthesi
 
 ---
 
-## What One `kb_context` Call Actually Returns
+## What One `wiki_context` Call Actually Returns
 
 ### Case 1: Deep CSV Table Lookup + Wiki Provenance (`~3 ms`)
 
 Query: *"What are the Sustained_RPS, Burst_Bucket, and Max_Payload_MB limits for the Enterprise-Dedicated tier?"*
 
 ```markdown
-<kb_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
+<wiki_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
 ## 1. Compiled Wiki Synthesis (Verify exact figures & clauses against Primary Sources below)
 ### [W1] wiki/Gateway-Rate-Limiting-and-SLOs.md § Key Facts (L20-L24) [freshness:fresh]
 - **Token Bucket Enforcement**: Edge nodes enforce per-tenant token buckets using local atomic counters synced every `250ms`...
@@ -105,7 +105,7 @@ Query: *"What are the Sustained_RPS, Burst_Bucket, and Max_Payload_MB limits for
 
 ## 3. Gap Diagnostics & Grounding Guardrails (Mandatory)
 - Grounding Rule: Every claim must be directly supported by [S1]~[Sn] above with explicit source citations...
-</kb_context>
+</wiki_context>
 ```
 Notice how `[S1]` slices lines `L24–L47` deep inside `tier-quotas.csv` while **pinning the CSV header row automatically** at the top, boosted via `[W1]`'s verified provenance.
 
@@ -114,13 +114,13 @@ Notice how `[S1]` slices lines `L24–L47` deep inside `tier-quotas.csv` while *
 Query: *"What is the Kafka partition retention period for billing events?"* (when the vault uses Raft/WAL, not Kafka)
 
 ```markdown
-<kb_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
+<wiki_context vault="AuroraEdge Engineering KB" route="fact" generation="gen-20261122T133553Z-1486c582">
 ## 2. Primary Source Evidence (Authoritative Ground Truth)
 *(No directly matching primary source chunks found)*
 
 ## 3. Gap Diagnostics & Grounding Guardrails (Mandatory)
 - ⚠️ Missing-Concept Alert: Key query concept(s) 'Kafka', 'partition', 'retention', 'period', 'billing', 'events' had 0 hits across all retrieved chunks! This likely indicates a knowledge gap in the vault — do NOT hallucinate figures or clauses from pretraining.
-</kb_context>
+</wiki_context>
 ```
 
 ---
@@ -141,12 +141,21 @@ Query: *"What is the Kafka partition retention period for billing events?"* (whe
 ### 1. Install
 
 ```bash
+# Recommended global install (isolated CLI, avoids PEP 668 system-Python errors):
+pipx install git+https://github.com/Minokun/wiki-context.git
+# or with uv:
+uv tool install git+https://github.com/Minokun/wiki-context.git
+
+# Or editable install from local clone:
 git clone https://github.com/Minokun/wiki-context.git
 cd wiki-context
 pip install -e .
+
+# Verify Python, PATH, PDF tools (`poppler`), and detected AI clients:
+wctx doctor
 ```
 
-*(Zero third-party packages are downloaded or installed. Optional: install `poppler` if you need native `pdftotext` PDF extraction.)*
+*(Zero third-party Python packages are downloaded or installed. Optional: install `poppler` (`brew install poppler` / `sudo apt install poppler-utils`) if you need native `pdftotext` PDF extraction and `pdftoppm` visual page rendering.)*
 
 ### 2. Run the Reproducible Benchmark
 
@@ -185,7 +194,21 @@ wctx sync --vault ./my-kb
 
 # Test one-shot context assembly in terminal:
 wctx context --vault ./my-kb -q "What are our API retry and rate-limit rules?"
+
+# Or launch the visual Web Control Console (http://127.0.0.1:8765):
+wctx ui
 ```
+
+---
+
+## Built-In Web Control Console (`wctx ui`)
+
+Prefer a visual control plane over editing JSON/TOML/YAML files by hand? Run `wctx ui` (zero external dependencies, served locally at `http://127.0.0.1:8765` with CSRF & loopback protection) to manage your entire setup in one place:
+
+1. **Folder Onboarding & Auto-Initialization**: Browse local directories, adopt existing raw document folders in-place (safely moving loose files into `sources/` / `史料/`, scaffolding the 4-layer layout, and building the FTS5 index), import external folders into existing vaults, run `lint`, and test `wiki_context` queries live.
+2. **Bearer Tokens & Multi-Level Permissions**: Issue SHA-256 hashed Bearer tokens (plaintext secret shown once), scope **which vaults (`allowed_vaults`)** each token can see, configure **role-based directory-prefix `allow`/`deny` rules** (with 100% Wiki & Memory provenance inheritance), and verify rules in the **ACL Sandbox Simulator** — all hot-reloaded with zero restarts.
+3. **One-Click AI Client MCP Sync**: Auto-detects **DeepSeek Harness (DSH)**, **Codex CLI**, **Claude Code**, **WorkBuddy**, **Cursor**, and **Antigravity (AGY)** on your machine, previews snippets (`stdio` or `streamable-http` gateway mode), and losslessly merges MCP configs with automatic `.wctx.bak` backups.
+4. **Layer-4 Memory & Errata Inspector**: Filter, search, create, edit, archive (`forget`), restore, or batch-import operational insights and source-anchored `📌 Errata Pins` across vaults.
 
 ---
 
@@ -228,7 +251,7 @@ my-kb/                                   # Vault Root
 │   └── Gateway-Rate-Limiting.md         #   └─ Topic synthesis (declares YAML `sources:` & `source_hashes:`)
 │
 └── notes/               (记忆/)          # [Layer 4: Operational Memory & Errata Inbox — Quarantined & ACL-inheriting]
-    └── mem-20261122-xxxx.md             #   └─ `kb_remember` field insights & 1-hop Errata Pins; consolidated via `wctx compile`
+    └── mem-20261122-xxxx.md             #   └─ `wiki_remember` field insights & 1-hop Errata Pins; consolidated via `wctx compile`
 ```
 
 | Layer / File | Maintained By | Role & Golden Rule | Commit to Git? |
@@ -236,7 +259,7 @@ my-kb/                                   # Vault Root
 | **`sources/` (`史料/`)** | **Humans only** | Immutable ground truth; **never modified, renamed, or deleted** by `wctx` or agents | Yes for Markdown/CSVs; Git LFS or shared storage for large binaries |
 | **`mirrors/` (`史料_md/`)** | **`wctx sync` (Auto)** | Derived Markdown mirrors, `.assets/` figures, and `bm25.sqlite`; 100% reproducible | **Ignore `.index/`** (or ignore `mirrors/` entirely) |
 | **`wiki/` (`知识库/`)** | **Agent / Human / `wctx compile`** | Cross-document architecture synthesis, trade-offs & caveats; **keep flat (`wiki/*.md`)** | **Yes** (plain Markdown, easy PR review) |
-| **`notes/` (`记忆/`)** | **`kb_remember` / `wctx remember`** | Domain session findings & read-only spec `📌 Errata Pins` (inherits `PrefixACLPolicy`; keep cross-project user habits in external memory like `magpie-memory`) | **Yes** (plain Markdown; consolidates into `wiki/` via `wctx compile`) |
+| **`notes/` (`记忆/`)** | **`wiki_remember` / `wctx remember`** | Domain session findings & read-only spec `📌 Errata Pins` (inherits `PrefixACLPolicy`; keep cross-project user habits in external memory like `magpie-memory`) | **Yes** (plain Markdown; consolidates into `wiki/` via `wctx compile`) |
 | **`index.md` / `vault.json` / `synonyms.json`** | **Agent / Human / `wctx synonyms mine`** | Topic hierarchy catalog, vault policy config, and colloquial synonym map | **Yes** |
 
 ---
@@ -258,7 +281,7 @@ Drop your raw files into `sources/`. While flat files work fine, organizing `sou
 2. **Archive Without Deleting**: Move superseded specs into `sources/99-deprecated-archive/` and set `"exclude_patterns": ["99-deprecated-archive/"]` in `vault.json` to keep them out of search results while preserving historical records.
 3. **Automatic File Admission & Hygiene**:
    - **Admitted natively**: `.md`, `.markdown`, `.txt`, `.rst`, `.csv`, `.tsv`, `.docx`, `.pptx`, `.xlsx`, and `.pdf` (when `pdftotext` is installed).
-   - **Skipped safely**: Credentials & keys (`.env`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`), machine dumps/logs (`.log`, `.json`, `.yaml`, `.sql`, `.sqlite`), media/archives, hidden/asset directories (`.git`, `.obsidian`, `*.assets`), and oversized files (`>2 MiB` by default, configurable via `max_doc_bytes`) are excluded with transparent reasons in `kb_status`. Byte-identical copies (e.g., `spec (1).docx`) are automatically folded during indexing.
+   - **Skipped safely**: Credentials & keys (`.env`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`), machine dumps/logs (`.log`, `.json`, `.yaml`, `.sql`, `.sqlite`), media/archives, hidden/asset directories (`.git`, `.obsidian`, `*.assets`), and oversized files (`>2 MiB` by default, configurable via `max_doc_bytes`) are excluded with transparent reasons in `wiki_status`. Byte-identical copies (e.g., `spec (1).docx`) are automatically folded during indexing.
    - **Targeted Image / Scan OCR**: Inline decorative images are skipped by default; to OCR architecture diagrams or scanned contracts in specific folders, add `"ocr_image_dirs": ["03-diagrams-and-scans"]` in `vault.json` and set `WCTX_OCR_CMD`.
 
 #### Step 3: Run `wctx sync` (Your Vault Is Immediately Queryable!)
@@ -348,15 +371,15 @@ Whenever you add new files or overwrite an updated `.docx`/`.xlsx`/`.md` inside 
 
 | MCP Tool | Purpose |
 | :--- | :--- |
-| **`kb_context`** | **Preferred default (answers 95% of queries in 1 call)**: assembles Wiki synthesis + primary evidence + table headers + visual hints + 1-hop Errata Pins + gap alerts |
-| `kb_inspect_visual` | **Native Multimodal Diagram Viewer**: returns embedded Office figures, standalone images, or rendered PDF visual pages as MCP `image` (base64) blocks |
-| `kb_remember` | **Layer-4 Operational Memory & Errata**: saves domain learnings or `errata` overrides into `notes/` (`记忆/`) with secret scrubbing & provenance ACL inheritance |
-| `kb_forget` | Archives/retracts obsolete or mistaken Layer-4 memory notes |
-| `kb_search` | Fine-grained BM25/FTS5 search with optional `section` / `page` / `wiki` unit filtering |
-| `kb_read` | Sandboxed exact line-range (`<=400` lines) or `page_num` reader over mirrors, Wiki pages, and `index.md` |
-| `kb_route` | Classifies query complexity (`fact` 2.6k budget vs. `complex` 4.8k budget) |
-| `kb_list` | Lists indexed documents and extraction methods with path filtering |
-| `kb_status` | Reports active index generation, document/chunk counts, active memory notes, skipped files, and coverage boundaries |
+| **`wiki_context`** | **Preferred default (answers 95% of queries in 1 call)**: assembles Wiki synthesis + primary evidence + table headers + visual hints + 1-hop Errata Pins + gap alerts |
+| `wiki_inspect_visual` | **Native Multimodal Diagram Viewer**: returns embedded Office figures, standalone images, or rendered PDF visual pages as MCP `image` (base64) blocks |
+| `wiki_remember` | **Layer-4 Operational Memory & Errata**: saves domain learnings or `errata` overrides into `notes/` (`记忆/`) with secret scrubbing & provenance ACL inheritance |
+| `wiki_forget` | Archives/retracts obsolete or mistaken Layer-4 memory notes |
+| `wiki_search` | Fine-grained BM25/FTS5 search with optional `section` / `page` / `wiki` unit filtering |
+| `wiki_read` | Sandboxed exact line-range (`<=400` lines) or `page_num` reader over mirrors, Wiki pages, and `index.md` |
+| `wiki_route` | Classifies query complexity (`fact` 2.6k budget vs. `complex` 4.8k budget) |
+| `wiki_list` | Lists indexed documents and extraction methods with path filtering |
+| `wiki_status` | Reports active index generation, document/chunk counts, active memory notes, skipped files, and coverage boundaries |
 
 ### Option A: Local Stdio MCP (Single User)
 
@@ -365,10 +388,10 @@ Whenever you add new files or overwrite an updated `.docx`/`.xlsx`/`.md` inside 
 ```json
 {
   "mcpServers": {
-    "kb": {
+    "wiki": {
       "command": "wctx",
       "args": ["serve", "--vault", "/absolute/path/to/my-kb"],
-      "env": { "KB_USER": "alice" }
+      "env": { "WCTX_USER": "alice" }
     }
   }
 }
@@ -377,10 +400,10 @@ Whenever you add new files or overwrite an updated `.docx`/`.xlsx`/`.md` inside 
 **Codex CLI (`~/.codex/config.toml`)**:
 
 ```toml
-[mcp_servers.kb]
+[mcp_servers.wiki]
 command = "wctx"
 args = ["serve", "--vault", "/absolute/path/to/my-kb"]
-env = { KB_USER = "alice" }
+env = { WCTX_USER = "alice" }
 ```
 
 ### Option B: Multi-User, Multi-Vault Remote HTTP Gateway (Teams)
@@ -425,10 +448,13 @@ wctx compile --vault ./my-kb
 
 | Command | Description |
 | :--- | :--- |
-| `wctx init <path> [--layout en\|zh]` | Initialize a three-layer vault (`sources/`, `mirrors/`, `wiki/`) |
+| `wctx ui [--port 8765]` | Launch the local loopback Web Control Console + dev Gateway (`wctx console`) |
+| `wctx doctor [--json]` | Diagnose Python, `wctx` PATH, `poppler` (`pdftotext`/`pdftoppm`), AI clients & services |
+| `wctx service [status\|render\|install\|uninstall]` | Generate or install a `launchd` / `systemd --user` background service for `gateway` or `ui` |
+| `wctx init <path> [--layout en\|zh]` | Initialize a four-layer vault (`sources/`, `mirrors/`, `wiki/`, `notes/`) |
 | `wctx sync --vault <V> [--list]` | Incrementally extract changed documents & rebuild FTS5 |
 | `wctx index --vault <V> [--check --deep]` | Build or verify immutable `gen-<id>/bm25.sqlite` snapshot |
-| `wctx context --vault <V> -q "<Q>"` | Assemble a single-call citation-anchored `<kb_context>` pack |
+| `wctx context --vault <V> -q "<Q>"` | Assemble a single-call citation-anchored `<wiki_context>` pack |
 | `wctx search --vault <V> -q "<Q>"` | Run raw BM25/FTS5 search or `--route` complexity classification |
 | `wctx compile --vault <V> [--dry-run]` | Compile unindexed mirrors, refresh `stale` Wiki pages & consolidate Layer-4 notes |
 | `wctx remember --vault <V> -t "<T>"` | Save an operational insight or `--kind errata` source pin into `notes/` (`记忆/`) |
@@ -439,6 +465,7 @@ wctx compile --vault ./my-kb
 | `wctx lint --vault <V>` | Verify broken `[[wikilinks]]`, missing sources, and catalog drift |
 | `wctx serve --vault <V> [--test]` | Run local stdio MCP server (9 tools, secret-scrubbed) |
 | `wctx gateway --vault id=path [--test]` | Run multi-user, multi-vault Streamable HTTP MCP + REST gateway |
+| `wctx remote [add\|list\|probe\|remove]` | Connect to a remote gateway (`--url` + `--token`) & auto-configure local AI clients |
 | `wctx bridge --url <URL> --token <T>` | Bridge local stdio MCP clients to a remote HTTP gateway |
 
 ---
