@@ -385,15 +385,18 @@ def run_doctor(
     installed_clients = [c for c in clients if c.get("installed")]
     configured_clients = [c for c in installed_clients if c.get("configured_servers")]
 
+    min_py = (3, 14)
+    min_py_str = f"{min_py[0]}.{min_py[1]}"
+    py_ok = sys.version_info >= min_py
     poppler_hint = _poppler_install_hint()
     checks: list[dict[str, Any]] = [
         {
             "id": "python",
-            "label": "Python 运行环境 (>= 3.10)",
-            "ok": sys.version_info >= (3, 10),
-            "level": "ok" if sys.version_info >= (3, 10) else "error",
+            "label": f"Python 运行环境 (>= {min_py_str})",
+            "ok": py_ok,
+            "level": "ok" if py_ok else "error",
             "detail": f"Python {sys.version.split()[0]} ({sys.executable})",
-            "fix": "" if sys.version_info >= (3, 10) else "请升级至 Python 3.10+",
+            "fix": "" if py_ok else f"请升级至 Python {min_py_str}+",
         },
         {
             "id": "wctx_path",
@@ -444,7 +447,7 @@ def run_doctor(
     return {
         "version": __version__,
         "platform": sys.platform,
-        "python": {"version": sys.version.split()[0], "executable": sys.executable, "ok": sys.version_info >= (3, 10)},
+        "python": {"version": sys.version.split()[0], "executable": sys.executable, "ok": py_ok},
         "wctx_cli": {"command": cmd, "base_args": base_args, "in_path": bool(wctx_in_path), "which": wctx_in_path or ""},
         "tools": {
             "pdftotext": {"available": bool(pdftotext_path), "path": pdftotext_path or "", "install_hint": poppler_hint},

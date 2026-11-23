@@ -364,6 +364,8 @@ class TestConsoleAndClients(unittest.TestCase):
             import _build_backend
 
             self.assertEqual(_build_backend.VERSION, __version__)
+            self.assertEqual(_build_backend.REQUIRES_PYTHON, ">=3.14")
+            self.assertIn("Requires-Python: >=3.14\n", _build_backend._metadata_bytes().decode("utf-8"))
         finally:
             if str(repo_root) in sys.path:
                 sys.path.remove(str(repo_root))
@@ -372,6 +374,8 @@ class TestConsoleAndClients(unittest.TestCase):
         doc = self._api("/api/doctor")
         self.assertEqual(doc["version"], __version__)
         self.assertTrue(doc["python"]["ok"])
+        py_check = next(c for c in doc["checks"] if c["id"] == "python")
+        self.assertIn(">= 3.14", py_check["label"])
         self.assertTrue(any(c["id"] == "pdftotext" for c in doc["checks"]))
         self.assertIn("security_boundary", doc)
 

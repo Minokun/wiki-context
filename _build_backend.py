@@ -13,30 +13,35 @@ import csv
 import hashlib
 import io
 import re
+import tomllib
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DIST_NAME = "wiki_context"
+DEFAULT_REQUIRES_PYTHON = ">=3.14"
 
 
-def _read_version() -> str:
+def _read_pyproject_meta() -> tuple[str, str]:
+    """Read package version and requires-python from pyproject.toml with safe fallbacks."""
     pyproject = ROOT / "pyproject.toml"
     if pyproject.is_file():
-        text = pyproject.read_text(encoding="utf-8")
-        m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
-        if m:
-            return m.group(1).strip()
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        proj = data.get("project", {}) if isinstance(data, dict) else {}
+        ver = str(proj.get("version") or "").strip()
+        req_py = str(proj.get("requires-python") or "").strip() or DEFAULT_REQUIRES_PYTHON
+        if ver:
+            return ver, req_py
     init_py = ROOT / "src" / "wiki_context" / "__init__.py"
     if init_py.is_file():
         text = init_py.read_text(encoding="utf-8")
         m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
         if m:
-            return m.group(1).strip()
-    return "0.3.0"
+            return m.group(1).strip(), DEFAULT_REQUIRES_PYTHON
+    return "0.3.0", DEFAULT_REQUIRES_PYTHON
 
 
-VERSION = _read_version()
+VERSION, REQUIRES_PYTHON = _read_pyproject_meta()
 DIST_INFO = f"{DIST_NAME}-{VERSION}.dist-info"
 
 
@@ -53,7 +58,7 @@ def _metadata_bytes() -> bytes:
         f"Version: {VERSION}\n"
         "Summary: Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + MCP Gateway\n"
         "License: MIT\n"
-        "Requires-Python: >=3.10\n"
+        f"Requires-Python: {REQUIRES_PYTHON}\n"
         "Project-URL: Homepage, https://github.com/Minokun/wiki-context\n"
         "Project-URL: Repository, https://github.com/Minokun/wiki-context.git\n"
         "Description-Content-Type: text/markdown\n\n"

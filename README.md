@@ -5,7 +5,7 @@
 English | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](pyproject.toml)
+[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB.svg)](pyproject.toml)
 [![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero-brightgreen.svg)](pyproject.toml)
 [![Protocol: MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)](docs/gateway-and-acl.md)
 
@@ -78,7 +78,7 @@ The "LLM Wiki" pattern replaces vector DBs with LLM-maintained Markdown synthesi
 | **Unanswerable Query Defense** | High hallucination risk (feeds nearest chunks) | Depends on agent stopping on time | **Explicit `⚠️ Missing-Concept Alert`** + unmirrored boundary notes |
 | **Online Latency & Token Cost** | 1–5 s + Embedding/Rerank API calls | 15–40 s (3–6 tool calls, ~30k–40k tokens) | **1 tool call, ~2–35 ms, 2.6k–4.8k tokens, 0 LLM calls** |
 | **Access Control (RBAC)** | Chunk metadata filter (often leaky) | File-level OS permissions only | **Hot-reloaded `PrefixACLPolicy` + 100% Wiki provenance inheritance** |
-| **Runtime Footprint** | Heavy (Milvus/Qdrant + Docker + SDKs) | Plain folder | **Zero dependencies** (Python 3.10+ stdlib + immutable SQLite FTS5) |
+| **Runtime Footprint** | Heavy (Milvus/Qdrant + Docker + SDKs) | Plain folder | **Zero dependencies** (Python 3.14+ stdlib + immutable SQLite FTS5) |
 
 ---
 
@@ -127,7 +127,7 @@ Query: *"What is the Kafka partition retention period for billing events?"* (whe
 
 ## Key Engineering Highlights
 
-- **Zero Runtime & Build-Time Dependencies**: Pure Python 3.10+ standard library — including a self-contained PEP 517/660 wheel backend, native XML/ZIP extractors for `.docx`, `.pptx`, `.xlsx`, `.csv`/`.tsv`, `.md`/`.txt`, `pdftotext` integration for `.pdf`, and a pluggable `WCTX_OCR_CMD` hook for scanned pages.
+- **Zero Runtime & Build-Time Dependencies**: Pure Python 3.14+ standard library — including a self-contained PEP 517/660 wheel backend, native XML/ZIP extractors for `.docx`, `.pptx`, `.xlsx`, `.csv`/`.tsv`, `.md`/`.txt`, `pdftotext` integration for `.pdf`, and a pluggable `WCTX_OCR_CMD` hook for scanned pages.
 - **Native English & Chinese Vault Layouts**:
   - English (`--layout en`): `sources/`, `mirrors/`, `wiki/`, `index.md`, `log.md`
   - Chinese Obsidian (`--layout zh`): `史料/`, `史料_md/`, `知识库/`, `目录.md`, `日志.md` (auto-detected with zero config on existing Obsidian LLM Wiki vaults).

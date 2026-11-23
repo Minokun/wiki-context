@@ -5,7 +5,7 @@
 [English](README.md) | 简体中文
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](pyproject.toml)
+[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB.svg)](pyproject.toml)
 [![Dependencies: Zero](https://img.shields.io/badge/第三方依赖-零-brightgreen.svg)](pyproject.toml)
 [![Protocol: MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)](docs/gateway-and-acl.md)
 
@@ -86,7 +86,7 @@
 | **超纲/不可答问题防幻觉** | 高危（强行返回最近邻切片诱导编造） | 依赖 Agent 自觉停止翻找 | **显式触发 `⚠️ 缺词预警`** + 未镜像/纯视觉页可答性边界声明 |
 | **在线问答延迟与 Token 开销** | 1～5 秒 + Embedding/Rerank 接口开销 | 15～40 秒（3～6 轮工具调用，消耗 ~3.5 万 Token） | **单次工具调用，~2–35 ms，仅 2.6k～4.8k Token，0 大模型调用** |
 | **多团队权限隔离（RBAC）** | 切片元数据过滤（难防派生摘要泄密） | 仅靠操作系统目录权限 | **热重载 `PrefixACLPolicy` + Wiki 100% 继承底层原件权限** |
-| **部署依赖与运维成本** | 重（Milvus/Qdrant + Docker + 各类 SDK） | 纯本地文件夹 | **零第三方依赖**（Python 3.10+ 标准库 + 单文件不可变 SQLite FTS5） |
+| **部署依赖与运维成本** | 重（Milvus/Qdrant + Docker + 各类 SDK） | 纯本地文件夹 | **零第三方依赖**（Python 3.14+ 标准库 + 单文件不可变 SQLite FTS5） |
 
 ---
 
@@ -135,7 +135,7 @@
 
 ## 核心工程特性一览
 
-1. **运行期与构建期双零依赖**：纯 Python 3.10+ 标准库实现（自带零依赖 PEP 517/660 构建后端、DOCX/PPTX/XLSX/CSV/MD 原生结构化提取器、`pdftotext` PDF 提取及可插拔 `WCTX_OCR_CMD` 扫描件 OCR 钩子），离线内网环境亦可秒级 `pip install -e .`。
+1. **运行期与构建期双零依赖**：纯 Python 3.14+ 标准库实现（自带零依赖 PEP 517/660 构建后端、DOCX/PPTX/XLSX/CSV/MD 原生结构化提取器、`pdftotext` PDF 提取及可插拔 `WCTX_OCR_CMD` 扫描件 OCR 钩子），离线内网环境亦可秒级 `pip install -e .`。
 2. **原生中英双语目录布局自适应**：
    - 英文布局（`--layout en`）：`sources/`、`mirrors/`、`wiki/`、`index.md`、`log.md`
    - 中文 Obsidian 布局（`--layout zh`）：`史料/`、`史料_md/`、`知识库/`、`目录.md`、`日志.md`（存量中文 Obsidian LLM Wiki 仓库无需写配置文件即可自动识别挂载）。
