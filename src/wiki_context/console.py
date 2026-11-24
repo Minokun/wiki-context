@@ -19,6 +19,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import sys
@@ -47,6 +48,7 @@ from .config import VaultConfig
 from .compiler import (
     LLM_PROVIDER_PRESETS,
     compile_vault,
+    is_local_llm_url,
     plan_compilation,
     test_llm_connection,
 )
@@ -69,9 +71,18 @@ from .gateway import (
 )
 from .lint import lint_vault
 from .mcp_server import scrub_secrets
+from .net import describe_trust_store
 from .memory import MemoryNote, MemoryStore
 from .ops import run_doctor
-from .scaffold import import_external_folder, inspect_folder, onboard_folder
+from .scaffold import (
+    create_managed_vault,
+    import_external_folder,
+    inspect_folder,
+    mount_source_folder,
+    onboard_folder,
+    relink_source_path,
+    unmount_source_folder,
+)
 from .search import route as route_query
 from .state_lock import (
     atomic_write_json,
@@ -478,6 +489,17 @@ class ConsoleState:
         self.gateway.close()
         self.telemetry.close()
 
+    @property
+    def vaults_dir(self) -> Path:
+        """Managed workspace root for zero-invasion external-source vaults."""
+        env_dir = (os.environ.get("WCTX_VAULTS_DIR") or "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser().resolve()
+        cfg_dir = str(self._load_console_data().get("vaults_dir") or "").strip()
+        if cfg_dir:
+            return Path(cfg_dir).expanduser().resolve()
+        return (self.config_dir / "vaults").resolve()
+
     def _shutdown_lan_server(self) -> None:
         if self._udp_responder is not None:
             try:
@@ -701,7 +723,10 @@ class ConsoleState:
         base_url = str(cfg.get("base_url") or preset["base_url"] or "https://api.deepseek.com/v1").strip().rstrip("/")
         model = str(cfg.get("model") or preset["model"] or "deepseek-chat").strip()
         auto_compile = bool(cfg.get("auto_compile_on_sync", False))
-        max_items = max(1, min(100, int(cfg.get("max_items_per_run") or 15)))
+        max_items = max(1, min(500, int(cfg.get("max_items_per_run") or 15)))
+        workers = max(1, min(16, int(cfg.get("workers") or 4)))
+        max_tokens = max(256, min(8192, int(cfg.get("max_tokens") or 1800)))
+        disable_thinking = bool(cfg.get("disable_thinking", provider == "local"))
 
         env_key = (
             os.environ.get("WCTX_API_KEY")
@@ -712,7 +737,8 @@ class ConsoleState:
         ).strip()
 
         eff_key = saved_key or env_key
-        key_source = "saved" if saved_key else ("env" if env_key else "none")
+        key_optional = (provider == "local") or is_local_llm_url(base_url)
+        key_source = "saved" if saved_key else ("env" if env_key else ("local" if key_optional else "none"))
         return {
             "provider": provider,
             "protocol": protocol,
@@ -720,17 +746,22 @@ class ConsoleState:
             "model": model,
             "api_key": eff_key,
             "has_api_key": bool(eff_key),
+            "key_optional": key_optional,
             "api_key_masked": self._mask_secret(eff_key),
             "key_source": key_source,
-            "ready": bool(eff_key and base_url and model),
+            "ready": bool(base_url and model and (eff_key or key_optional)),
             "auto_compile_on_sync": auto_compile,
             "max_items_per_run": max_items,
+            "workers": workers,
+            "max_tokens": max_tokens,
+            "disable_thinking": disable_thinking,
         }
 
     def get_llm_compiler_status(self) -> dict[str, Any]:
         rt = self._resolve_llm_runtime()
         rt.pop("api_key", None)
         rt["presets"] = LLM_PROVIDER_PRESETS
+        rt["tls"] = describe_trust_store()
         return rt
 
     def save_llm_compiler_config(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -756,7 +787,14 @@ class ConsoleState:
                 if "auto_compile_on_sync" in payload
                 else prev.get("auto_compile_on_sync", False)
             )
-            max_items = max(1, min(100, int(payload.get("max_items_per_run") or prev.get("max_items_per_run") or 15)))
+            max_items = max(1, min(500, int(payload.get("max_items_per_run") or prev.get("max_items_per_run") or 15)))
+            workers = max(1, min(16, int(payload.get("workers") or prev.get("workers") or 4)))
+            max_tokens = max(256, min(8192, int(payload.get("max_tokens") or prev.get("max_tokens") or 1800)))
+            disable_thinking = bool(
+                payload["disable_thinking"]
+                if "disable_thinking" in payload
+                else prev.get("disable_thinking", provider == "local")
+            )
 
             data["llm_compiler"] = {
                 "provider": provider,
@@ -765,6 +803,9 @@ class ConsoleState:
                 "model": model,
                 "auto_compile_on_sync": auto_compile,
                 "max_items_per_run": max_items,
+                "workers": workers,
+                "max_tokens": max_tokens,
+                "disable_thinking": disable_thinking,
                 "updated_at": _now_iso(),
             }
             self._save_console_data(data)
@@ -783,7 +824,12 @@ class ConsoleState:
         eff_url = str(ov.get("base_url") or "").strip().rstrip("/") or rt["base_url"]
         eff_model = str(ov.get("model") or "").strip() or rt["model"]
         eff_proto = str(ov.get("protocol") or "").strip().lower() or rt["protocol"]
-        if not eff_key:
+        eff_provider = str(ov.get("provider") or rt["provider"]).strip().lower()
+        eff_disable_thinking = bool(
+            ov["disable_thinking"] if "disable_thinking" in ov else rt.get("disable_thinking", False)
+        )
+        key_optional = (eff_provider == "local") or is_local_llm_url(eff_url)
+        if not eff_key and not key_optional:
             raise ValueError("请先填写大模型访问令牌 (API Key)")
         return test_llm_connection(
             model=eff_model,
@@ -791,6 +837,7 @@ class ConsoleState:
             api_key=eff_key,
             protocol=eff_proto,
             timeout_sec=20,
+            disable_thinking=eff_disable_thinking,
         )
 
     # -- Embedded LAN Sharing Gateway (Computer A) -------------------------- #
@@ -969,6 +1016,7 @@ class ConsoleState:
                 out.append({
                     "id": vid,
                     "kind": "remote",
+                    "storage_mode": "remote",
                     "capabilities": _vault_capabilities("remote"),
                     "remote_vault_id": rvid,
                     "gateway_url": gw,
@@ -1106,24 +1154,61 @@ class ConsoleState:
                 continue
             entry["name"] = cfg.name
             entry["layout"] = cfg.layout
+            entry["storage_mode"] = cfg.storage_mode
+            entry["workspace_path"] = str(vpath)
+            entry["sources_path"] = str(cfg.sources_root)
+            entry["source_available"] = cfg.sources_root.is_dir()
+            entry["source_mounts"] = [
+                {"name": mname, "path": str(mpath), "available": mpath.is_dir()}
+                for mname, mpath in cfg.source_mounts
+            ]
             entry["sources_dir"] = cfg.sources_dir
             entry["wiki_dir"] = cfg.wiki_dir
             entry["notes_dir"] = cfg.notes_dir
+            if cfg.sources_path is not None and not cfg.sources_root.is_dir():
+                entry["online_error"] = (
+                    f"原始文档目录暂不可访问或已移动：{cfg.sources_root}（历史索引仍可查询，可使用“重定位源目录”恢复同步）"
+                )
 
             # Source subdirectories & 2-level visual folder tree for graphical ACL editor
             subdirs: list[str] = [f"{cfg.sources_dir}/**"]
             folder_tree: list[dict[str, Any]] = []
             if cfg.sources_root.is_dir():
-                for child in sorted(cfg.sources_root.iterdir(), key=lambda p: p.name.lower()):
-                    if not child.is_dir() or child.name.startswith("."):
-                        continue
-                    c_prefix = f"{cfg.sources_dir}/{child.name}/**"
-                    subdirs.append(c_prefix)
-                    sub_nodes: list[dict[str, Any]] = []
+                try:
+                    for child in sorted(cfg.sources_root.iterdir(), key=lambda p: p.name.lower()):
+                        if not child.is_dir() or child.name.startswith("."):
+                            continue
+                        c_prefix = f"{cfg.sources_dir}/{child.name}/**"
+                        subdirs.append(c_prefix)
+                        sub_nodes: list[dict[str, Any]] = []
+                        try:
+                            for sub in sorted(child.iterdir(), key=lambda p: p.name.lower()):
+                                if sub.is_dir() and not sub.name.startswith("."):
+                                    sub_p = f"{cfg.sources_dir}/{child.name}/{sub.name}/**"
+                                    subdirs.append(sub_p)
+                                    sub_nodes.append({
+                                        "name": sub.name,
+                                        "prefix": sub_p,
+                                    })
+                        except PermissionError:
+                            pass
+                        folder_tree.append({
+                            "name": child.name,
+                            "prefix": c_prefix,
+                            "children": sub_nodes,
+                        })
+                except PermissionError:
+                    pass
+            for mname, mpath in cfg.source_mounts:
+                c_prefix = f"{cfg.sources_dir}/{mname}/**"
+                subdirs.append(c_prefix)
+                sub_nodes = []
+                m_avail = mpath.is_dir()
+                if m_avail:
                     try:
-                        for sub in sorted(child.iterdir(), key=lambda p: p.name.lower()):
+                        for sub in sorted(mpath.iterdir(), key=lambda p: p.name.lower()):
                             if sub.is_dir() and not sub.name.startswith("."):
-                                sub_p = f"{cfg.sources_dir}/{child.name}/{sub.name}/**"
+                                sub_p = f"{cfg.sources_dir}/{mname}/{sub.name}/**"
                                 subdirs.append(sub_p)
                                 sub_nodes.append({
                                     "name": sub.name,
@@ -1131,11 +1216,14 @@ class ConsoleState:
                                 })
                     except PermissionError:
                         pass
-                    folder_tree.append({
-                        "name": child.name,
-                        "prefix": c_prefix,
-                        "children": sub_nodes,
-                    })
+                folder_tree.append({
+                    "name": mname,
+                    "prefix": c_prefix,
+                    "mounted": True,
+                    "mount_path": str(mpath),
+                    "available": m_avail,
+                    "children": sub_nodes,
+                })
             entry["source_prefixes"] = subdirs
             entry["folder_tree"] = folder_tree
 
@@ -1219,6 +1307,48 @@ class ConsoleState:
             raise KeyError(f"Missing local path for vault_id '{vault_id}'")
         return Path(raw_p).expanduser().resolve()
 
+    def _find_existing_local_vault(self, vaults: list[dict[str, Any]], target: Path) -> dict[str, Any] | None:
+        """Deduplicate onboarding against both workspace paths and external primary source roots."""
+        for v in vaults:
+            if not isinstance(v, dict) or v.get("kind") == "remote":
+                continue
+            raw_p = str(v.get("path") or "").strip()
+            if raw_p:
+                try:
+                    vp = Path(raw_p).expanduser().resolve()
+                    if vp == target:
+                        return v
+                except OSError:
+                    vp = None
+            else:
+                vp = None
+            raw_sp = str(v.get("sources_path") or "").strip()
+            if raw_sp:
+                try:
+                    if Path(raw_sp).expanduser().resolve() == target:
+                        return v
+                except OSError:
+                    pass
+            if vp is not None and vp.is_dir():
+                try:
+                    cfg_v = VaultConfig.load(vp)
+                    if cfg_v.sources_root.resolve() == target:
+                        return v
+                except Exception:
+                    pass
+        return None
+
+    def _allocate_managed_workspace(self, vid: str) -> Path:
+        base_root = self.vaults_dir
+        base_root.mkdir(parents=True, exist_ok=True)
+        cand = base_root / vid
+        if not cand.exists():
+            return cand
+        idx = 2
+        while (base_root / f"{vid}-{idx}").exists():
+            idx += 1
+        return base_root / f"{vid}-{idx}"
+
     def onboard_and_register(
         self,
         *,
@@ -1228,48 +1358,100 @@ class ConsoleState:
         layout: str = "",
         adopt_loose_files: bool = True,
         auto_compile: bool | None = None,
+        storage_mode: str = "auto",
     ) -> dict[str, Any]:
+        smode = (storage_mode or "auto").strip().lower()
+        if smode not in {"auto", "managed", "in_place"}:
+            raise ValueError(f"Unsupported storage_mode '{storage_mode}'; choose 'auto', 'managed', or 'in_place'")
+
         target = Path(path).expanduser().resolve()
-        rep = onboard_folder(
-            target,
-            name=name or None,
-            layout=layout or None,
-            adopt_loose_files=adopt_loose_files,
-            run_sync=True,
-        )
+        info = inspect_folder(target)
+
+        # Deduplicate against BOTH registered workspace paths and external source paths
         with self._lock:
             data = self._load_console_data()
             vaults = list(data.get("vaults") or [])
-            existing_by_path = next(
-                (
-                    v
-                    for v in vaults
-                    if v.get("kind") != "remote"
-                    and v.get("path")
-                    and Path(str(v.get("path"))).resolve() == target
-                ),
-                None,
-            )
-            if existing_by_path is not None:
-                vid = str(existing_by_path["id"])
+            existing_rec = self._find_existing_local_vault(vaults, target)
+            existing_ids = {str(v.get("id")) for v in vaults if isinstance(v, dict)}
+
+        if existing_rec is not None:
+            vid = str(existing_rec["id"])
+            registered_path = Path(str(existing_rec["path"])).expanduser().resolve()
+            sync_rep = sync_vault(registered_path, rebuild=True)
+            cfg_ex = VaultConfig.load(registered_path)
+            rep: dict[str, Any] = {
+                "path": str(registered_path),
+                "workspace_path": str(registered_path),
+                "sources_path": str(cfg_ex.sources_root),
+                "storage_mode": cfg_ex.storage_mode,
+                "name": cfg_ex.name,
+                "layout": cfg_ex.layout,
+                "onboard_mode": "already_registered",
+                "moved_entries": [],
+                "sync": sync_rep,
+            }
+        else:
+            clean_req_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", vault_id.strip()).strip("-")
+            if clean_req_id and clean_req_id in existing_ids:
+                raise ValueError(f"知识库 ID '{clean_req_id}' 已存在，请更换一个标识")
+
+            eff_mode = ("in_place" if info["kind"] == "existing_vault" else "managed") if smode == "auto" else smode
+            if eff_mode == "managed":
+                if info["kind"] == "existing_vault":
+                    raise ValueError("该目录本身已是完整的知识库工作区，请使用原地接入模式，无需重复套壳")
+                sug_name = (name or info.get("suggested_name") or target.name or "knowledge-vault").strip()
+                vid = clean_req_id if clean_req_id else _slugify_vault_id(sug_name, existing_ids)
+                ws_dir = self._allocate_managed_workspace(vid)
+                rep = create_managed_vault(
+                    ws_dir,
+                    source_dir=target,
+                    name=name or None,
+                    layout=layout or None,
+                    run_sync=True,
+                )
+                registered_path = ws_dir
+                new_record: dict[str, Any] = {
+                    "id": vid,
+                    "path": str(ws_dir),
+                    "storage_mode": "managed",
+                    "sources_path": str(target),
+                    "added_at": _now_iso(),
+                }
             else:
-                existing_ids = {str(v.get("id")) for v in vaults}
-                clean_req_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", vault_id.strip()).strip("-")
-                if clean_req_id and clean_req_id in existing_ids:
-                    raise ValueError(f"知识库 ID '{clean_req_id}' 已存在，请更换一个标识")
+                rep = onboard_folder(
+                    target,
+                    name=name or None,
+                    layout=layout or None,
+                    adopt_loose_files=adopt_loose_files,
+                    run_sync=True,
+                )
                 vid = clean_req_id if clean_req_id else _slugify_vault_id(rep["name"], existing_ids)
-                vaults.append({"id": vid, "path": str(target), "added_at": _now_iso()})
+                registered_path = target
+                new_record = {
+                    "id": vid,
+                    "path": str(target),
+                    "storage_mode": "in_place",
+                    "added_at": _now_iso(),
+                }
+
+            with self._lock:
+                data = self._load_console_data()
+                vaults = list(data.get("vaults") or [])
+                if any(isinstance(v, dict) and str(v.get("id")) == vid for v in vaults):
+                    raise ValueError(f"知识库 ID '{vid}' 已存在，请更换一个标识")
+                vaults.append(new_record)
                 data["vaults"] = vaults
                 _atomic_write_json(self.console_file, data)
 
-        self.gateway.upsert_vault(vid, target)
+        self.gateway.upsert_vault(vid, registered_path)
         self._compile_plan_cache.pop(vid, None)
+        self._refresh_watcher_targets()
         rt = self._resolve_llm_runtime()
         should_compile = rt["auto_compile_on_sync"] if auto_compile is None else bool(auto_compile)
         compile_job: dict[str, Any] | None = None
         uncompiled_cnt = 0
         try:
-            plan_info = plan_compilation(target)
+            plan_info = plan_compilation(registered_path)
             uncompiled_cnt = len(plan_info.get("uncompiled_sources") or [])
         except Exception:
             uncompiled_cnt = 0
@@ -1293,11 +1475,69 @@ class ConsoleState:
         )
         self.gateway.upsert_vault(vault_id, vpath)
         self._compile_plan_cache.pop(vault_id, None)
+        self._refresh_watcher_targets()
         rt = self._resolve_llm_runtime()
         compile_job: dict[str, Any] | None = None
         if rt["ready"] and rt["auto_compile_on_sync"]:
             compile_job = self.start_compile_job(vault_id, trigger="import")
         return {"vault_id": vault_id, **rep, "llm_ready": rt["ready"], "compile_job": compile_job}
+
+    def mount_folder(self, *, vault_id: str, external_folder: str, mount_name: str = "") -> dict[str, Any]:
+        vpath = self.get_vault_path(vault_id)
+        rep = mount_source_folder(
+            vpath,
+            external_folder,
+            mount_name=mount_name or None,
+            run_sync=True,
+        )
+        self.gateway.upsert_vault(vault_id, vpath)
+        self._compile_plan_cache.pop(vault_id, None)
+        self._refresh_watcher_targets()
+        rt = self._resolve_llm_runtime()
+        compile_job: dict[str, Any] | None = None
+        if rt["ready"] and rt["auto_compile_on_sync"]:
+            compile_job = self.start_compile_job(vault_id, trigger="mount")
+        return {"vault_id": vault_id, **rep, "llm_ready": rt["ready"], "compile_job": compile_job}
+
+    def unmount_folder(self, *, vault_id: str, mount_name: str, purge_mirrors: bool = True) -> dict[str, Any]:
+        vpath = self.get_vault_path(vault_id)
+        rep = unmount_source_folder(
+            vpath,
+            mount_name,
+            purge_mirrors=purge_mirrors,
+            rebuild=True,
+        )
+        self.gateway.upsert_vault(vault_id, vpath)
+        self._compile_plan_cache.pop(vault_id, None)
+        self._refresh_watcher_targets()
+        return {"vault_id": vault_id, **rep}
+
+    def relink_vault_source(
+        self,
+        *,
+        vault_id: str,
+        new_source_dir: str,
+        mount_name: str = "",
+    ) -> dict[str, Any]:
+        vpath = self.get_vault_path(vault_id)
+        rep = relink_source_path(
+            vpath,
+            new_source_dir,
+            mount_name=mount_name or None,
+            run_sync=True,
+        )
+        if not (mount_name or "").strip():
+            with self._lock:
+                data = self._load_console_data()
+                for v in data.get("vaults") or []:
+                    if isinstance(v, dict) and str(v.get("id")) == vault_id and v.get("kind") != "remote":
+                        v["sources_path"] = rep["new_path"]
+                        v["storage_mode"] = "managed"
+                _atomic_write_json(self.console_file, data)
+        self.gateway.upsert_vault(vault_id, vpath)
+        self._compile_plan_cache.pop(vault_id, None)
+        self._refresh_watcher_targets()
+        return {"vault_id": vault_id, **rep}
 
     def sync_registered_vault(self, vault_id: str, *, force: bool = False) -> dict[str, Any]:
         vpath = self.get_vault_path(vault_id)
@@ -1515,21 +1755,80 @@ class ConsoleState:
             args["max_tokens"] = int(max_tokens)
         return svc.tool_context(args, principal=Principal(uid="console-admin", groups=("admin",)))
 
-    def unregister_vault(self, vault_id: str) -> bool:
+    def remove_vault_detailed(self, vault_id: str, *, cleanup_workspace: bool = False) -> dict[str, Any]:
+        """Unregister a vault and optionally clean managed workspace cache while archiving curated Wiki/Memory."""
+        removed_rec: dict[str, Any] | None = None
         with self._lock:
             data = self._load_console_data()
             before = list(data.get("vaults") or [])
-            after = [v for v in before if str(v.get("id")) != vault_id]
-            if len(after) == len(before):
-                return False
+            after: list[dict[str, Any]] = []
+            for v in before:
+                if isinstance(v, dict) and str(v.get("id")) == vault_id:
+                    removed_rec = dict(v)
+                else:
+                    after.append(v)
+            if removed_rec is None:
+                return {"removed": False, "workspace_cleaned": False, "archived_to": ""}
             data["vaults"] = after
+            watched = [x for x in (data.get("watched_vaults") or []) if str(x) != vault_id]
+            data["watched_vaults"] = watched
             _atomic_write_json(self.console_file, data)
             rem_doc = self._load_remotes_doc()
             if vault_id in (rem_doc.get("credentials") or {}):
                 rem_doc["credentials"].pop(vault_id, None)
                 self._save_remotes_doc(rem_doc)
+
         self.gateway.remove_vault(vault_id)
-        return True
+        self._compile_plan_cache.pop(vault_id, None)
+        self._refresh_watcher_targets()
+
+        workspace_cleaned = False
+        archived_to = ""
+        cleanup_error = ""
+        if cleanup_workspace and removed_rec.get("kind") != "remote" and removed_rec.get("path"):
+            try:
+                vpath = Path(str(removed_rec["path"])).expanduser().resolve()
+                vdir_root = self.vaults_dir.resolve()
+                # Strict safety jail: ONLY clean managed workspaces living strictly inside vaults_dir
+                # that point to an external sources_path — NEVER touch user's original source folder!
+                if vdir_root in vpath.parents and vpath.is_dir():
+                    cfg = VaultConfig.load(vpath)
+                    if cfg.sources_path is not None:
+                        if cfg.mirrors_root.is_dir() and vpath in cfg.mirrors_root.resolve().parents:
+                            shutil.rmtree(cfg.mirrors_root, ignore_errors=True)
+                        template_pages = {"知识库总览.md", "Overview.md"}
+                        has_curated_wiki = (
+                            cfg.wiki_root.is_dir()
+                            and any(
+                                p.is_file() and p.name not in template_pages
+                                for p in cfg.wiki_root.rglob("*.md")
+                            )
+                        )
+                        has_notes = cfg.notes_root.is_dir() and any(cfg.notes_root.rglob("*.md"))
+                        if has_curated_wiki or has_notes:
+                            ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                            trash_root = (self.config_dir / ".trash").resolve()
+                            trash_root.mkdir(parents=True, exist_ok=True)
+                            dest = trash_root / f"{vault_id}-{ts}"
+                            shutil.move(str(vpath), str(dest))
+                            archived_to = str(dest)
+                        else:
+                            shutil.rmtree(vpath, ignore_errors=True)
+                        workspace_cleaned = True
+            except Exception as exc:
+                cleanup_error = str(exc)
+
+        out: dict[str, Any] = {
+            "removed": True,
+            "workspace_cleaned": workspace_cleaned,
+            "archived_to": archived_to,
+        }
+        if cleanup_error:
+            out["cleanup_error"] = cleanup_error
+        return out
+
+    def unregister_vault(self, vault_id: str, *, cleanup_workspace: bool = False) -> bool:
+        return bool(self.remove_vault_detailed(vault_id, cleanup_workspace=cleanup_workspace)["removed"])
 
     def rename_vault_id(self, old_id: str, new_id: str, *, sync_clients: bool = True) -> dict[str, Any]:
         clean_new = re.sub(r"[^a-zA-Z0-9_-]+", "-", (new_id or "").strip()).strip("-")
@@ -1553,6 +1852,9 @@ class ConsoleState:
             if target.get("kind") != "remote" and target.get("path"):
                 local_path = Path(str(target["path"])).expanduser().resolve()
             data["vaults"] = vaults
+            watched = list(data.get("watched_vaults") or [])
+            if old_id in watched:
+                data["watched_vaults"] = [clean_new if x == old_id else x for x in watched]
             _atomic_write_json(self.console_file, data)
 
             rem_doc = self._load_remotes_doc()
@@ -1576,6 +1878,7 @@ class ConsoleState:
         self.gateway.remove_vault(old_id)
         if local_path is not None and local_path.is_dir():
             self.gateway.upsert_vault(clean_new, local_path)
+        self._refresh_watcher_targets()
 
         client_sync_results: list[dict[str, Any]] = []
         if sync_clients:
@@ -1636,7 +1939,7 @@ class ConsoleState:
                 "result": {"compiled_pages": [], "refreshed_pages": [], "consolidated_notes": [], "noop": True},
             }
 
-        eff_max = max(1, min(100, int(max_items or rt["max_items_per_run"] or 15)))
+        eff_max = max(1, min(500, int(max_items or rt["max_items_per_run"] or 15)))
         job_id = f"job_cmp_{secrets.token_hex(5)}"
         job_rec: dict[str, Any] = {
             "job_id": job_id,
@@ -1681,6 +1984,9 @@ class ConsoleState:
                     api_key=rt["api_key"],
                     protocol=rt["protocol"],
                     max_items=eff_max,
+                    workers=rt["workers"],
+                    max_tokens=rt["max_tokens"],
+                    disable_thinking=rt["disable_thinking"],
                     on_progress=_on_progress,
                 )
                 self._compile_finished_ts[vault_id] = time.monotonic()
@@ -2622,6 +2928,10 @@ def create_console_server(
                 allowed_origins.update({"http://127.0.0.1:5173", "http://localhost:5173"})
             if origin in allowed_origins:
                 return origin
+            if allow_remote_admin and not _is_loopback_host(host):
+                req_host = (self.headers.get("Host") or "").strip().lower()
+                if req_host and origin.lower() in {f"http://{req_host}", f"https://{req_host}"}:
+                    return origin
             if allow_null_for_sidecar and origin == "null" and eff_admin_token:
                 return "null"
             return ""
@@ -2681,7 +2991,8 @@ def create_console_server(
 
         def _require_admin_csrf(self) -> bool:
             if not self._is_allowed_host():
-                self._send_json(403, {"error": "Disallowed Host header (DNS rebinding guard)"})
+                self.close_connection = True
+                self._send_json(403, {"error": "Disallowed Host header (DNS rebinding guard)"}, {"Connection": "close"})
                 return False
             supplied_admin = (self.headers.get("X-WCTX-Admin-Token") or "").strip()
             has_valid_admin = bool(
@@ -2689,14 +3000,20 @@ def create_console_server(
             )
             origin = (self.headers.get("Origin") or "").strip()
             if origin and not self._cors_origin(allow_null_for_sidecar=has_valid_admin):
-                self._send_json(403, {"error": "Cross-origin admin request blocked"})
+                self.close_connection = True
+                self._send_json(403, {"error": "Cross-origin admin request blocked"}, {"Connection": "close"})
                 return False
             if has_valid_admin:
                 return True
             supplied_csrf = (self.headers.get("X-WCTX-CSRF") or "").strip()
             if supplied_csrf and hmac.compare_digest(supplied_csrf, csrf_token):
                 return True
-            self._send_json(403, {"error": "Missing or invalid X-WCTX-CSRF / X-WCTX-Admin-Token session token"})
+            self.close_connection = True
+            self._send_json(
+                403,
+                {"error": "Missing or invalid X-WCTX-CSRF / X-WCTX-Admin-Token session token"},
+                {"Connection": "close"},
+            )
             return False
 
         def do_OPTIONS(self) -> None:  # noqa: N802
@@ -2847,6 +3164,7 @@ def create_console_server(
             return {
                 "version": __version__,
                 "config_dir": str(state.config_dir),
+                "vaults_dir": str(state.vaults_dir),
                 "tokens_file": str(state.tokens_file),
                 "gateway_base_url": self._gateway_base_url(),
                 "lan_gateway": state.get_lan_gateway_status(),
@@ -3039,6 +3357,7 @@ def create_console_server(
                         layout=str(body.get("layout") or ""),
                         adopt_loose_files=bool(body.get("adopt_loose_files", True)),
                         auto_compile=auto_cmp if isinstance(auto_cmp, bool) else None,
+                        storage_mode=str(body.get("storage_mode") or "auto"),
                     )
                     self._send_json(200, res)
                     return
@@ -3048,6 +3367,33 @@ def create_console_server(
                         vault_id=str(body.get("vault_id") or ""),
                         external_folder=str(body.get("external_folder") or ""),
                         target_subfolder=str(body.get("target_subfolder") or ""),
+                    )
+                    self._send_json(200, res)
+                    return
+
+                if path == "/api/vaults/mount-folder":
+                    res = state.mount_folder(
+                        vault_id=str(body.get("vault_id") or ""),
+                        external_folder=str(body.get("external_folder") or ""),
+                        mount_name=str(body.get("mount_name") or ""),
+                    )
+                    self._send_json(200, res)
+                    return
+
+                if path == "/api/vaults/unmount-folder":
+                    res = state.unmount_folder(
+                        vault_id=str(body.get("vault_id") or ""),
+                        mount_name=str(body.get("mount_name") or ""),
+                        purge_mirrors=bool(body.get("purge_mirrors", True)),
+                    )
+                    self._send_json(200, res)
+                    return
+
+                if path == "/api/vaults/relink":
+                    res = state.relink_vault_source(
+                        vault_id=str(body.get("vault_id") or ""),
+                        new_source_dir=str(body.get("new_source_dir") or ""),
+                        mount_name=str(body.get("mount_name") or ""),
                     )
                     self._send_json(200, res)
                     return
@@ -3151,8 +3497,11 @@ def create_console_server(
                     return
 
                 if path == "/api/vaults/remove":
-                    ok = state.unregister_vault(str(body.get("vault_id") or ""))
-                    self._send_json(200, {"removed": ok})
+                    res = state.remove_vault_detailed(
+                        str(body.get("vault_id") or ""),
+                        cleanup_workspace=bool(body.get("cleanup_workspace", False)),
+                    )
+                    self._send_json(200, res)
                     return
 
                 if path == "/api/vaults/rename":
@@ -3444,6 +3793,7 @@ def run_console(
             threading.Thread(target=_stdin_watchdog, name="wctx-stdin-watchdog", daemon=True).start()
 
         url = f"http://{'127.0.0.1' if host in {'0.0.0.0', '::'} else host}:{actual_port}"
+        listen_url = f"http://{host}:{actual_port}"
         if allow_remote_admin and not _is_loopback_host(host):
             print(
                 "[WARNING] Control Console admin routes (/api/*) have no user login password and are "
@@ -3455,8 +3805,9 @@ def run_console(
         if sidecar:
             print(f"WCTX_READY {actual_port} {os.getpid()}", flush=True)
         else:
+            addr_line = f"{listen_url} (local: {url})" if host in {"0.0.0.0", "::"} else url
             print(
-                f"wiki-context Control Console & Gateway running at {url}\n"
+                f"wiki-context Control Console & Gateway running at {addr_line}\n"
                 f"  Config & Tokens : {state.config_dir}\n"
                 f"  MCP HTTP Route  : {url}/mcp/<vault_id>",
                 flush=True,

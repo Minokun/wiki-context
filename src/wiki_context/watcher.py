@@ -41,7 +41,7 @@ class VaultWatcherManager:
     def _shallow_sig(vault_path: Path) -> tuple[int, int]:
         try:
             cfg = VaultConfig.load(vault_path)
-            roots = (cfg.sources_root, cfg.wiki_root)
+            roots = tuple(p for _, p in cfg.iter_source_roots()) + (cfg.wiki_root,)
         except Exception:
             roots = (vault_path,)
 

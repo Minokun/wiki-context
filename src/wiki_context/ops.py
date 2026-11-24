@@ -20,9 +20,11 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from . import __version__
+from .net import describe_trust_store, probe_tls as _tls_handshake
 from .clients import inspect_all_clients, resolve_wctx_command
 from .state_lock import resolve_external_tool
 
@@ -51,6 +53,39 @@ def _poppler_install_hint() -> str:
     if sys.platform.startswith("linux"):
         return "sudo apt-get update && sudo apt-get install -y poppler-utils"
     return "Install poppler (provides pdftotext & pdftoppm) and add it to PATH"
+
+
+def _tls_check_detail(tls_info: dict[str, Any], probe: dict[str, Any] | None) -> str:
+    """One-line summary of the resolved CA bundle, optionally with a live handshake."""
+    if not tls_info.get("ok"):
+        return str(tls_info.get("error") or "未找到可用的根证书，任何 HTTPS 请求都会失败")
+    detail = (
+        f"来源 {tls_info.get('source')} · {tls_info.get('cafile') or '系统证书库'}"
+        f"（{tls_info.get('ca_count')} 个根证书）"
+    )
+    if probe:
+        host = probe.get("host") or "目标站点"
+        if probe.get("ok"):
+            detail += f" · 实测握手 {host} 成功"
+        else:
+            detail += f" · 实测握手 {host} 失败：{probe.get('error') or '未知错误'}"
+    return detail
+
+
+def _probe_configured_llm_tls(cfg_dir: Path) -> dict[str, Any]:
+    """Handshake-test the host of the configured LLM endpoint (no request, no token spend)."""
+    host = "api.deepseek.com"
+    try:
+        raw = json.loads((cfg_dir / "console.json").read_text(encoding="utf-8"))
+        compiler = raw.get("llm_compiler") if isinstance(raw, dict) else None
+        base_url = str((compiler or {}).get("base_url") or "").strip()
+        parsed = urlparse(base_url)
+        if parsed.hostname:
+            host = parsed.hostname
+    except (OSError, ValueError, AttributeError):
+        pass
+    return _tls_handshake(host)
+
 
 
 def _resolve_config_dir(config_dir: Path | str | None = None) -> Path:
@@ -345,6 +380,7 @@ def run_doctor(
     client_home: Path | None = None,
     ui_port: int = 8765,
     gateway_port: int = 8090,
+    probe_tls: bool = False,
 ) -> dict[str, Any]:
     """Run a comprehensive first-time installation & runtime health diagnostic."""
     cfg_dir = _resolve_config_dir(config_dir)
@@ -383,6 +419,11 @@ def run_doctor(
     asr_cmd = (os.environ.get("WCTX_ASR_CMD") or "").strip()
     vlm_key_set = bool((os.environ.get("WCTX_VLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip())
 
+    tls_info = describe_trust_store()
+    tls_probe: dict[str, Any] | None = None
+    if probe_tls:
+        tls_probe = _probe_configured_llm_tls(cfg_dir)
+
     clients = inspect_all_clients(home=client_home)
     installed_clients = [c for c in clients if c.get("installed")]
     configured_clients = [c for c in installed_clients if c.get("configured_servers")]
@@ -399,6 +440,14 @@ def run_doctor(
             "level": "ok" if py_ok else "error",
             "detail": f"Python {sys.version.split()[0]} ({sys.executable})",
             "fix": "" if py_ok else f"请升级至 Python {min_py_str}+",
+        },
+        {
+            "id": "tls_trust_store",
+            "label": "HTTPS 根证书信任库",
+            "ok": bool(tls_info.get("ok")),
+            "level": "ok" if tls_info.get("ok") else "error",
+            "detail": _tls_check_detail(tls_info, tls_probe),
+            "fix": "" if tls_info.get("ok") else "设置 WCTX_CA_BUNDLE=/etc/ssl/cert.pem 或安装 certifi，然后重启 wiki-context",
         },
         {
             "id": "wctx_path",
@@ -451,6 +500,7 @@ def run_doctor(
         "platform": sys.platform,
         "python": {"version": sys.version.split()[0], "executable": sys.executable, "ok": py_ok},
         "wctx_cli": {"command": cmd, "base_args": base_args, "in_path": bool(wctx_in_path), "which": wctx_in_path or ""},
+        "tls": {**tls_info, "probe": tls_probe},
         "tools": {
             "pdftotext": {"available": bool(pdftotext_path), "path": pdftotext_path or "", "install_hint": poppler_hint},
             "pdftoppm": {"available": bool(pdftoppm_path), "path": pdftoppm_path or "", "install_hint": poppler_hint},

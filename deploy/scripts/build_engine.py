@@ -34,6 +34,28 @@ EXCLUDE_MODULES = [
 ]
 
 
+def _ensure_certifi(py: str) -> bool:
+    """Bundle certifi so a frozen engine never depends on the host's CA files.
+
+    PyInstaller ships OpenSSL with a compiled-in CA path pointing at the
+    python.org framework install (e.g.
+    /Library/Frameworks/Python.framework/Versions/3.14/etc/openssl/cert.pem).
+    On machines without that exact framework every HTTPS request fails with
+    CERTIFICATE_VERIFY_FAILED ("unable to get local issuer certificate").
+    """
+    chk = subprocess.run([py, "-c", "import certifi"], capture_output=True, check=False)
+    if chk.returncode == 0:
+        return True
+    print("[build_engine] Installing certifi into the build environment ...", flush=True)
+    res = subprocess.run([py, "-m", "pip", "install", "certifi"], check=False)
+    if res.returncode != 0:
+        res = subprocess.run(
+            [py, "-m", "pip", "install", "-i", "https://pypi.org/simple", "certifi"],
+            check=False,
+        )
+    return res.returncode == 0
+
+
 def _resolve_python_with_pyinstaller() -> str:
     # 1. Current interpreter if PyInstaller is available
     chk = subprocess.run(
@@ -94,6 +116,14 @@ def main() -> int:
         ]
         for mod in EXCLUDE_MODULES:
             cmd.extend(["--exclude-module", mod])
+        if _ensure_certifi(py):
+            cmd.extend(["--collect-data", "certifi", "--hidden-import", "certifi"])
+        else:
+            print(
+                "[build_engine] WARNING: certifi unavailable; the engine will rely on "
+                "system CA bundles at runtime (WCTX_CA_BUNDLE / platform bundles)",
+                flush=True,
+            )
         ui_dist = SRC_DIR / "wiki_context" / "ui_dist"
         if (ui_dist / "index.html").is_file():
             cmd.extend(["--add-data", f"{ui_dist}{os.pathsep}wiki_context/ui_dist"])

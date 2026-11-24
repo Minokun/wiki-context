@@ -689,6 +689,24 @@ WCTX_MODEL="deepseek-chat" \
 wctx compile --vault ./我的知识库
 ```
 
+### 排查：点击「AI 整理新文档」报 `CERTIFICATE_VERIFY_FAILED`
+
+若控制中心提示 `文档整理失败：<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate>`，说明当前运行环境的 **HTTPS 根证书信任库为空**（常见于打包桌面版：内置 OpenSSL 的默认证书路径指向了本机未安装的 python.org 框架版本），与 API Key、模型地址无关。任选一种方式修复：
+
+```bash
+# 1) 查看当前信任库来源与实测握手（不消耗 token）
+wctx doctor --probe-tls
+
+# 2) 指定一个可用的根证书包（macOS/Linux 通用），随后重启 wiki-context
+export WCTX_CA_BUNDLE=/etc/ssl/cert.pem     # 或 SSL_CERT_FILE=/etc/ssl/cert.pem
+open -a wiki-context                        # 桌面版需完全退出后重新打开
+
+# 3) 或安装证书包，让内置解析自动兜底
+pip install certifi
+```
+
+`wctx` 会依次尝试 `WCTX_CA_BUNDLE` → `SSL_CERT_FILE` → `certifi` → 系统证书包（macOS `/etc/ssl/cert.pem`、Linux `/etc/ssl/certs/ca-certificates.crt`）→ 系统证书库，并在 `wctx doctor` 中显示实际生效的来源与根证书数量；此后重新打包的桌面安装包会在 `_internal/certifi/` 内置根证书，不再依赖宿主机证书文件。
+
 ---
 
 ## CLI 命令速查（`wctx`）
@@ -696,7 +714,7 @@ wctx compile --vault ./我的知识库
 | 命令 | 功能说明 |
 | :--- | :--- |
 | `wctx ui [--port 8765]` | 启动本机可视化 Web 控制中心（仅绑定 `127.0.0.1`，管理文件夹、令牌、多端 MCP、记忆 + 开发网关） |
-| `wctx doctor [--json]` | 一键环境体检（Python、全局 `wctx` 路径、`pdftotext`/`pdftoppm`、AI 客户端与后台守护状态） |
+| `wctx doctor [--json] [--probe-tls]` | 一键环境体检（Python、HTTPS 根证书信任库、全局 `wctx` 路径、`pdftotext`/`pdftoppm`、AI 客户端与后台守护状态）；`--probe-tls` 额外对整理模型域名做一次真实 TLS 握手 |
 | `wctx service [status\|render\|install\|uninstall]` | 生成或安装 macOS `launchd` / Linux `systemd --user` 后台守护服务（推荐 `--target gateway`） |
 | `wctx init <path> [--layout en\|zh]` | 初始化中/英文四层结构知识库与 `AGENTS.md` 维护规约 |
 | `wctx sync --vault <V> [--list]` | 增量提取变更原件并重建不可变 FTS5 索引 |

@@ -51,7 +51,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
       baseUrl: cfg.baseUrl.replace(/\/+$/, ""),
       adminToken: isAdminSecret ? tok : undefined,
       csrfToken: isAdminSecret ? undefined : tok,
-      version: cfg.version || "0.4.1",
+      version: cfg.version || "0.5.0",
     };
     return cachedBootstrap;
   }
@@ -62,7 +62,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
       mode: "web",
       baseUrl: "",
       csrfToken: injected.csrfToken,
-      version: injected.version || "0.4.1",
+      version: injected.version || "0.5.0",
       instanceId: injected.instanceId,
       fp: injected.fp,
     };
@@ -83,7 +83,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
     mode: "web",
     baseUrl: "",
     csrfToken: data.csrfToken,
-    version: data.version || "0.4.1",
+    version: data.version || "0.5.0",
     instanceId: data.instanceId,
     fp: data.fp,
   };
@@ -118,6 +118,17 @@ export async function subscribeNativeFileDrop(
     return unlisten;
   } catch {
     return () => {};
+  }
+}
+
+export async function openNativeDirectory(path: string): Promise<boolean> {
+  if (!isTauriRuntime() || !path.trim()) return false;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("open_directory", { path: path.trim() });
+    return true;
+  } catch {
+    return false;
   }
 }
 

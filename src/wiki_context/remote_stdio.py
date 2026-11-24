@@ -13,6 +13,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from .net import TLSUnavailable, format_network_error, ssl_context
+
 
 def _write_stdout_line(text: str) -> None:
     data = (text.rstrip("\r\n") + "\n").encode("utf-8", errors="replace")
@@ -57,7 +59,7 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
 
         req = urllib.request.Request(endpoint, data=line.encode("utf-8"), headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_context()) as resp:
                 if resp.status == 202 or not has_id:
                     continue
                 body = resp.read().decode("utf-8", errors="replace").strip()
@@ -71,12 +73,16 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
                     "error": {"code": -32000, "message": f"Gateway HTTP {exc.code}: {exc.reason}"},
                 }
                 _write_stdout_line(json.dumps(err_msg, ensure_ascii=False))
-        except OSError as exc:
+        except (OSError, TLSUnavailable) as exc:
             if has_id:
                 err_msg = {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "error": {"code": -32000, "message": f"Gateway unreachable: {exc}"},
+                    "error": {
+                        "code": -32000,
+                        "message": "Gateway unreachable: "
+                        + format_network_error(exc, target=endpoint),
+                    },
                 }
                 _write_stdout_line(json.dumps(err_msg, ensure_ascii=False))
     return 0

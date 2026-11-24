@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wiki_context.extract import extract_document  # noqa: E402
+from wiki_context.config import VaultConfig  # noqa: E402
+from wiki_context.extract import (  # noqa: E402
+    _compact_pdf_layout_padding,
+    _strip_pdf_repeated_noise,
+    extract_document,
+)
 from wiki_context.policy import source_skip_reason  # noqa: E402
 from wiki_context.scaffold import init_vault  # noqa: E402
 from wiki_context.sync import _split_command_template, sync_vault  # noqa: E402
@@ -125,6 +130,74 @@ class TestExtractAndSync(unittest.TestCase):
             _split_command_template(unquoted_cmd, is_windows=True),
             [r"C:\Python314\python.exe", "-c", "print('ok')"],
         )
+
+    def test_rich_binary_size_limit_and_pdf_watermark_denoising(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "size-vault"
+            init_vault(v)
+            cfg = VaultConfig.load(v)
+            self.assertEqual(cfg.max_doc_bytes, 2 * 1024 * 1024)
+            self.assertEqual(cfg.max_source_bytes, 50 * 1024 * 1024)
+
+            big_pdf = v / "sources" / "slides.pdf"
+            big_pdf.write_bytes(b"%PDF-1.4\n" + b"0" * (3 * 1024 * 1024))
+            big_txt = v / "sources" / "dump.txt"
+            big_txt.write_bytes(b"A" * (3 * 1024 * 1024))
+            # 3 MiB PDF/PPTX is admitted under 50 MiB max_source_bytes, while 3 MiB plain text is still rejected
+            self.assertIsNone(source_skip_reason(big_pdf, "slides.pdf", cfg=cfg))
+            self.assertTrue(str(source_skip_reason(big_txt, "dump.txt", cfg=cfg)).startswith("oversized("))
+
+        # Multi-page PDF diagonal watermark & repeated footer stripping
+        raw_pages = []
+        for idx in range(1, 11):
+            raw_pages.append(
+                f"                    资\n"
+                f"             教\n"
+                f"          学\n"
+                f"                  第 {idx} 节核心内容：导高 4000-6500mm，误差 ±3mm。\n"
+                f"  课程中所涉及案例均仅做案例讲解，不构成任何投资建议\n"
+            )
+        cleaned_pages, stripped = _strip_pdf_repeated_noise(raw_pages)
+        self.assertTrue(stripped)
+        joined = "\n".join(_compact_pdf_layout_padding(p) for p in cleaned_pages)
+        self.assertNotIn("不构成任何投资建议", joined)
+        self.assertNotIn("\n资\n", joined)
+        self.assertIn("第 10 节核心内容：导高 4000-6500mm，误差 ±3mm。", joined)
+
+    def test_pdf_noise_stripper_preserves_repeated_table_headers_and_single_source_nested_dir(self):
+        from wiki_context.extract import _reconstruct_pdf_layout_tables, _strip_pdf_repeated_noise
+
+        # F2 regression: one-table-per-page PDF repeating the same column header row must NOT lose its header
+        pages = [
+            f"Company Confidential Header\n"
+            f"Item                Amount      Notes\n"
+            f"widget-{i}            {i * 10}        ok\n"
+            f"gadget-{i}            {i * 7}         fine\n"
+            f"Section {i} summary: revenue for period {i}.\n"
+            for i in range(1, 11)
+        ]
+        cleaned_pages, changed = _strip_pdf_repeated_noise(pages)
+        self.assertTrue(changed)
+        self.assertNotIn("Company Confidential Header", cleaned_pages[0])
+        self.assertIn("Item", cleaned_pages[0])
+        reconstructed = _reconstruct_pdf_layout_tables(cleaned_pages[0])
+        self.assertIn("| Item | Amount | Notes |", reconstructed)
+        self.assertIn("| widget-1 | 10 | ok |", reconstructed)
+
+        # F7 regression: sync_vault(source="sources/sources/foo.md") must not double-strip `sources/`
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "nested-src-vault"
+            init_vault(v, name="NestedSrc", layout="en")
+            (v / "sources" / "sources").mkdir(parents=True)
+            (v / "sources" / "foo.md").write_text("# Outer\nOUTER_CONTENT\n", encoding="utf-8")
+            (v / "sources" / "sources" / "foo.md").write_text("# Inner\nINNER_TARGET_987\n", encoding="utf-8")
+
+            rep = sync_vault(v, source="sources/sources/foo.md", rebuild=True)
+            self.assertEqual(rep["converted"], 1)
+            mirror_inner = v / "mirrors" / "sources" / "foo.md.md"
+            self.assertTrue(mirror_inner.is_file())
+            self.assertIn("INNER_TARGET_987", mirror_inner.read_text(encoding="utf-8"))
+            self.assertNotIn("OUTER_CONTENT", mirror_inner.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

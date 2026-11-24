@@ -1399,6 +1399,95 @@ def _reconstruct_pdf_layout_tables(page_text: str) -> str:
     return "\n".join(out)
 
 
+def _strip_pdf_repeated_noise(raw_pages: list[str]) -> tuple[list[str], bool]:
+    """Remove per-page repeated watermarks and header/footer boilerplate across multi-page PDFs.
+
+    Protects multi-column table header/data rows so repeated per-page tables still reconstruct
+    cleanly into Markdown tables in ``_reconstruct_pdf_layout_tables``.
+    """
+    n_pages = len(raw_pages)
+    if n_pages < 5:
+        return raw_pages, False
+
+    def _is_multi_col(raw_ln: str) -> bool:
+        return len(re.split(r" {2,}|\t+", raw_ln.strip())) >= 2
+
+    page_doc_freq: dict[str, int] = {}
+    margin_doc_freq: dict[str, int] = {}
+    table_like_norms: set[str] = set()
+    multi_col_norms: set[str] = set()
+
+    for ptxt in raw_pages:
+        raw_lines = ptxt.splitlines()
+        non_empty = [(idx, ln, re.sub(r"\s+", " ", ln.strip())) for idx, ln in enumerate(raw_lines) if ln.strip()]
+        seen_page: set[str] = set()
+        seen_margin: set[str] = set()
+        n_non_empty = len(non_empty)
+
+        for pos, (_idx, raw_ln, norm) in enumerate(non_empty):
+            if not norm or norm.startswith("#"):
+                continue
+            seen_page.add(norm)
+            if pos < 3 or pos >= n_non_empty - 3:
+                seen_margin.add(norm)
+            if _is_multi_col(raw_ln):
+                multi_col_norms.add(norm)
+                prev_mc = pos > 0 and _is_multi_col(non_empty[pos - 1][1])
+                next_mc = pos + 1 < n_non_empty and _is_multi_col(non_empty[pos + 1][1])
+                if prev_mc or next_mc:
+                    table_like_norms.add(norm)
+
+        for norm in seen_page:
+            page_doc_freq[norm] = page_doc_freq.get(norm, 0) + 1
+        for norm in seen_margin:
+            margin_doc_freq[norm] = margin_doc_freq.get(norm, 0) + 1
+
+    short_thresh = max(4, int(n_pages * 0.30))
+    line_thresh = max(4, int(n_pages * 0.40))
+    noise_lines: set[str] = set()
+    for norm, df in page_doc_freq.items():
+        if re.match(r"^\|?[\s:\-|]+\|?$", norm):
+            continue
+        if norm in table_like_norms:
+            continue
+        if len(norm) <= 2 and df >= short_thresh:
+            noise_lines.add(norm)
+        elif len(norm) <= 60 and df >= line_thresh:
+            # Strip repeated header/footer margins, or short single-column watermark phrases
+            if margin_doc_freq.get(norm, 0) >= line_thresh or (len(norm) <= 24 and norm not in multi_col_norms):
+                noise_lines.add(norm)
+
+    if not noise_lines:
+        return raw_pages, False
+
+    cleaned_pages: list[str] = []
+    for ptxt in raw_pages:
+        kept = [
+            ln for ln in ptxt.splitlines()
+            if re.sub(r"\s+", " ", ln.strip()) not in noise_lines
+        ]
+        cleaned_pages.append("\n".join(kept))
+    return cleaned_pages, True
+
+
+def _compact_pdf_layout_padding(text: str) -> str:
+    """Collapse excessive `pdftotext -layout` horizontal indentation on non-table prose lines."""
+    out: list[str] = []
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith("|") or _SQL_OR_CODE_LINE_RE.match(ln):
+            out.append(ln.rstrip())
+            continue
+        # Remove leading 4+ space layout offsets and collapse long internal gaps on prose lines
+        compact = re.sub(r"^[ \t]{4,}", "", ln).rstrip()
+        compact = re.sub(r"[ \t]{4,}", "  ", compact)
+        out.append(compact)
+    return "\n".join(out)
+
+
 def _extract_pdf(path: Path) -> ExtractedDocument:
     pdftotext = resolve_external_tool("pdftotext")
     if not pdftotext:
@@ -1433,9 +1522,14 @@ def _extract_pdf(path: Path) -> ExtractedDocument:
     while raw_pages and not raw_pages[-1].strip():
         raw_pages.pop()
 
+    raw_pages, stripped_noise = _strip_pdf_repeated_noise(raw_pages)
+    if stripped_noise:
+        warnings.append("Stripped repeated per-page PDF watermark/boilerplate lines")
+
     pages: list[dict] = []
     md_sections: list[str] = []
     visual_pages: list[int] = []
+    cleaned_page_texts: list[str] = []
 
     for idx, ptxt in enumerate(raw_pages):
         cleaned = _clean_text(ptxt).strip()
@@ -1443,6 +1537,9 @@ def _extract_pdf(path: Path) -> ExtractedDocument:
         if eff < 25:
             visual_pages.append(idx + 1)
         formatted = _reconstruct_pdf_layout_tables(cleaned) if cleaned else ""
+        if formatted:
+            formatted = _compact_pdf_layout_padding(formatted).strip()
+        cleaned_page_texts.append(formatted)
         label = f"Page {idx + 1}"
         md_sections.append(f"## {label}\n\n{formatted}" if formatted else f"## {label}\n\n*(visual/scanned page)*")
         pages.append({
@@ -1454,7 +1551,7 @@ def _extract_pdf(path: Path) -> ExtractedDocument:
     markdown = "\n\n".join(md_sections).strip()
     if markdown:
         markdown += "\n"
-    total_chars = _effective_chars("\n".join(_clean_text(p) for p in raw_pages))
+    total_chars = _effective_chars("\n".join(cleaned_page_texts))
     usable = total_chars >= 40 and not proc.stderr.strip() and len(visual_pages) < max(1, len(raw_pages))
     if visual_pages:
         warnings.append(f"PDF contains {len(visual_pages)} sparse/visual page(s): {visual_pages[:10]}")

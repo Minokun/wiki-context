@@ -24,7 +24,16 @@ export interface VaultCapabilities {
 export interface FolderTreeNode {
   name: string;
   prefix: string;
+  mounted?: boolean;
+  mount_path?: string;
+  available?: boolean;
   children: { name: string; prefix: string }[];
+}
+
+export interface SourceMountInfo {
+  name: string;
+  path: string;
+  available: boolean;
 }
 
 export interface LlmProviderPreset {
@@ -41,11 +50,15 @@ export interface LlmCompilerStatus {
   base_url: string;
   model: string;
   has_api_key: boolean;
+  key_optional?: boolean;
   api_key_masked: string;
-  key_source: "saved" | "env" | "none" | string;
+  key_source: "saved" | "env" | "local" | "none" | string;
   ready: boolean;
   auto_compile_on_sync: boolean;
   max_items_per_run: number;
+  workers?: number;
+  max_tokens?: number;
+  disable_thinking?: boolean;
   presets: LlmProviderPreset[];
 }
 
@@ -73,10 +86,15 @@ export interface AsyncJobRecord {
 export interface VaultInfo {
   id: string;
   kind: "local" | "remote";
+  storage_mode?: "managed" | "in_place" | "remote";
   capabilities: VaultCapabilities;
   name: string;
   layout: string;
   path: string;
+  workspace_path?: string;
+  sources_path?: string;
+  source_available?: boolean;
+  source_mounts?: SourceMountInfo[];
   ready: boolean;
   exists: boolean;
   hydrating?: boolean;
@@ -173,6 +191,7 @@ export interface LanGatewayStatus {
 export interface OverviewResponse {
   version: string;
   config_dir: string;
+  vaults_dir?: string;
   tokens_file: string;
   gateway_base_url: string;
   lan_gateway: LanGatewayStatus;

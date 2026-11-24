@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 from .config import VaultConfig
 from .context import AccessPolicy, AllowAllPolicy, ContextPackEngine, PrefixACLPolicy, Principal, SynonymBook

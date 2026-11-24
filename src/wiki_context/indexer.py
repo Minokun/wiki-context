@@ -14,12 +14,19 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 from pathlib import Path, PurePosixPath
 
 from .config import VaultConfig
 from .freshness import clean_source_ref, compute_wiki_freshness, parse_wiki_frontmatter, split_frontmatter
 from .policy import POLICY_VERSION, mirror_skip_reason
-from .search import INDEX_SCHEMA_VERSION, build_fts_sqlite, is_excluded_source, load_exclude_patterns
+from .search import (
+    INDEX_SCHEMA_VERSION,
+    build_fts_sqlite,
+    is_excluded_source,
+    load_exclude_patterns,
+    refresh_wiki_fts_sqlite,
+)
 from .state_lock import atomic_write_bytes, atomic_write_text, file_lock, replace_with_retry
 
 SCHEMA_VERSION = INDEX_SCHEMA_VERSION
@@ -237,7 +244,8 @@ def assign_duplicates(docs: list[dict]) -> tuple[int, int]:
     return dup_docs, dup_groups
 
 
-def _compute_input_signature(cfg: VaultConfig) -> str:
+def _compute_primary_signature(cfg: VaultConfig) -> str:
+    """Hash schema, config, manifests, and all Layer-2 mirrors (independent of Layer-3 `wiki/*.md`)."""
     h = hashlib.sha256()
     h.update(f"schema={SCHEMA_VERSION};policy={POLICY_VERSION};".encode("utf-8"))
     h.update(json.dumps(cfg.config_signature_dict(), sort_keys=True).encode("utf-8"))
@@ -257,6 +265,14 @@ def _compute_input_signature(cfg: VaultConfig) -> str:
             except OSError:
                 pass
 
+    return h.hexdigest()
+
+
+def _compute_input_signature(cfg: VaultConfig, *, primary_sig: str | None = None) -> str:
+    h = hashlib.sha256()
+    p_sig = primary_sig if primary_sig is not None else _compute_primary_signature(cfg)
+    h.update(f"primary={p_sig};".encode("utf-8"))
+
     if cfg.wiki_root.is_dir():
         for wp in sorted(cfg.wiki_root.glob("*.md")):
             try:
@@ -266,6 +282,83 @@ def _compute_input_signature(cfg: VaultConfig) -> str:
                 pass
 
     return h.hexdigest()
+
+
+def _collect_wiki_sections(cfg: VaultConfig, indexed_hashes: dict[str, str]) -> tuple[list[dict], int]:
+    """Scan Layer-3 `wiki/*.md` pages and return `(wiki_sections, wiki_doc_count)`."""
+    wiki_sections: list[dict] = []
+    wiki_doc_count = 0
+    if cfg.wiki_root.is_dir():
+        for wp in sorted(cfg.wiki_root.glob("*.md")):
+            if wp.is_symlink():
+                continue
+            wiki_doc_count += 1
+            raw_w = wp.read_text(encoding="utf-8", errors="replace")
+            fm_w, _ = split_frontmatter(raw_w)
+            w_meta = parse_wiki_frontmatter(fm_w)
+            title = w_meta["title"] or wp.stem
+            norm_refs = [
+                cfg.normalize_source_ref(cleaned)
+                for r in w_meta["sources"]
+                if isinstance(r, str)
+                for cleaned in (clean_source_ref(r),)
+                if cfg.is_source_ref(cleaned)
+            ]
+            fresh_state = compute_wiki_freshness(
+                norm_refs, w_meta["source_hashes"], indexed_hashes, cfg=cfg
+            )
+            cleaned_raw = _HTML_COMMENT_RE.sub("", raw_w)
+            w_chunks = split_markdown_sections(cleaned_raw)
+            for wc in w_chunks:
+                wiki_sections.append({
+                    "source": f"{cfg.wiki_prefix}{wp.name}",
+                    "title": title,
+                    "heading": wc["heading_path"] or title,
+                    "table_header": wc["table_header"],
+                    "line_start": wc["line_start"],
+                    "line_end": wc["line_end"],
+                    "freshness": fresh_state,
+                    "sources": norm_refs,
+                    "text": wc["text"],
+                })
+    return wiki_sections, wiki_doc_count
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _prune_old_generations(index_root: Path, gen_id: str) -> None:
+    deferred = set(_sweep_trashed_generations(index_root, gen_id))
+    gens = sorted(
+        (p for p in index_root.iterdir() if p.is_dir() and p.name.startswith("gen-")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    kept = 0
+    for g in gens:
+        if g.name == gen_id or (g.name not in deferred and kept < KEEP_GENERATIONS):
+            if g.name not in deferred:
+                kept += 1
+            continue
+        try:
+            shutil.rmtree(g)
+            deferred.discard(g.name)
+        except OSError:
+            # Windows [WinError 32]: open bm25.sqlite read handle still draining; defer to .trash.json
+            deferred.add(g.name)
+
+    trash_file = index_root / ".trash.json"
+    if deferred:
+        _atomic_write_text(trash_file, json.dumps(sorted(deferred), indent=2) + "\n")
+    elif trash_file.is_file():
+        try:
+            trash_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 MANAGED_MARKER = ".wctx-managed"
@@ -342,14 +435,19 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
     lock_path = cfg.index_root / ".build.lock"
     with file_lock(lock_path, blocking=True, busy_message="Another index build is running on this vault"):
 
-        sig = _compute_input_signature(cfg)
+        primary_sig = _compute_primary_signature(cfg)
+        sig = _compute_input_signature(cfg, primary_sig=primary_sig)
         cur_path = cfg.index_root / "current.json"
+        cur_meta: dict | None = None
         if not force and cur_path.is_file():
             try:
-                cur_meta = json.loads(cur_path.read_text(encoding="utf-8"))
-                gen_id = cur_meta.get("generation_id", "")
+                loaded_cur = json.loads(cur_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_cur, dict):
+                    cur_meta = loaded_cur
+                gen_id = (cur_meta or {}).get("generation_id", "")
                 if (
-                    cur_meta.get("input_signature") == sig
+                    cur_meta is not None
+                    and cur_meta.get("input_signature") == sig
                     and gen_id
                     and (cfg.index_root / gen_id / "bm25.sqlite").is_file()
                     and (cfg.index_root / "summary.json").is_file()
@@ -357,7 +455,101 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
                     summary = json.loads((cfg.index_root / "summary.json").read_text(encoding="utf-8"))
                     return {**summary, "noop": True}
             except (OSError, ValueError):
-                pass
+                cur_meta = None
+
+        # Fast incremental path: when only Layer-3 `wiki/*.md` changed and all Layer-2 mirrors are untouched,
+        # reuse `docs/pages/sections.jsonl` and clone `bm25.sqlite` while rebuilding ONLY the 4 Wiki tables.
+        if (
+            not force
+            and cur_meta is not None
+            and cur_meta.get("schema_version") == SCHEMA_VERSION
+            and cur_meta.get("primary_signature") == primary_sig
+        ):
+            prev_gen_id = str(cur_meta.get("generation_id") or "")
+            prev_gen_dir = cfg.index_root / prev_gen_id if prev_gen_id else None
+            prev_fstats = cur_meta.get("file_stats") if isinstance(cur_meta.get("file_stats"), dict) else {}
+            if (
+                prev_gen_dir is not None
+                and (prev_gen_dir / "bm25.sqlite").is_file()
+                and (prev_gen_dir / "summary.json").is_file()
+                and all((prev_gen_dir / f).is_file() and f in prev_fstats for f in ("docs.jsonl", "pages.jsonl", "sections.jsonl"))
+            ):
+                try:
+                    indexed_hashes: dict[str, str] = {}
+                    with (prev_gen_dir / "docs.jsonl").open("r", encoding="utf-8") as dfh:
+                        for raw_ln in dfh:
+                            if not raw_ln.strip():
+                                continue
+                            d_row = json.loads(raw_ln)
+                            if d_row.get("source") and d_row.get("source_hash"):
+                                indexed_hashes[d_row["source"]] = d_row["source_hash"]
+                    prev_summary = json.loads((prev_gen_dir / "summary.json").read_text(encoding="utf-8"))
+                    wiki_sections, wiki_doc_count = _collect_wiki_sections(cfg, indexed_hashes)
+                    exclude_pats = load_exclude_patterns(cfg.root)
+                    wiki_fts_rows = [
+                        w for w in wiki_sections
+                        if not is_excluded_source(w["source"], exclude_pats)
+                        and not any(is_excluded_source(r, exclude_pats) for r in w["sources"])
+                    ]
+
+                    ts_str = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    gen_id = f"gen-{ts_str}-{sig[:8]}"
+                    gen_dir = cfg.index_root / gen_id
+                    while gen_dir.exists():
+                        gen_id = f"gen-{ts_str}-{sig[:8]}-{secrets.token_hex(3)}"
+                        gen_dir = cfg.index_root / gen_id
+                    gen_dir.mkdir(parents=True, exist_ok=True)
+
+                    for fname in ("docs.jsonl", "pages.jsonl", "sections.jsonl"):
+                        _link_or_copy(prev_gen_dir / fname, gen_dir / fname)
+                    wiki_stat = _stream_write_jsonl(gen_dir / "wiki_sections.jsonl", wiki_sections)
+
+                    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+                    summary = {
+                        **prev_summary,
+                        "schema_version": SCHEMA_VERSION,
+                        "generator": "wiki-context",
+                        "generation_id": gen_id,
+                        "generated_at": now_iso,
+                        "wiki_docs": wiki_doc_count,
+                        "wiki_sections": len(wiki_sections),
+                    }
+                    _atomic_write_text(gen_dir / "summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+                    refresh_wiki_fts_sqlite(prev_gen_dir / "bm25.sqlite", gen_dir / "bm25.sqlite", wiki_fts_rows)
+
+                    for fname in ("wiki_sections.jsonl", "summary.json"):
+                        dst = cfg.index_root / fname
+                        tmp_dst = cfg.index_root / f".{fname}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+                        shutil.copy2(gen_dir / fname, tmp_dst)
+                        replace_with_retry(tmp_dst, dst)
+                    for fname in ("docs.jsonl", "pages.jsonl", "sections.jsonl"):
+                        dst = cfg.index_root / fname
+                        if not dst.is_file():
+                            tmp_dst = cfg.index_root / f".{fname}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+                            shutil.copy2(gen_dir / fname, tmp_dst)
+                            replace_with_retry(tmp_dst, dst)
+
+                    current_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "generator": "wiki-context",
+                        "generation_id": gen_id,
+                        "generated_at": now_iso,
+                        "input_signature": sig,
+                        "primary_signature": primary_sig,
+                        "file_stats": {
+                            "docs.jsonl": prev_fstats["docs.jsonl"],
+                            "pages.jsonl": prev_fstats["pages.jsonl"],
+                            "sections.jsonl": prev_fstats["sections.jsonl"],
+                            "wiki_sections.jsonl": wiki_stat,
+                        },
+                    }
+                    _atomic_write_text(cur_path, json.dumps(current_payload, ensure_ascii=False, indent=2) + "\n")
+                    _write_managed_marker(cfg.index_root)
+                    _prune_old_generations(cfg.index_root, gen_id)
+                    return {**summary, "wiki_only_refresh": True}
+                except (OSError, ValueError, KeyError, sqlite3.Error):
+                    # Clean up any partial fast-path generation dir and fall back cleanly to full rebuild
+                    shutil.rmtree(gen_dir, ignore_errors=True)
 
         manifest: dict = {}
         manifest_path = cfg.mirrors_root / ".manifest.json"
@@ -503,41 +695,7 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
         }
 
         # Pre-index Layer-3 `wiki/*.md`
-        wiki_sections: list[dict] = []
-        wiki_doc_count = 0
-        if cfg.wiki_root.is_dir():
-            for wp in sorted(cfg.wiki_root.glob("*.md")):
-                if wp.is_symlink():
-                    continue
-                wiki_doc_count += 1
-                raw_w = wp.read_text(encoding="utf-8", errors="replace")
-                fm_w, _ = split_frontmatter(raw_w)
-                w_meta = parse_wiki_frontmatter(fm_w)
-                title = w_meta["title"] or wp.stem
-                norm_refs = [
-                    cfg.normalize_source_ref(cleaned)
-                    for r in w_meta["sources"]
-                    if isinstance(r, str)
-                    for cleaned in (clean_source_ref(r),)
-                    if cfg.is_source_ref(cleaned)
-                ]
-                fresh_state = compute_wiki_freshness(
-                    norm_refs, w_meta["source_hashes"], indexed_hashes, cfg=cfg
-                )
-                cleaned_raw = _HTML_COMMENT_RE.sub("", raw_w)
-                w_chunks = split_markdown_sections(cleaned_raw)
-                for wc in w_chunks:
-                    wiki_sections.append({
-                        "source": f"{cfg.wiki_prefix}{wp.name}",
-                        "title": title,
-                        "heading": wc["heading_path"] or title,
-                        "table_header": wc["table_header"],
-                        "line_start": wc["line_start"],
-                        "line_end": wc["line_end"],
-                        "freshness": fresh_state,
-                        "sources": norm_refs,
-                        "text": wc["text"],
-                    })
+        wiki_sections, wiki_doc_count = _collect_wiki_sections(cfg, indexed_hashes)
 
         exclude_pats = load_exclude_patterns(cfg.root)
         l2_fts_rows: list[dict] = []
@@ -632,39 +790,12 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
             "generation_id": gen_id,
             "generated_at": summary["generated_at"],
             "input_signature": sig,
+            "primary_signature": primary_sig,
             "file_stats": fstats,
         }
         _atomic_write_text(cur_path, json.dumps(current_payload, ensure_ascii=False, indent=2) + "\n")
         _write_managed_marker(cfg.index_root)
-
-        # Sweep previously deferred `.trash.json` generations & prune older generations beyond KEEP_GENERATIONS
-        deferred = set(_sweep_trashed_generations(cfg.index_root, gen_id))
-        gens = sorted(
-            (p for p in cfg.index_root.iterdir() if p.is_dir() and p.name.startswith("gen-")),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        kept = 0
-        for g in gens:
-            if g.name == gen_id or (g.name not in deferred and kept < KEEP_GENERATIONS):
-                if g.name not in deferred:
-                    kept += 1
-                continue
-            try:
-                shutil.rmtree(g)
-                deferred.discard(g.name)
-            except OSError:
-                # Windows [WinError 32]: open bm25.sqlite read handle still draining; defer to .trash.json
-                deferred.add(g.name)
-
-        trash_file = cfg.index_root / ".trash.json"
-        if deferred:
-            _atomic_write_text(trash_file, json.dumps(sorted(deferred), indent=2) + "\n")
-        elif trash_file.is_file():
-            try:
-                trash_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _prune_old_generations(cfg.index_root, gen_id)
 
         return summary
 

@@ -133,11 +133,11 @@ export const AppShell: React.FC<AppShellProps> = ({
               title={checkingUpdate ? "正在检查更新..." : "点击检查在线更新"}
               className="hidden rounded px-1 py-0.5 font-mono text-xs text-[var(--ink-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)] disabled:opacity-60 xl:inline"
             >
-              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.4.1"}`}
+              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.5.0"}`}
             </button>
           ) : (
             <span className="hidden font-mono text-xs text-[var(--ink-muted)] xl:inline">
-              v{overview?.version || "0.4.1"}
+              v{overview?.version || "0.5.0"}
             </span>
           )}
           {mode === "desktop" && availableUpdateVersion && onOpenUpdateModal && (
@@ -324,14 +324,16 @@ export const AppShell: React.FC<AppShellProps> = ({
                   const pendingCount = (v.uncompiled_count || 0) + (v.stale_count || 0);
                   const subtitle = isRemote
                     ? "共享知识库"
-                    : pendingCount > 0
-                      ? `待整理 ${pendingCount} 篇`
-                      : `已整理 ${v.wiki_docs} 篇`;
+                    : v.source_available === false
+                      ? "源目录离线"
+                      : pendingCount > 0
+                        ? `待整理 ${pendingCount} 篇`
+                        : `已整理 ${v.wiki_docs} 篇`;
                   return (
                     <button
                       key={v.id}
                       type="button"
-                      title={v.path || v.gateway_url || v.id}
+                      title={v.sources_path || v.path || v.gateway_url || v.id}
                       onClick={() => onSelectVault(v.id)}
                       className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left ${
                         selected

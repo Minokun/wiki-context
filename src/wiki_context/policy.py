@@ -15,7 +15,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from .config import DEFAULT_MAX_DOC_BYTES, VaultConfig
+from .config import DEFAULT_MAX_DOC_BYTES, DEFAULT_MAX_SOURCE_BYTES, VaultConfig
 
 POLICY_VERSION = 2
 
@@ -25,6 +25,7 @@ RICH_STDLIB_EXTS = frozenset({".html", ".htm", ".eml", ".ipynb", ".rtf", ".svg"}
 NATIVE_OOXML_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
 LEGACY_OFFICE_EXTS = frozenset({".doc", ".ppt", ".xls"})
 PDF_EXTS = frozenset({".pdf"})
+RICH_BINARY_EXTS = NATIVE_OOXML_EXTS | LEGACY_OFFICE_EXTS | PDF_EXTS
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
 OCR_CONVERTERS = frozenset({"vlm-caption", "cmd-ocr", "visual-asset"})
 AUDIO_VIDEO_EXTS = frozenset({".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm"})
@@ -114,6 +115,7 @@ def source_skip_reason(
 
     ext = Path(name).suffix.lower()
     max_bytes = cfg.max_doc_bytes if cfg is not None else DEFAULT_MAX_DOC_BYTES
+    max_src_bytes = cfg.max_source_bytes if cfg is not None else DEFAULT_MAX_SOURCE_BYTES
     try:
         st = path.stat()
     except OSError:
@@ -127,8 +129,9 @@ def source_skip_reason(
             return None
         return "audio-video-requires-asr"
 
-    if st.st_size > max_bytes and not explicit:
-        return f"oversized(>{max_bytes}B)"
+    size_limit = max_src_bytes if ext in RICH_BINARY_EXTS else max_bytes
+    if st.st_size > size_limit and not explicit:
+        return f"oversized(>{size_limit}B)"
 
     if ext in IMAGE_EXTS:
         ocr_dirs = cfg.ocr_image_dirs if cfg is not None else frozenset()

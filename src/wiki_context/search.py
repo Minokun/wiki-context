@@ -18,6 +18,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import threading
 import zlib
@@ -350,6 +351,116 @@ def _dedup_per_source(
 # -- SQLite FTS5 Builder ---------------------------------------------------- #
 
 
+_WIKI_SCHEMA_SQL = """
+CREATE TABLE wiki_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE wiki_vocab (tok TEXT PRIMARY KEY, df_sources INTEGER NOT NULL);
+CREATE TABLE wiki_units (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    heading TEXT NOT NULL,
+    table_header TEXT NOT NULL,
+    line_start INTEGER,
+    line_end INTEGER,
+    freshness TEXT NOT NULL,
+    sources_json TEXT NOT NULL,
+    dl INTEGER NOT NULL,
+    tf_z BLOB NOT NULL,
+    text_z BLOB NOT NULL
+);
+CREATE VIRTUAL TABLE fts_wiki USING fts5(tokens, tokenize='ascii');
+"""
+
+
+def _populate_wiki_tables(con: sqlite3.Connection, wiki_rows: list[dict]) -> None:
+    """Populate Layer-3 Wiki tables (`wiki_units`, `fts_wiki`, `wiki_meta`, `wiki_vocab`)."""
+    w_source_sets: dict[str, set[str]] = defaultdict(set)
+    all_w_sources: set[str] = set()
+    total_w_dl = 0
+
+    for wid, row in enumerate(wiki_rows, 1):
+        wsrc = row.get("source") or ""
+        all_w_sources.add(wsrc)
+        title = row.get("title") or ""
+        heading = row.get("heading") or ""
+        text = row.get("text") or ""
+        body_toks = tokenize(text)
+        head_toks = tokenize(f"{title} {heading}")
+
+        tf_w: dict[str, float] = defaultdict(float)
+        for t in body_toks:
+            tf_w[t] += 1.0
+        for t in head_toks:
+            tf_w[t] += BM25Index.HEADING_BOOST
+
+        dl_w = max(1, len(body_toks) + len(head_toks))
+        total_w_dl += dl_w
+        for t in tf_w:
+            w_source_sets[t].add(wsrc)
+
+        con.execute(
+            "INSERT INTO wiki_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wid,
+                wsrc,
+                title,
+                heading,
+                row.get("table_header") or "",
+                row.get("line_start"),
+                row.get("line_end"),
+                row.get("freshness") or "unverified",
+                json.dumps(row.get("sources") or [], ensure_ascii=False),
+                dl_w,
+                zlib.compress(json.dumps(tf_w, separators=(",", ":")).encode("utf-8"), level=3),
+                zlib.compress(text.encode("utf-8"), level=3),
+            ),
+        )
+        fts_toks = " ".join(encode_fts_token(t) for t in (*head_toks, *body_toks))
+        con.execute("INSERT INTO fts_wiki(rowid, tokens) VALUES (?, ?)", (wid, fts_toks))
+
+    avg_w_dl = (total_w_dl / len(wiki_rows)) if wiki_rows else 1.0
+    con.executemany(
+        "INSERT INTO wiki_meta VALUES (?, ?)",
+        [
+            ("n_units", str(len(wiki_rows))),
+            ("n_sources", str(len(all_w_sources))),
+            ("avg_len", f"{avg_w_dl:.4f}"),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO wiki_vocab VALUES (?, ?)",
+        [(tok, len(srcs)) for tok, srcs in w_source_sets.items()],
+    )
+
+
+def refresh_wiki_fts_sqlite(prev_db_path: Path, db_path: Path, wiki_rows: list[dict]) -> None:
+    """Clone an immutable SQLite FTS5 snapshot and refresh ONLY the Layer-3 Wiki tables."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_db = db_path.with_name(f".{db_path.name}.tmp-{os.getpid()}")
+    tmp_db.unlink(missing_ok=True)
+    shutil.copy2(prev_db_path, tmp_db)
+
+    con = sqlite3.connect(str(tmp_db))
+    try:
+        con.executescript(
+            """
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            DROP TABLE IF EXISTS fts_wiki;
+            DROP TABLE IF EXISTS wiki_units;
+            DROP TABLE IF EXISTS wiki_vocab;
+            DROP TABLE IF EXISTS wiki_meta;
+            """
+            + _WIKI_SCHEMA_SQL
+        )
+        _populate_wiki_tables(con, wiki_rows)
+        con.commit()
+    finally:
+        con.close()
+
+    replace_with_retry(tmp_db, db_path)
+
+
 def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dict]) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_db = db_path.with_name(f".{db_path.name}.tmp-{os.getpid()}")
@@ -380,25 +491,8 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
             );
             CREATE INDEX idx_units_source ON units(source);
             CREATE VIRTUAL TABLE fts_units USING fts5(head, body, tokenize='ascii');
-
-            CREATE TABLE wiki_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE wiki_vocab (tok TEXT PRIMARY KEY, df_sources INTEGER NOT NULL);
-            CREATE TABLE wiki_units (
-                id INTEGER PRIMARY KEY,
-                source TEXT NOT NULL,
-                title TEXT NOT NULL,
-                heading TEXT NOT NULL,
-                table_header TEXT NOT NULL,
-                line_start INTEGER,
-                line_end INTEGER,
-                freshness TEXT NOT NULL,
-                sources_json TEXT NOT NULL,
-                dl INTEGER NOT NULL,
-                tf_z BLOB NOT NULL,
-                text_z BLOB NOT NULL
-            );
-            CREATE VIRTUAL TABLE fts_wiki USING fts5(tokens, tokenize='ascii');
             """
+            + _WIKI_SCHEMA_SQL
         )
 
         # Populate Layer-2 primary source units
@@ -466,63 +560,7 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
         )
 
         # Populate Layer-3 Wiki units
-        w_source_sets: dict[str, set[str]] = defaultdict(set)
-        all_w_sources: set[str] = set()
-        total_w_dl = 0
-
-        for wid, row in enumerate(wiki_rows, 1):
-            wsrc = row.get("source") or ""
-            all_w_sources.add(wsrc)
-            title = row.get("title") or ""
-            heading = row.get("heading") or ""
-            text = row.get("text") or ""
-            body_toks = tokenize(text)
-            head_toks = tokenize(f"{title} {heading}")
-
-            tf_w: dict[str, float] = defaultdict(float)
-            for t in body_toks:
-                tf_w[t] += 1.0
-            for t in head_toks:
-                tf_w[t] += BM25Index.HEADING_BOOST
-
-            dl_w = max(1, len(body_toks) + len(head_toks))
-            total_w_dl += dl_w
-            for t in tf_w:
-                w_source_sets[t].add(wsrc)
-
-            con.execute(
-                "INSERT INTO wiki_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    wid,
-                    wsrc,
-                    title,
-                    heading,
-                    row.get("table_header") or "",
-                    row.get("line_start"),
-                    row.get("line_end"),
-                    row.get("freshness") or "unverified",
-                    json.dumps(row.get("sources") or [], ensure_ascii=False),
-                    dl_w,
-                    zlib.compress(json.dumps(tf_w, separators=(",", ":")).encode("utf-8"), level=3),
-                    zlib.compress(text.encode("utf-8"), level=3),
-                ),
-            )
-            fts_toks = " ".join(encode_fts_token(t) for t in (*head_toks, *body_toks))
-            con.execute("INSERT INTO fts_wiki(rowid, tokens) VALUES (?, ?)", (wid, fts_toks))
-
-        avg_w_dl = (total_w_dl / len(wiki_rows)) if wiki_rows else 1.0
-        con.executemany(
-            "INSERT INTO wiki_meta VALUES (?, ?)",
-            [
-                ("n_units", str(len(wiki_rows))),
-                ("n_sources", str(len(all_w_sources))),
-                ("avg_len", f"{avg_w_dl:.4f}"),
-            ],
-        )
-        con.executemany(
-            "INSERT INTO wiki_vocab VALUES (?, ?)",
-            [(tok, len(srcs)) for tok, srcs in w_source_sets.items()],
-        )
+        _populate_wiki_tables(con, wiki_rows)
         con.commit()
     finally:
         con.close()

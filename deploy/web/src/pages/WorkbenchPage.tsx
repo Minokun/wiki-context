@@ -970,7 +970,9 @@ export const WorkbenchPage: React.FC<WorkbenchPageProps> = ({
                         desc:
                           activeHit?.layer === 1
                             ? activeHit.source
-                            : `${activeVault?.sources_dir || "原文档"}/ 原地解析`,
+                            : activeVault?.storage_mode === "managed"
+                              ? `${activeVault.sources_path || activeVault.sources_dir || "原文档"}（只读映射）`
+                              : `${activeVault?.sources_dir || "原文档"}/ 原地解析`,
                       },
                       {
                         lvl: 2,

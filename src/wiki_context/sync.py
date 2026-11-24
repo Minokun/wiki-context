@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import VaultConfig
+from .net import ssl_context
 from .state_lock import atomic_write_text, file_lock, resolve_external_tool
 from .extract import (
     ExtractedDocument,
@@ -181,7 +182,7 @@ class HttpVLMProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec, context=ssl_context()) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             choices = body.get("choices") or []
             if choices:
@@ -248,7 +249,12 @@ def sync_vault(
     """Incrementally convert new/modified sources into ``mirrors/`` + ``mirrors/.assets/`` and rebuild index."""
     cfg = VaultConfig.load(vault)
     cfg.mirrors_root.mkdir(parents=True, exist_ok=True)
-    cfg.sources_root.mkdir(parents=True, exist_ok=True)
+    if cfg.sources_path is None:
+        cfg.sources_root.mkdir(parents=True, exist_ok=True)
+    elif not cfg.sources_root.is_dir():
+        raise FileNotFoundError(
+            f"外部源目录当前不可访问或已移动：{cfg.sources_root}（历史索引已保留；请检查挂载点或使用重定位功能更新路径）"
+        )
 
     cmd_str = (ocr_cmd or os.environ.get("WCTX_OCR_CMD") or "").strip()
     ocr = ocr_provider or (CommandOCRProvider(cmd_str, method_name="cmd-ocr") if cmd_str else None)
@@ -286,10 +292,14 @@ def sync_vault(
                 failed_map = {}
 
         candidates: list[tuple[Path, str, bool]] = []
+        offline_mounts: list[dict[str, str]] = []
         if source:
             rel = cfg.strip_source_prefix(source)
-            target = (cfg.sources_root / rel).resolve()
-            if not target.is_file() or cfg.sources_root.resolve() not in target.parents:
+            resolved = cfg.resolve_source_rel(rel)
+            if resolved is None:
+                raise ValueError(f"Source file not found inside {cfg.sources_dir}/: {source}")
+            target, _jail = resolved
+            if not target.is_file():
                 raise ValueError(f"Source file not found inside {cfg.sources_dir}/: {source}")
             reason = source_skip_reason(
                 target, rel, cfg=cfg, explicit=True, include_all_images=include_all_images, has_asr=(asr is not None)
@@ -298,16 +308,22 @@ def sync_vault(
                 raise ValueError(f"Source file rejected by policy ({reason}): {source}")
             candidates.append((target, rel, True))
         else:
-            for p in sorted(cfg.sources_root.rglob("*")):
-                if p.is_symlink() or not p.is_file():
+            for mount_name, sroot in cfg.iter_source_roots():
+                if not sroot.is_dir():
+                    if mount_name:
+                        offline_mounts.append({"name": mount_name, "path": str(sroot)})
                     continue
-                rel = p.relative_to(cfg.sources_root).as_posix()
-                reason = source_skip_reason(
-                    p, rel, cfg=cfg, explicit=False, include_all_images=include_all_images, has_asr=(asr is not None)
-                )
-                if reason is not None:
-                    continue
-                candidates.append((p, rel, False))
+                for p in sorted(sroot.rglob("*")):
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                    sub_rel = p.relative_to(sroot).as_posix()
+                    rel = f"{mount_name}/{sub_rel}" if mount_name else sub_rel
+                    reason = source_skip_reason(
+                        p, rel, cfg=cfg, explicit=False, include_all_images=include_all_images, has_asr=(asr is not None)
+                    )
+                    if reason is not None:
+                        continue
+                    candidates.append((p, rel, False))
 
         pending: list[tuple[Path, str, str, bool]] = []
         up_to_date = 0
@@ -538,7 +554,7 @@ def sync_vault(
             from .indexer import rebuild_index
             index_summary = rebuild_index(cfg.root)
 
-        return {
+        out = {
             "vault": cfg.name,
             "scanned": len(candidates),
             "up_to_date": up_to_date,
@@ -546,5 +562,12 @@ def sync_vault(
             "preserved": preserved,
             "failed": failed_now,
             "total_failed_recorded": len(failed_map),
+            "offline_mounts": offline_mounts,
             "index": index_summary,
         }
+        if cfg.sources_path is not None and not candidates and len(manifest) >= 5:
+            out["warning"] = (
+                f"External source directory '{cfg.sources_root}' currently returned 0 readable files "
+                "(possible unmounted volume); existing mirrors and index were preserved."
+            )
+        return out

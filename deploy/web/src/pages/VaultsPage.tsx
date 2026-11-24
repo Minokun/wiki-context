@@ -1,14 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   Edit3,
+  ExternalLink,
   Eye,
   FolderInput,
   FolderOpen,
   FolderTree,
+  HardDrive,
+  Link2,
   Loader2,
   Lock,
   Plus,
@@ -16,13 +20,16 @@ import {
   ShieldAlert,
   Sparkles,
   Trash2,
+  Unlink,
   X,
 } from "lucide-react";
 import { api } from "../api/client";
 import { BrandGlyph } from "../components/BrandIcons";
 import { FolderPickerModal } from "../components/FolderPickerModal";
 import {
+  copyToClipboard,
   isTauriRuntime,
+  openNativeDirectory,
   pickNativeDirectory,
   subscribeNativeFileDrop,
 } from "../platform/adapter";
@@ -36,6 +43,7 @@ import type {
 
 interface VaultsPageProps {
   vaults: VaultInfo[];
+  vaultsDir?: string;
   activeVaultId: string;
   onSelectVault: (vaultId: string) => void;
   llmCompiler: LlmCompilerStatus | null;
@@ -77,6 +85,7 @@ const MEMORY_KIND_LABELS: Record<string, string> = {
 
 export const VaultsPage: React.FC<VaultsPageProps> = ({
   vaults,
+  vaultsDir,
   activeVaultId,
   onSelectVault,
   llmCompiler,
@@ -92,8 +101,9 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
   const activeVault = vaults.find((v) => v.id === activeVaultId) || vaults[0] || null;
   const [subTab, setSubTab] = useState<VaultSubTab>("structure");
 
-  // Picker mode: "onboard" (new vault) vs "import" (import folder into active vault)
-  const [pickerMode, setPickerMode] = useState<"onboard" | "import">("onboard");
+  // Picker mode: "onboard" (new vault) vs "mount" (zero-copy extra mount) vs "relink" (update moved source dir)
+  const [pickerMode, setPickerMode] = useState<"onboard" | "mount" | "relink">("onboard");
+  const [relinkMountName, setRelinkMountName] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
 
   // Onboarding state
@@ -103,14 +113,35 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     suggested_name: string;
     suggested_id: string;
     detected_layout: string;
+    recommended_storage_mode?: "managed" | "in_place";
     file_count: number;
+    loose_total?: number;
     warnings?: string[];
   } | null>(null);
   const [vaultIdInput, setVaultIdInput] = useState("");
   const [vaultNameInput, setVaultNameInput] = useState("");
   const [layoutInput, setLayoutInput] = useState("zh");
+  const [storageModeInput, setStorageModeInput] = useState<"managed" | "in_place">("managed");
   const [onboardAutoCompile, setOnboardAutoCompile] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
+
+  // Safe removal confirmation <dialog> state
+  const [removeTarget, setRemoveTarget] = useState<VaultInfo | null>(null);
+  const [removeCleanupWs, setRemoveCleanupWs] = useState(true);
+  const removeDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const dlg = removeDialogRef.current;
+    if (!dlg) return;
+    if (removeTarget) {
+      setRemoveCleanupWs(removeTarget.storage_mode === "managed");
+      if (!dlg.open) {
+        dlg.showModal();
+      }
+    } else if (dlg.open) {
+      dlg.close();
+    }
+  }, [removeTarget]);
 
   // Sync, Plan Preview, Lint & Rename state
   const [syncingJobs, setSyncingJobs] = useState<Record<string, string>>({});
@@ -206,23 +237,89 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
       setVaultIdInput(info.suggested_id);
       setVaultNameInput(info.suggested_name);
       setLayoutInput(info.detected_layout || "zh");
+      setStorageModeInput(
+        info.recommended_storage_mode || (info.kind === "existing_vault" ? "in_place" : "managed"),
+      );
     } catch (e) {
       onToast("error", e instanceof Error ? e.message : String(e));
     }
   };
 
-  const handleImportExternalFolder = async (folderPath: string) => {
+  const handleMountExternalFolder = async (folderPath: string) => {
     if (!activeVault) return;
     try {
-      const res = await api.importFolder({
+      const res = await api.mountFolder({
         vault_id: activeVault.id,
         external_folder: folderPath,
       });
       if (res.compile_job?.job_id && res.compile_job.status === "running") {
         onTrackCompileJob(activeVault.id, res.compile_job);
-        onToast("success", `已导入 ${res.copied_count} 个文件，正在后台整理摘要并更新索引`);
+        onToast("success", `已零拷贝挂载「${res.mount_name}」（原目录只读），正在后台整理并更新索引`);
       } else {
-        onToast("success", `已导入 ${res.copied_count} 个文件并更新搜索索引`);
+        onToast("success", `已零拷贝挂载「${res.mount_name}」（原目录只读）并更新搜索索引`);
+      }
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleUnmountFolder = async (vaultId: string, mountName: string) => {
+    try {
+      await api.unmountFolder({
+        vault_id: vaultId,
+        mount_name: mountName,
+        purge_mirrors: true,
+      });
+      onToast("info", `已取消挂载「${mountName}」（原文件夹不受任何影响）`);
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleRelinkSource = async (folderPath: string, mountName = "") => {
+    if (!activeVault) return;
+    try {
+      const res = await api.relinkVault({
+        vault_id: activeVault.id,
+        new_source_dir: folderPath,
+        ...(mountName ? { mount_name: mountName } : {}),
+      });
+      onToast(
+        "success",
+        mountName
+          ? `已重定位挂载点「${mountName}」到新目录（历史索引已无缝复用）`
+          : `已重定位主源目录至 ${res.new_path}（未变更文件 0 重复提取）`,
+      );
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleOpenOrCopyPath = async (targetPath: string, label = "路径") => {
+    if (!targetPath) return;
+    if (isTauriRuntime()) {
+      const opened = await openNativeDirectory(targetPath);
+      if (opened) return;
+    }
+    const copied = await copyToClipboard(targetPath);
+    if (copied) {
+      onToast("info", `已复制${label}：${targetPath}`);
+    }
+  };
+
+  const executeConfirmedRemove = async (v: VaultInfo, cleanupWs: boolean) => {
+    try {
+      const res = await api.removeVault(v.id, cleanupWs);
+      if (res.archived_to) {
+        onToast(
+          "info",
+          `已移除「${v.name}」（原始文件夹完好无损；已整理的知识库/记忆已备份至 ${res.archived_to}）`,
+        );
+      } else {
+        onToast("info", `已移除「${v.name}」（本地原始文档不会被删除）`);
       }
       onRefresh();
     } catch (e) {
@@ -251,15 +348,27 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     };
   }, []);
 
-  const chooseFolder = async (mode: "onboard" | "import" = "onboard") => {
+  const chooseFolder = async (
+    mode: "onboard" | "mount" | "relink" = "onboard",
+    mountName = "",
+  ) => {
     setPickerMode(mode);
+    setRelinkMountName(mountName);
+    const title =
+      mode === "mount"
+        ? "选择要挂载到当前知识库的文件夹（只读零拷贝）"
+        : mode === "relink"
+          ? mountName
+            ? `为挂载点「${mountName}」选择新位置`
+            : "选择移动/改名后的原始文档文件夹"
+          : "选择要添加的本地文件夹";
     if (isTauriRuntime()) {
-      const p = await pickNativeDirectory(
-        mode === "import" ? "选择要导入到当前知识库的文件夹" : "选择要添加的本地文件夹",
-      );
+      const p = await pickNativeDirectory(title);
       if (p) {
-        if (mode === "import") {
-          await handleImportExternalFolder(p);
+        if (mode === "mount") {
+          await handleMountExternalFolder(p);
+        } else if (mode === "relink") {
+          await handleRelinkSource(p, mountName);
         } else {
           await inspectSelectedPath(p);
         }
@@ -278,19 +387,21 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
         vault_id: vaultIdInput.trim(),
         name: vaultNameInput.trim(),
         layout: layoutInput,
+        storage_mode: inspected?.kind === "existing_vault" ? "in_place" : storageModeInput,
         auto_compile: onboardAutoCompile,
       });
 
+      const modeHint = res.storage_mode === "managed" ? "（原目录保持只读干净）" : "";
       if (res.compile_job?.job_id && res.compile_job.status === "running") {
         onTrackCompileJob(res.vault_id, res.compile_job);
-        onToast("success", `知识库已添加并建立基础索引，正在后台自动整理内容摘要`);
+        onToast("success", `知识库已添加${modeHint}，正在后台自动整理内容摘要`);
       } else if (onboardAutoCompile && !res.llm_ready && (res.uncompiled_count || 0) > 0) {
         onToast(
           "info",
-          `知识库已添加（含 ${res.uncompiled_count} 篇待整理文档，配置顶部整理模型后即可自动整理）`,
+          `知识库已添加${modeHint}（含 ${res.uncompiled_count} 篇待整理文档，配置顶部整理模型后即可自动整理）`,
         );
       } else {
-        onToast("success", "知识库已添加并建立搜索索引");
+        onToast("success", `知识库已添加${modeHint}并建立搜索索引`);
       }
 
       setSelectedPath("");
@@ -528,24 +639,75 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                     className={`rounded-md px-2 py-0.5 text-xs font-semibold ${
                       activeVault.kind === "remote"
                         ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                        : activeVault.ready
-                          ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                          : "bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300"
+                        : activeVault.source_available === false
+                          ? "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
+                          : activeVault.ready
+                            ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                            : "bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300"
                     }`}
                   >
                     {activeVault.kind === "remote"
                       ? "共享知识库"
-                      : activeVault.ready
-                        ? "就绪"
-                        : "正在建立索引"}
+                      : activeVault.source_available === false
+                        ? "源目录离线"
+                        : activeVault.ready
+                          ? "就绪"
+                          : "正在建立索引"}
+                  </span>
+                )}
+                {activeVault && activeVault.kind === "local" && (
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-xs font-medium ${
+                      activeVault.storage_mode === "managed"
+                        ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                        : "bg-[var(--bg-muted)] text-[var(--ink-secondary)]"
+                    }`}
+                  >
+                    {activeVault.storage_mode === "managed" ? "原目录只读" : "原地自包含"}
                   </span>
                 )}
               </div>
-              <p className="font-mono text-xs text-[var(--ink-muted)]">
-                {activeVault?.kind === "remote"
-                  ? activeVault.gateway_url || activeVault.mcp_url
-                  : activeVault?.path || "点击「添加文件夹」即可接入本地 Markdown、PDF、Word、PPT 等文档"}
-              </p>
+              <div className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-xs text-[var(--ink-muted)]">
+                <span className="truncate">
+                  {activeVault?.kind === "remote"
+                    ? activeVault.gateway_url || activeVault.mcp_url
+                    : activeVault?.sources_path ||
+                      activeVault?.path ||
+                      "点击「添加文件夹」即可接入本地 Markdown、PDF、Word、PPT 等文档"}
+                </span>
+                {activeVault && activeVault.kind === "local" && (activeVault.sources_path || activeVault.path) && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleOpenOrCopyPath(
+                        activeVault.sources_path || activeVault.path,
+                        "原始目录路径",
+                      )
+                    }
+                    className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 font-sans text-[11px] font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)] hover:text-[var(--accent)]"
+                    title={isTauriRuntime() ? "在访达/资源管理器中打开" : "复制路径"}
+                  >
+                    {isTauriRuntime() ? (
+                      <ExternalLink className="h-3 w-3" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
+                    {isTauriRuntime() ? "打开" : "复制"}
+                  </button>
+                )}
+                {activeVault &&
+                  activeVault.kind === "local" &&
+                  activeVault.storage_mode === "managed" &&
+                  activeVault.source_available === false && (
+                    <button
+                      type="button"
+                      onClick={() => void chooseFolder("relink")}
+                      className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-100 px-2 py-0.5 font-sans text-[11px] font-semibold text-amber-900 hover:bg-amber-200 dark:bg-amber-950/70 dark:text-amber-200"
+                    >
+                      <Link2 className="h-3 w-3" /> 重定位源目录
+                    </button>
+                  )}
+              </div>
             </div>
           </div>
         </div>
@@ -742,7 +904,9 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
             <div className="rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)]/55 p-4">
               <div className="flex items-center justify-between">
                 <div className="text-[14px] font-bold text-[var(--ink-primary)]">
-                  添加本地文件夹（检测到 {inspected.file_count} 个文档）
+                  {inspected.kind === "existing_vault"
+                    ? `接入已有知识库（检测到 ${inspected.file_count ?? inspected.loose_total ?? 0} 个文档）`
+                    : `添加本地文件夹（检测到 ${inspected.file_count ?? inspected.loose_total ?? 0} 个文档）`}
                 </div>
                 <button
                   type="button"
@@ -794,6 +958,64 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                   </select>
                 </div>
               </div>
+
+              {/* Storage Mode Selection */}
+              {inspected.kind === "existing_vault" ? (
+                <div className="mt-3 rounded-xl border border-emerald-300/70 bg-emerald-50/70 px-3.5 py-2 text-xs text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">
+                  检测到该目录已是完整的知识库工作区，将直接原地接入，保留原有目录结构与历史数据。
+                </div>
+              ) : (
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <label
+                    className={`flex cursor-pointer items-start gap-2.5 rounded-xl border p-3 text-xs ${
+                      storageModeInput === "managed"
+                        ? "border-[var(--accent)] bg-[var(--bg-surface)] shadow-2xs"
+                        : "border-[var(--border-default)] bg-[var(--bg-surface)]/70 hover:border-[var(--border-strong)]"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="onboardStorageMode"
+                      checked={storageModeInput === "managed"}
+                      onChange={() => setStorageModeInput("managed")}
+                      className="mt-0.5"
+                    />
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5 font-bold text-[var(--ink-primary)]">
+                        <span>零侵入托管模式</span>
+                        <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                          推荐
+                        </span>
+                      </div>
+                      <p className="mt-0.5 leading-relaxed text-[var(--ink-muted)]">
+                        不移动、不改写原文件夹任何内容；索引与 AI 知识库存放在{" "}
+                        <code className="font-mono">{vaultsDir || "~/.wiki-context/vaults"}</code>
+                      </p>
+                    </div>
+                  </label>
+                  <label
+                    className={`flex cursor-pointer items-start gap-2.5 rounded-xl border p-3 text-xs ${
+                      storageModeInput === "in_place"
+                        ? "border-[var(--accent)] bg-[var(--bg-surface)] shadow-2xs"
+                        : "border-[var(--border-default)] bg-[var(--bg-surface)]/70 hover:border-[var(--border-strong)]"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="onboardStorageMode"
+                      checked={storageModeInput === "in_place"}
+                      onChange={() => setStorageModeInput("in_place")}
+                      className="mt-0.5"
+                    />
+                    <div className="min-w-0">
+                      <div className="font-bold text-[var(--ink-primary)]">原地自包含模式</div>
+                      <p className="mt-0.5 leading-relaxed text-[var(--ink-muted)]">
+                        在所选文件夹内创建 史料 / 知识库 / 记忆 等目录（适合随身移动硬盘或独立 Git 仓库）
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              )}
 
               {/* Global Agent Auto-Compile Link */}
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] px-3.5 py-2.5 text-xs">
@@ -888,6 +1110,16 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                               <span className="truncate text-[14px] font-bold text-[var(--ink-primary)]">
                                 {v.name}
                               </span>
+                              {v.kind === "local" && v.storage_mode === "managed" && (
+                                <span className="shrink-0 whitespace-nowrap rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+                                  原目录只读
+                                </span>
+                              )}
+                              {v.kind === "local" && v.source_available === false && (
+                                <span className="shrink-0 whitespace-nowrap rounded bg-rose-100 px-1.5 py-0.5 text-[11px] font-semibold text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+                                  源目录离线
+                                </span>
+                              )}
                               {isCompiling ? (
                                 <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-xs font-semibold text-[var(--accent)]">
                                   <Loader2 className="h-3 w-3 animate-spin" />
@@ -903,8 +1135,13 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                               )}
                             </div>
                             <div className="mt-1 truncate font-mono text-xs text-[var(--ink-muted)]">
-                              {v.kind === "remote" ? v.gateway_url : v.path}
+                              {v.kind === "remote" ? v.gateway_url : v.sources_path || v.path}
                             </div>
+                            {v.kind === "local" && (v.source_mounts?.length || 0) > 0 && (
+                              <div className="mt-0.5 text-[11px] text-[var(--ink-muted)]">
+                                另挂载 {v.source_mounts?.length} 个外部文件夹
+                              </div>
+                            )}
                           </div>
                           <span
                             className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-medium ${
@@ -974,15 +1211,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                             </button>
                             <button
                               type="button"
-                              onClick={() => {
-                                void api.removeVault(v.id).then(() => {
-                                  onToast(
-                                    "info",
-                                    `已移除「${v.name}」（本地原文件不会被删除）`,
-                                  );
-                                  onRefresh();
-                                });
-                              }}
+                              onClick={() => setRemoveTarget(v)}
                               className="rounded p-1 text-[var(--ink-muted)] hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/50 dark:hover:text-rose-400"
                               title="移除知识库"
                             >
@@ -1038,13 +1267,23 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                                     <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--ink-muted)]" />
                                   )}
                                   <span className="truncate">{node.name}/</span>
+                                  {node.mounted && (
+                                    <span className="shrink-0 rounded bg-[var(--accent-soft)] px-1.5 py-0.5 font-sans text-[10px] font-semibold text-[var(--accent)]">
+                                      挂载
+                                    </span>
+                                  )}
                                   <span className="rounded bg-[var(--bg-muted)] px-1.5 py-0.5 text-xs text-[var(--ink-muted)]">
                                     {node.children.length}
                                   </span>
                                 </button>
                               ) : (
-                                <span className="truncate font-mono font-semibold text-[var(--ink-primary)]">
-                                  {node.name}/
+                                <span className="flex min-w-0 items-center gap-1.5 font-mono font-semibold text-[var(--ink-primary)]">
+                                  <span className="truncate">{node.name}/</span>
+                                  {node.mounted && (
+                                    <span className="shrink-0 rounded bg-[var(--accent-soft)] px-1.5 py-0.5 font-sans text-[10px] font-semibold text-[var(--accent)]">
+                                      挂载
+                                    </span>
+                                  )}
                                 </span>
                               )}
 
@@ -1455,12 +1694,111 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => void chooseFolder("import")}
+                    onClick={() => void chooseFolder("mount")}
                     className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] py-2 font-semibold text-[var(--ink-primary)] hover:bg-[var(--bg-subtle)]"
                   >
                     <FolderInput className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    导入外部文件夹到此库
+                    挂载更多文件夹（零拷贝只读）
                   </button>
+
+                  {/* Source Mapping & Extra Mounts Panel */}
+                  <div className="space-y-2 rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="flex items-center gap-1.5 font-bold text-[var(--ink-secondary)]">
+                        <HardDrive className="h-3.5 w-3.5 text-[var(--accent)]" />
+                        源目录与挂载点
+                      </span>
+                      <span className="text-[11px] text-[var(--ink-muted)]">只读映射</span>
+                    </div>
+
+                    {/* Primary Source Root */}
+                    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] p-2">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <span className="flex items-center gap-1.5 font-semibold text-[var(--ink-primary)]">
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              activeVault.source_available === false
+                                ? "bg-rose-500"
+                                : "bg-emerald-500"
+                            }`}
+                          />
+                          主源目录
+                        </span>
+                        <div className="flex items-center gap-1">
+                          {activeVault.storage_mode === "managed" && (
+                            <button
+                              type="button"
+                              onClick={() => void chooseFolder("relink")}
+                              className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                              title="原文件夹移动或改名后重新绑定路径，无需重新整理"
+                            >
+                              <Link2 className="h-3 w-3" /> 重定位
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleOpenOrCopyPath(
+                                activeVault.sources_path || activeVault.path,
+                                "主源目录路径",
+                              )
+                            }
+                            className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--bg-surface)] hover:text-[var(--ink-primary)]"
+                            title={isTauriRuntime() ? "打开目录" : "复制路径"}
+                          >
+                            {isTauriRuntime() ? (
+                              <ExternalLink className="h-3 w-3" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-[var(--ink-muted)]">
+                        {activeVault.sources_path || activeVault.path}
+                      </div>
+                    </div>
+
+                    {/* Extra Zero-Copy Mounts */}
+                    {(activeVault.source_mounts || []).map((mnt) => (
+                      <div
+                        key={mnt.name}
+                        className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] p-2"
+                      >
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="flex min-w-0 items-center gap-1.5 font-mono font-semibold text-[var(--ink-primary)]">
+                            <span
+                              className={`h-2 w-2 shrink-0 rounded-full ${
+                                mnt.available ? "bg-emerald-500" : "bg-rose-500"
+                              }`}
+                            />
+                            <span className="truncate">{mnt.name}/</span>
+                          </span>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => void chooseFolder("relink", mnt.name)}
+                              className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--bg-surface)] hover:text-[var(--accent)]"
+                              title="重定位此挂载目录"
+                            >
+                              <Link2 className="h-3 w-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleUnmountFolder(activeVault.id, mnt.name)}
+                              className="rounded p-1 text-[var(--ink-muted)] hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/50 dark:hover:text-rose-400"
+                              title="取消挂载（不删除原文件夹）"
+                            >
+                              <Unlink className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-1 truncate font-mono text-[11px] text-[var(--ink-muted)]">
+                          {mnt.path}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
 
                   <div className="grid grid-cols-2 gap-2">
                     <button
@@ -1547,9 +1885,35 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                     <div className="flex items-center justify-between py-2">
                       <span className="text-[var(--ink-muted)]">来源类型</span>
                       <span className="font-semibold text-[var(--ink-primary)]">
-                        {activeVault.kind === "remote" ? "其他电脑共享" : "本机文件夹"}
+                        {activeVault.kind === "remote"
+                          ? "其他电脑共享"
+                          : activeVault.storage_mode === "managed"
+                            ? "零侵入托管（原目录只读）"
+                            : "原地自包含目录"}
                       </span>
                     </div>
+                    {activeVault.kind === "local" && (
+                      <div className="py-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[var(--ink-muted)]">工作区目录</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleOpenOrCopyPath(
+                                activeVault.workspace_path || activeVault.path,
+                                "工作区路径",
+                              )
+                            }
+                            className="inline-flex items-center gap-1 font-medium text-[var(--accent)] hover:underline"
+                          >
+                            {isTauriRuntime() ? "打开工作区" : "复制路径"}
+                          </button>
+                        </div>
+                        <div className="mt-0.5 truncate font-mono text-[11px] text-[var(--ink-secondary)]">
+                          {activeVault.workspace_path || activeVault.path}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between py-2">
                       <span className="text-[var(--ink-muted)]">标识 ID</span>
                       <span className="font-mono font-semibold text-[var(--ink-primary)]">
@@ -1586,16 +1950,97 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
 
       <FolderPickerModal
         open={pickerOpen}
-        title={pickerMode === "import" ? "选择要导入的文件夹" : "选择要添加的本地文件夹"}
+        title={
+          pickerMode === "mount"
+            ? "选择要挂载的文件夹（零拷贝只读）"
+            : pickerMode === "relink"
+              ? relinkMountName
+                ? `为挂载点「${relinkMountName}」选择新目录`
+                : "选择移动或改名后的原始文档目录"
+              : "选择要添加的本地文件夹"
+        }
         onClose={() => setPickerOpen(false)}
         onSelect={(p) => {
-          if (pickerMode === "import") {
-            void handleImportExternalFolder(p);
+          if (pickerMode === "mount") {
+            void handleMountExternalFolder(p);
+          } else if (pickerMode === "relink") {
+            void handleRelinkSource(p, relinkMountName);
           } else {
             void inspectSelectedPath(p);
           }
         }}
       />
+
+      {/* Native <dialog> Safe Removal Confirmation */}
+      <dialog
+        ref={removeDialogRef}
+        aria-labelledby="remove-vault-title"
+        onClose={() => {
+          const dlg = removeDialogRef.current;
+          const choice = dlg?.returnValue || "";
+          if (dlg) dlg.returnValue = "";
+          const target = removeTarget;
+          const cleanup = removeCleanupWs;
+          setRemoveTarget(null);
+          if (choice === "confirm" && target) {
+            void executeConfirmedRemove(target, cleanup);
+          }
+        }}
+        className="m-auto w-full max-w-md rounded-2xl border border-[var(--border-strong)] bg-[var(--bg-surface)] p-5 text-[var(--ink-primary)] shadow-2xl"
+      >
+        {removeTarget && (
+          <form method="dialog" className="space-y-3">
+            <h1 id="remove-vault-title" className="text-[15px] font-bold text-[var(--ink-primary)]">
+              移除知识库「{removeTarget.name}」？
+            </h1>
+            <p className="text-xs leading-relaxed text-[var(--ink-secondary)]">
+              {removeTarget.kind === "remote"
+                ? "仅断开此远程共享知识库的本地连接，不会影响提供端电脑上的任何数据。"
+                : "绝对不会删除或修改你的原始文档文件夹。"}
+            </p>
+            {removeTarget.kind === "local" && (
+              <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] px-3 py-2 font-mono text-[11px] text-[var(--ink-secondary)]">
+                <div className="truncate">
+                  原目录（完好保留）：{removeTarget.sources_path || removeTarget.path}
+                </div>
+              </div>
+            )}
+            {removeTarget.kind === "local" && removeTarget.storage_mode === "managed" && (
+              <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--bg-subtle)] p-2.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={removeCleanupWs}
+                  onChange={(e) => setRemoveCleanupWs(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span className="leading-relaxed text-[var(--ink-secondary)]">
+                  同时清理可重建缓存（<code className="font-mono">史料_md/</code>）；若包含已整理的{" "}
+                  <code className="font-mono">知识库/</code> 或{" "}
+                  <code className="font-mono">记忆/</code>，将自动安全归档至{" "}
+                  <code className="font-mono">.trash/</code> 目录方便恢复
+                </span>
+              </label>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="submit"
+                value="cancel"
+                autoFocus
+                className="rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3.5 py-1.5 text-xs font-semibold text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)]"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                value="confirm"
+                className="rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-rose-700"
+              >
+                确认移除
+              </button>
+            </div>
+          </form>
+        )}
+      </dialog>
 
       {/* Rename Vault ID Modal */}
       {renameTarget && (

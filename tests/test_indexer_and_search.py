@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wiki_context.indexer import check_index, split_markdown_sections  # noqa: E402
+from wiki_context.indexer import check_index, rebuild_index, split_markdown_sections  # noqa: E402
 from wiki_context.scaffold import init_vault  # noqa: E402
 from wiki_context.search import BM25Index, route, tokenize_query  # noqa: E402
 from wiki_context.sync import sync_vault  # noqa: E402
@@ -105,6 +105,56 @@ class TestIndexerAndSearch(unittest.TestCase):
             finally:
                 idx.close()
             self.assertEqual(len(idx._all_cons), 0)
+
+    def test_fast_wiki_only_incremental_reindex_preserves_primary_and_passes_deep_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "fast-wiki"
+            init_vault(v, name="FastWikiKB", layout="zh")
+            (v / "史料" / "spec.md").write_text(
+                "# 网关规范\n\n默认超时时间为 750ms，限流返回 HTTP-429。\n",
+                encoding="utf-8",
+            )
+            r1 = sync_vault(v)
+            self.assertFalse(r1["index"].get("wiki_only_refresh", False))
+            gen1 = r1["index"]["generation_id"]
+
+            # Modify ONLY Layer-3 `知识库/*.md` without touching `史料/` or `史料_md/`
+            (v / "知识库" / "网关专题.md").write_text(
+                '---\ntitle: "网关专题"\ntype: synthesis\nstatus: draft\nupdated: 2026-11-24\n'
+                "sources:\n  - 史料/spec.md\n---\n\n# 网关专题\n\n## 概览\n\n边缘网关熔断阈值为 95%。\n",
+                encoding="utf-8",
+            )
+            r2 = rebuild_index(v)
+            self.assertTrue(r2.get("wiki_only_refresh"), r2)
+            self.assertNotEqual(r2["generation_id"], gen1)
+            self.assertEqual(r2["docs"], 1)
+            self.assertEqual(r2["wiki_docs"], 2)
+
+            ok, msgs = check_index(v, deep=True)
+            self.assertTrue(ok, msgs)
+
+            idx = BM25Index(v, backend="sqlite")
+            try:
+                l2_hits = idx.search("HTTP-429 750ms", k=3)
+                self.assertTrue(l2_hits and l2_hits[0]["source"] == "史料/spec.md")
+                w_hits = idx.search_wiki("边缘网关熔断阈值 95%", k=3)
+                self.assertTrue(w_hits and w_hits[0]["source"] == "知识库/网关专题.md")
+            finally:
+                idx.close()
+
+            # F1 regression: corrupted previous-gen bm25.sqlite must fall back cleanly to full rebuild
+            gen2 = r2["generation_id"]
+            (v / "史料_md" / ".index" / gen2 / "bm25.sqlite").write_bytes(b"NOT A SQLITE DB")
+            (v / "知识库" / "网关专题2.md").write_text(
+                '---\ntitle: "网关专题2"\ntype: synthesis\nstatus: draft\nupdated: 2026-11-24\n'
+                "sources:\n  - 史料/spec.md\n---\n\n# 网关专题2\n\n## 概览\n\n降级后完整重建成功。\n",
+                encoding="utf-8",
+            )
+            r3 = rebuild_index(v)
+            self.assertFalse(r3.get("wiki_only_refresh", False))
+            self.assertEqual(r3["wiki_docs"], 3)
+            ok3, msgs3 = check_index(v, deep=True)
+            self.assertTrue(ok3, msgs3)
 
 
 if __name__ == "__main__":

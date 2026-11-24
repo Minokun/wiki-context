@@ -857,10 +857,17 @@ class KBService:
         rel_s = self.cfg.strip_source_prefix(norm_src)
         assets = list(snap.assets_by_source.get(norm_src) or ())
 
-        # Also support direct standalone images inside `sources/` even if not yet mirrored
-        s_root = self.cfg.sources_root.resolve()
-        raw_file = (s_root / rel_s).resolve()
-        if not assets and s_root in raw_file.parents and raw_file.is_file() and not raw_file.is_symlink():
+        # Also support direct standalone images inside primary/mounted sources even if not yet mirrored
+        resolved_src = self.cfg.resolve_source_rel(rel_s)
+        raw_file, s_root = resolved_src if resolved_src is not None else (None, None)
+        if (
+            not assets
+            and raw_file is not None
+            and s_root is not None
+            and s_root in raw_file.parents
+            and raw_file.is_file()
+            and not raw_file.is_symlink()
+        ):
             if raw_file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                 mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
                 assets = [{
@@ -885,6 +892,8 @@ class KBService:
             chosen = matched
 
         if chosen.get("source_direct"):
+            if raw_file is None or s_root is None:
+                return {"error": f"Visual asset source unavailable on disk for {norm_src}"}, True
             target_img = raw_file
             jail_root = s_root
         else:
@@ -944,7 +953,8 @@ class KBService:
                 exists = (self.cfg.wiki_root / norm_s[len(self.cfg.wiki_prefix):]).is_file()
             else:
                 allowed = self.policy.can_access_source(user, norm_s)
-                exists = (self.cfg.sources_root / self.cfg.strip_source_prefix(norm_s)).exists()
+                resolved_ref = self.cfg.resolve_source_file(norm_s)
+                exists = bool(resolved_ref is not None and resolved_ref[0].exists())
             if not allowed:
                 return {"error": f"Access denied to related_source: {norm_s}"}
             if not exists:

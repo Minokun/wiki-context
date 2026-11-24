@@ -114,3 +114,14 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(120, 130, 150, 0.46);
 }
+
+/* Native <dialog> modal scroll containment & backdrop */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background: rgba(10, 14, 24, 0.48);
+  backdrop-filter: blur(2px);
+}

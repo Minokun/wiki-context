@@ -30,7 +30,18 @@ LAYOUT_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
-DEFAULT_MAX_DOC_BYTES = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_MAX_DOC_BYTES = 2 * 1024 * 1024  # 2 MiB (plain text & derived Markdown mirrors)
+DEFAULT_MAX_SOURCE_BYTES = 50 * 1024 * 1024  # 50 MiB (rich binary docs: PDF/PPTX/DOCX/XLSX)
+
+
+def validate_external_source_path(vault_root: Path, source_path: Path) -> None:
+    """Ensure an external read-only source root never equals, contains, or nests inside the vault workspace."""
+    v = vault_root.expanduser().resolve()
+    s = source_path.expanduser().resolve()
+    if s == v or v in s.parents or s in v.parents:
+        raise ValueError(
+            f"External source directory '{s}' must not equal, contain, or be inside vault workspace '{v}'"
+        )
 
 
 @dataclass(frozen=True)
@@ -39,6 +50,9 @@ class VaultConfig:
     name: str
     layout: str = "en"
     sources_dir: str = "sources"
+    sources_path: Path | None = None
+    source_mounts: tuple[tuple[str, Path], ...] = ()
+    invalid_mounts: tuple[tuple[str, str, str], ...] = ()
     mirrors_dir: str = "mirrors"
     wiki_dir: str = "wiki"
     notes_dir: str = "notes"
@@ -46,9 +60,16 @@ class VaultConfig:
     log_file: str = "log.md"
     index_subdir: str = ".index"
     max_doc_bytes: int = DEFAULT_MAX_DOC_BYTES
+    max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES
     sensitive: bool = False
     exclude_patterns: tuple[str, ...] = ()
     compile_exclude_patterns: tuple[str, ...] = ()
+    compile_include_patterns: tuple[str, ...] = ()
+    compile_skip_csv: bool = False
+    compile_project_rollup: bool = False
+    compile_workers: int = 4
+    compile_max_tokens: int = 1800
+    compile_disable_thinking: bool = False
     ocr_image_dirs: frozenset[str] = field(default_factory=frozenset)
     anchor_terms: tuple[str, ...] = ()
     acl_rules: dict[str, dict[str, list[str]]] = field(default_factory=dict)
@@ -86,6 +107,8 @@ class VaultConfig:
 
         name = str(raw_cfg.get("name") or root.name or "vault").strip()
         max_bytes = int(raw_cfg.get("max_doc_bytes") or DEFAULT_MAX_DOC_BYTES)
+        raw_max_src = raw_cfg.get("max_source_bytes")
+        max_src_bytes = int(raw_max_src) if raw_max_src else max(DEFAULT_MAX_SOURCE_BYTES, max_bytes)
         sensitive = bool(raw_cfg.get("sensitive") is True)
 
         excl_raw = raw_cfg.get("exclude_patterns") or ()
@@ -97,6 +120,16 @@ class VaultConfig:
         compile_exclude_patterns = tuple(
             str(x).strip() for x in cmp_excl_raw if isinstance(x, str) and str(x).strip()
         )
+
+        cmp_incl_raw = raw_cfg.get("compile_include_patterns") or ()
+        compile_include_patterns = tuple(
+            str(x).strip() for x in cmp_incl_raw if isinstance(x, str) and str(x).strip()
+        )
+        compile_skip_csv = bool(raw_cfg.get("compile_skip_csv") is True)
+        compile_project_rollup = bool(raw_cfg.get("compile_project_rollup") is True)
+        compile_workers = max(1, min(16, int(raw_cfg.get("compile_workers") or 4)))
+        compile_max_tokens = max(256, min(8192, int(raw_cfg.get("compile_max_tokens") or 1800)))
+        compile_disable_thinking = bool(raw_cfg.get("compile_disable_thinking") is True)
 
         ocr_dirs_raw = raw_cfg.get("ocr_image_dirs") or ()
         ocr_image_dirs = frozenset(
@@ -111,28 +144,121 @@ class VaultConfig:
         acl_raw = raw_cfg.get("acl")
         acl_rules = dict(acl_raw) if isinstance(acl_raw, dict) else {}
 
+        raw_sources_path = str(raw_cfg.get("sources_path") or "").strip()
+        sources_path: Path | None = None
+        if raw_sources_path:
+            p_sp = Path(raw_sources_path).expanduser()
+            sources_path = (p_sp if p_sp.is_absolute() else (root / p_sp)).resolve()
+            validate_external_source_path(root, sources_path)
+
+        raw_mounts = raw_cfg.get("source_mounts")
+        parsed_mounts: list[tuple[str, Path]] = []
+        invalid_mounts_list: list[tuple[str, str, str]] = []
+        seen_mount_keys: set[str] = set()
+        if isinstance(raw_mounts, dict):
+            for mk, mv in sorted(raw_mounts.items(), key=lambda kv: (str(kv[0]).strip().strip("/").lower(), str(kv[0]))):
+                mname = str(mk).strip().strip("/").replace("\\", "/")
+                mval = str(mv or "").strip()
+                if not mname or not mval or "/" in mname or mname in {".", ".."} or ".." in mname:
+                    invalid_mounts_list.append((str(mk), mval, "invalid mount name or empty path"))
+                    continue
+                norm_key = mname.lower()
+                if norm_key in seen_mount_keys:
+                    invalid_mounts_list.append((str(mk), mval, f"duplicate normalized mount name '{mname}'"))
+                    continue
+                p_mv = Path(mval).expanduser()
+                mpath = (p_mv if p_mv.is_absolute() else (root / p_mv)).resolve()
+                try:
+                    validate_external_source_path(root, mpath)
+                except ValueError as exc:
+                    invalid_mounts_list.append((mname, mval, str(exc)))
+                    continue
+                seen_mount_keys.add(norm_key)
+                parsed_mounts.append((mname, mpath))
+        source_mounts = tuple(parsed_mounts)
+        invalid_mounts = tuple(invalid_mounts_list)
+
         return cls(
             root=root,
             name=name,
             layout=layout,
             sources_dir=sources_dir,
+            sources_path=sources_path,
+            source_mounts=source_mounts,
+            invalid_mounts=invalid_mounts,
             mirrors_dir=mirrors_dir,
             wiki_dir=wiki_dir,
             notes_dir=notes_dir,
             catalog_file=catalog_file,
             log_file=log_file,
             max_doc_bytes=max_bytes,
+            max_source_bytes=max_src_bytes,
             sensitive=sensitive,
             exclude_patterns=exclude_patterns,
             compile_exclude_patterns=compile_exclude_patterns,
+            compile_include_patterns=compile_include_patterns,
+            compile_skip_csv=compile_skip_csv,
+            compile_project_rollup=compile_project_rollup,
+            compile_workers=compile_workers,
+            compile_max_tokens=compile_max_tokens,
+            compile_disable_thinking=compile_disable_thinking,
             ocr_image_dirs=ocr_image_dirs,
             anchor_terms=anchor_terms,
             acl_rules=acl_rules,
         )
 
     @property
+    def is_external_sources(self) -> bool:
+        return self.sources_path is not None or bool(self.source_mounts)
+
+    @property
+    def storage_mode(self) -> str:
+        return "managed" if self.sources_path is not None else "in_place"
+
+    @property
     def sources_root(self) -> Path:
+        if self.sources_path is not None:
+            return self.sources_path
         return self.root / self.sources_dir
+
+    def iter_source_roots(self) -> list[tuple[str, Path]]:
+        """Yield ``(mount_prefix, directory)`` pairs across the primary source root and all extra mounts."""
+        roots: list[tuple[str, Path]] = [("", self.sources_root)]
+        for mname, mpath in self.source_mounts:
+            roots.append((mname, mpath))
+        return roots
+
+    def resolve_source_rel(self, rel: str) -> tuple[Path, Path] | None:
+        """Resolve an already-prefix-stripped source relative path safely to ``(file_path, jail_root)``."""
+        clean_rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+        if not clean_rel or ".." in clean_rel.split("/"):
+            return None
+        for mname, mpath in self.source_mounts:
+            pfx = f"{mname}/"
+            if clean_rel.startswith(pfx):
+                sub = clean_rel[len(pfx):]
+                if not sub:
+                    return None
+                jail = mpath.resolve()
+                unres = jail / sub
+                if unres.is_symlink():
+                    return None
+                cand = unres.resolve()
+                if jail in cand.parents:
+                    return (cand, jail)
+                return None
+        jail = self.sources_root.resolve()
+        unres = jail / clean_rel
+        if unres.is_symlink():
+            return None
+        cand = unres.resolve()
+        if jail in cand.parents:
+            return (cand, jail)
+        return None
+
+    def resolve_source_file(self, rel_or_ref: str) -> tuple[Path, Path] | None:
+        """Resolve a logical source ref (prefixed with ``sources/`` or ``史料/``) safely to ``(file_path, jail_root)``."""
+        return self.resolve_source_rel(self.strip_source_prefix(rel_or_ref))
 
     @property
     def mirrors_root(self) -> Path:
@@ -222,6 +348,7 @@ class VaultConfig:
             "mirrors_dir": self.mirrors_dir,
             "wiki_dir": self.wiki_dir,
             "max_doc_bytes": self.max_doc_bytes,
+            "max_source_bytes": self.max_source_bytes,
             "exclude_patterns": list(self.exclude_patterns),
             "ocr_image_dirs": sorted(self.ocr_image_dirs),
         }

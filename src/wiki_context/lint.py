@@ -25,6 +25,14 @@ _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 _HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 
 
+def _normalize_wikilink_target(raw: str) -> str:
+    """Normalize a wikilink or href target without stripping version dots like `V2.0`."""
+    name = raw.strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if name.lower().endswith(".md"):
+        name = name[:-3]
+    return name.lower()
+
+
 def lint_vault(vault: Path | str) -> dict:
     cfg = VaultConfig.load(vault)
     errors: list[dict] = []
@@ -60,7 +68,7 @@ def lint_vault(vault: Path | str) -> dict:
     if cfg.catalog_path.is_file():
         cat_raw = _HTML_COMMENT_RE.sub("", _FENCED_CODE_RE.sub("", cfg.catalog_path.read_text(encoding="utf-8", errors="replace")))
         for m in _WIKILINK_RE.finditer(cat_raw):
-            tgt = Path(m.group(1).strip()).stem.lower()
+            tgt = _normalize_wikilink_target(m.group(1))
             catalog_registered.add(tgt)
             if tgt not in wiki_pages and tgt not in root_special:
                 errors.append({
@@ -71,7 +79,7 @@ def lint_vault(vault: Path | str) -> dict:
         for m in _MD_LINK_RE.finditer(cat_raw):
             href = m.group(2).strip().lstrip("./")
             if not href.startswith(("http://", "https://", "#")):
-                catalog_registered.add(Path(href).stem.lower())
+                catalog_registered.add(_normalize_wikilink_target(href))
     else:
         warnings.append({"code": "missing-catalog", "file": cfg.catalog_file, "detail": "Catalog file not found"})
 
@@ -122,7 +130,7 @@ def lint_vault(vault: Path | str) -> dict:
         body_no_code = _HTML_COMMENT_RE.sub("", _FENCED_CODE_RE.sub("", body))
         for m in _WIKILINK_RE.finditer(body_no_code):
             target_raw = m.group(1).strip()
-            target_stem = Path(target_raw).stem.lower()
+            target_stem = _normalize_wikilink_target(target_raw)
             if target_stem not in wiki_pages and target_stem not in root_special:
                 errors.append({
                     "code": "dangling-link",

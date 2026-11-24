@@ -17,6 +17,28 @@ fn prepare_for_update(state: tauri::State<'_, Arc<SidecarState>>) {
     state.shutdown();
 }
 
+#[tauri::command]
+fn open_directory(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("目录路径不能为空".to_string());
+    }
+    let dir = std::path::PathBuf::from(trimmed);
+    if !dir.is_dir() {
+        return Err(format!("目录不存在或不可访问: {}", dir.display()));
+    }
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("explorer").arg(&dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = std::process::Command::new("xdg-open").arg(&dir).spawn();
+
+    status
+        .map(|_| ())
+        .map_err(|e| format!("无法打开目录 {}: {e}", dir.display()))
+}
+
 pub fn run() {
     let sidecar = Arc::new(SidecarState::new());
     let sidecar_setup = Arc::clone(&sidecar);
@@ -32,7 +54,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(sidecar)
-        .invoke_handler(tauri::generate_handler![get_bootstrap_config, prepare_for_update])
+        .invoke_handler(tauri::generate_handler![
+            get_bootstrap_config,
+            prepare_for_update,
+            open_directory
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
             tray::setup_tray(&handle, sidecar_tray)?;

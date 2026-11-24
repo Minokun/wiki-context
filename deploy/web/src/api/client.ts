@@ -66,8 +66,12 @@ export const api = {
       suggested_name: string;
       suggested_id: string;
       detected_layout: string;
+      recommended_storage_mode?: "managed" | "in_place";
+      storage_mode?: "managed" | "in_place";
+      sources_path?: string;
       file_count: number;
-      warnings: string[];
+      loose_total?: number;
+      warnings?: string[];
     }>("/api/fs/inspect", { path }),
   fsMkdir: (parent: string, name: string) =>
     requestJson<{ created: string }>("/api/fs/mkdir", { parent, name }),
@@ -78,10 +82,14 @@ export const api = {
     vault_id?: string;
     name?: string;
     layout?: string;
+    storage_mode?: "auto" | "managed" | "in_place";
     auto_compile?: boolean;
   }) =>
     requestJson<{
       vault_id: string;
+      storage_mode?: "managed" | "in_place";
+      workspace_path?: string;
+      sources_path?: string;
       uncompiled_count?: number;
       llm_ready?: boolean;
       compile_job?: AsyncJobRecord | null;
@@ -89,10 +97,37 @@ export const api = {
   importFolder: (payload: { vault_id: string; external_folder: string; target_subfolder?: string }) =>
     requestJson<{
       vault_id: string;
+      mode?: "mount" | "copy";
+      mounted?: boolean;
+      mount_name?: string;
       copied_count: number;
       llm_ready?: boolean;
       compile_job?: AsyncJobRecord | null;
     }>("/api/vaults/import-folder", payload),
+  mountFolder: (payload: { vault_id: string; external_folder: string; mount_name?: string }) =>
+    requestJson<{
+      vault_id: string;
+      mounted: boolean;
+      mount_name: string;
+      external_folder: string;
+      target_subfolder: string;
+      llm_ready?: boolean;
+      compile_job?: AsyncJobRecord | null;
+    }>("/api/vaults/mount-folder", payload),
+  unmountFolder: (payload: { vault_id: string; mount_name: string; purge_mirrors?: boolean }) =>
+    requestJson<{
+      vault_id: string;
+      unmounted: boolean;
+      mount_name: string;
+      purged_mirrors: number;
+    }>("/api/vaults/unmount-folder", payload),
+  relinkVault: (payload: { vault_id: string; new_source_dir: string; mount_name?: string }) =>
+    requestJson<{
+      vault_id: string;
+      mount_name: string;
+      old_path: string;
+      new_path: string;
+    }>("/api/vaults/relink", payload),
   syncVaultAsync: (vault_id: string, force = false) =>
     requestJson<AsyncJobRecord>("/api/vaults/sync", {
       vault_id,
@@ -127,12 +162,17 @@ export const api = {
     clear_api_key?: boolean;
     auto_compile_on_sync?: boolean;
     max_items_per_run?: number;
+    workers?: number;
+    max_tokens?: number;
+    disable_thinking?: boolean;
   }) => requestJson<LlmCompilerStatus>("/api/llm/config", payload),
   testLlmConfig: (payload?: {
+    provider?: string;
     protocol?: string;
     base_url?: string;
     model?: string;
     api_key?: string;
+    disable_thinking?: boolean;
   }) =>
     requestJson<{ ok: boolean; latency_ms: number; reply: string; model: string }>(
       "/api/llm/test",
@@ -147,8 +187,11 @@ export const api = {
     ),
   renameVault: (old_id: string, new_id: string, sync_clients = true) =>
     requestJson<{ old_id: string; new_id: string }>("/api/vaults/rename", { old_id, new_id, sync_clients }),
-  removeVault: (vault_id: string) =>
-    requestJson<{ removed: boolean }>("/api/vaults/remove", { vault_id }),
+  removeVault: (vault_id: string, cleanup_workspace = false) =>
+    requestJson<{ removed: boolean; workspace_cleaned?: boolean; archived_to?: string }>(
+      "/api/vaults/remove",
+      { vault_id, cleanup_workspace },
+    ),
 
   // Synonyms
   getSynonyms: (vault_id: string) =>

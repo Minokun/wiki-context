@@ -316,7 +316,7 @@ const AppInner: React.FC = () => {
         });
         setUpdateModalOpen(true);
       } else {
-        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.4.1"})`);
+        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.0"})`);
       }
     } catch {
       pushToast("info", "暂未检测到线上新版本（请确认网络或已发布 GitHub Release）");
@@ -410,6 +410,7 @@ const AppInner: React.FC = () => {
         {tab === "vaults" && (
           <VaultsPage
             vaults={overview?.vaults || []}
+            vaultsDir={overview?.vaults_dir}
             activeVaultId={activeVaultId}
             onSelectVault={handleSelectVault}
             llmCompiler={overview?.llm_compiler || null}

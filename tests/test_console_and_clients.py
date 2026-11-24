@@ -159,6 +159,7 @@ class TestConsoleAndClients(unittest.TestCase):
             "vault_id": "wiki-rd",
             "name": "研发规范库",
             "layout": "zh",
+            "storage_mode": "in_place",
         })
         self.assertEqual(ob["vault_id"], "wiki-rd")
         self.assertTrue((raw_folder / "史料" / "公开" / "网关限流规范.md").is_file())
@@ -744,6 +745,171 @@ class TestConsoleAndClients(unittest.TestCase):
         self.assertNotIn("wiki-core", vsc_after_disc["servers"])
         magpie_after_disc = json.loads((self.fake_home / ".config" / "magpie" / "library.json").read_text(encoding="utf-8"))
         self.assertIn("wiki-core", [m["name"] for m in magpie_after_disc["mcp"]])
+
+    def test_remote_admin_same_origin_post_and_keepalive_close_on_403(self):
+        import http.client
+
+        remote_srv = create_console_server(self.state, host="0.0.0.0", port=0, allow_remote_admin=True)
+        remote_port = remote_srv.server_address[1]
+        remote_thread = threading.Thread(target=remote_srv.serve_forever, daemon=True)
+        remote_thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{remote_port}/", timeout=5) as resp:
+                html = resp.read().decode("utf-8")
+            m = re.search(r'"csrfToken":\s*"([^"]+)"', html)
+            assert m is not None
+            remote_csrf = m.group(1)
+
+            body = json.dumps({"path": str(self.root)}).encode("utf-8")
+            host_hdr = f"10.10.10.90:{remote_port}"
+
+            # 1. Same-origin remote POST succeeds when Host and Origin match
+            conn = http.client.HTTPConnection("127.0.0.1", remote_port, timeout=5)
+            try:
+                conn.request(
+                    "POST",
+                    "/api/fs/inspect",
+                    body=body,
+                    headers={
+                        "Host": host_hdr,
+                        "Origin": f"http://{host_hdr}",
+                        "Content-Type": "application/json",
+                        "X-WCTX-CSRF": remote_csrf,
+                    },
+                )
+                r_ok = conn.getresponse()
+                ok_data = json.loads(r_ok.read().decode("utf-8"))
+                self.assertEqual(r_ok.status, 200)
+                self.assertIn("kind", ok_data)
+            finally:
+                conn.close()
+
+            # 2. Cross-origin POST returns 403 and closes keep-alive socket so unread body cannot desync next request
+            conn2 = http.client.HTTPConnection("127.0.0.1", remote_port, timeout=5)
+            try:
+                conn2.request(
+                    "POST",
+                    "/api/fs/inspect",
+                    body=body,
+                    headers={
+                        "Host": host_hdr,
+                        "Origin": "http://evil.example",
+                        "Content-Type": "application/json",
+                        "X-WCTX-CSRF": remote_csrf,
+                    },
+                )
+                r_err = conn2.getresponse()
+                err_data = json.loads(r_err.read().decode("utf-8"))
+                self.assertEqual(r_err.status, 403)
+                self.assertEqual(err_data.get("error"), "Cross-origin admin request blocked")
+                self.assertEqual((r_err.getheader("Connection") or "").lower(), "close")
+            finally:
+                conn2.close()
+        finally:
+            remote_srv.shutdown()
+            remote_srv.server_close()
+
+    def test_managed_default_onboarding_dedup_mount_relink_and_safe_remove(self):
+        import shutil
+
+        # 1. Plain documents folder onboarded with DEFAULT storage_mode ("auto" -> "managed")
+        raw_dir = self.root / "量化课程资料"
+        (raw_dir / "因子库").mkdir(parents=True)
+        (raw_dir / "因子库" / "动量策略.md").write_text(
+            "# 动量策略\n\n夏普比率目标 2.4，最大回撤限制 8%。\n", encoding="utf-8"
+        )
+        orig_snapshot = sorted(p.relative_to(raw_dir).as_posix() for p in raw_dir.rglob("*"))
+
+        insp = self._api("/api/fs/inspect", {"path": str(raw_dir)})
+        self.assertEqual(insp["kind"], "raw_documents_folder")
+        self.assertEqual(insp["recommended_storage_mode"], "managed")
+        self.assertEqual(insp["file_count"], 1)
+
+        ob = self._api("/api/vaults/onboard", {
+            "path": str(raw_dir),
+            "vault_id": "wiki-quant",
+            "name": "量化资料",
+            "layout": "zh",
+        })
+        self.assertEqual(ob["vault_id"], "wiki-quant")
+        self.assertEqual(ob["storage_mode"], "managed")
+        ws_path = Path(ob["workspace_path"])
+        self.assertTrue(ws_path.is_dir())
+        self.assertIn(self.cfg_dir.resolve(), ws_path.parents)
+        # Original folder MUST remain 100% untouched!
+        self.assertEqual(sorted(p.relative_to(raw_dir).as_posix() for p in raw_dir.rglob("*")), orig_snapshot)
+        self.assertFalse((raw_dir / "vault.json").exists())
+        self.assertFalse((raw_dir / "史料").exists())
+
+        # 2. Re-onboarding the exact same raw_dir must deduplicate (no duplicate vault or workspace!)
+        ob_dup = self._api("/api/vaults/onboard", {"path": str(raw_dir), "name": "量化资料"})
+        self.assertEqual(ob_dup["vault_id"], "wiki-quant")
+        self.assertEqual(ob_dup["onboard_mode"], "already_registered")
+        ov = self._api("/api/overview")
+        self.assertEqual(len([v for v in ov["vaults"] if v["id"] == "wiki-quant"]), 1)
+        self.assertEqual(Path(ov["vaults_dir"]).resolve(), (self.cfg_dir / "vaults").resolve())
+        qv = next(v for v in ov["vaults"] if v["id"] == "wiki-quant")
+        self.assertEqual(qv["storage_mode"], "managed")
+        self.assertEqual(Path(qv["sources_path"]).resolve(), raw_dir.resolve())
+        self.assertTrue(qv["source_available"])
+        self.assertTrue(any(n["name"] == "因子库" for n in qv["folder_tree"]))
+
+        # 3. Zero-copy mount a second external folder via /api/vaults/mount-folder
+        extra_dir = self.root / "额外研报"
+        (extra_dir / "宏观").mkdir(parents=True)
+        (extra_dir / "宏观" / "利率分析.md").write_text(
+            "# 利率分析\n\n十年期国债收益率中枢为 2.35%。\n", encoding="utf-8"
+        )
+        mnt = self._api("/api/vaults/mount-folder", {
+            "vault_id": "wiki-quant",
+            "external_folder": str(extra_dir),
+            "mount_name": "研报",
+        })
+        self.assertTrue(mnt["mounted"])
+        self.assertEqual(mnt["mount_name"], "研报")
+        self.assertEqual(sorted(p.relative_to(raw_dir).as_posix() for p in raw_dir.rglob("*")), orig_snapshot)
+
+        q_mnt = self._api("/api/vaults/query", {"vault_id": "wiki-quant", "question": "十年期国债收益率中枢"})
+        self.assertIn("2.35%", q_mnt["context_markdown"])
+        ov_mnt = self._api("/api/overview")
+        qv_mnt = next(v for v in ov_mnt["vaults"] if v["id"] == "wiki-quant")
+        self.assertEqual(len(qv_mnt["source_mounts"]), 1)
+        self.assertTrue(any(n["name"] == "研报" and n.get("mounted") for n in qv_mnt["folder_tree"]))
+
+        # 4. Move primary folder -> offline detected -> relink restores online with 0 re-extraction!
+        moved_dir = self.root / "量化课程资料-已移动"
+        shutil.move(str(raw_dir), str(moved_dir))
+        ov_off = self._api("/api/overview")
+        qv_off = next(v for v in ov_off["vaults"] if v["id"] == "wiki-quant")
+        self.assertFalse(qv_off["source_available"])
+        self.assertIn("不可访问", qv_off.get("online_error", ""))
+
+        rel = self._api("/api/vaults/relink", {
+            "vault_id": "wiki-quant",
+            "new_source_dir": str(moved_dir),
+        })
+        self.assertEqual(Path(rel["new_path"]).resolve(), moved_dir.resolve())
+        self.assertEqual(rel["sync"]["converted"], 0)
+        ov_back = self._api("/api/overview")
+        qv_back = next(v for v in ov_back["vaults"] if v["id"] == "wiki-quant")
+        self.assertTrue(qv_back["source_available"])
+
+        # 5. Unmount extra folder -> original extra_dir stays untouched
+        umnt = self._api("/api/vaults/unmount-folder", {"vault_id": "wiki-quant", "mount_name": "研报"})
+        self.assertTrue(umnt["unmounted"])
+        self.assertTrue((extra_dir / "宏观" / "利率分析.md").is_file())
+
+        # 6. Safe remove with cleanup_workspace=True archives curated Wiki to .trash, removes cache, NEVER touches moved_dir!
+        (ws_path / "知识库" / "策略精选.md").write_text("# 策略精选\n\n人工精修内容。\n", encoding="utf-8")
+        rem = self._api("/api/vaults/remove", {"vault_id": "wiki-quant", "cleanup_workspace": True})
+        self.assertTrue(rem["removed"])
+        self.assertTrue(rem["workspace_cleaned"])
+        archived = Path(rem["archived_to"])
+        self.assertTrue(archived.is_dir())
+        self.assertIn((self.cfg_dir / ".trash").resolve(), archived.parents)
+        self.assertTrue((archived / "知识库" / "策略精选.md").is_file())
+        self.assertFalse((archived / "史料_md").exists())
+        self.assertTrue((moved_dir / "因子库" / "动量策略.md").is_file())
 
 
 if __name__ == "__main__":

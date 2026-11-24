@@ -48,6 +48,13 @@ const DEFAULT_PRESETS = [
     model: "claude-sonnet-4-20250514",
   },
   {
+    id: "local",
+    label: "本地私有模型 (llama.cpp / vLLM / Ollama)",
+    protocol: "openai",
+    base_url: "http://127.0.0.1:8080/v1",
+    model: "local-model",
+  },
+  {
     id: "custom",
     label: "自定义兼容接口",
     protocol: "openai",
@@ -55,6 +62,10 @@ const DEFAULT_PRESETS = [
     model: "",
   },
 ];
+
+function isLoopbackUrl(raw: string): boolean {
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d+)?(\/|$)/i.test(raw.trim());
+}
 
 export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   open,
@@ -73,9 +84,14 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [autoSync, setAutoSync] = useState(llmCompiler?.auto_compile_on_sync ?? false);
   const [maxItems, setMaxItems] = useState(llmCompiler?.max_items_per_run ?? 15);
+  const [workers, setWorkers] = useState(llmCompiler?.workers ?? 4);
+  const [maxTokens, setMaxTokens] = useState(llmCompiler?.max_tokens ?? 1800);
+  const [disableThinking, setDisableThinking] = useState(llmCompiler?.disable_thinking ?? false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const keyOptional = provider === "local" || isLoopbackUrl(baseUrl);
 
   useEffect(() => {
     if (!open || !llmCompiler) return;
@@ -85,6 +101,9 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setModel(llmCompiler.model || "deepseek-chat");
     setAutoSync(llmCompiler.auto_compile_on_sync ?? false);
     setMaxItems(llmCompiler.max_items_per_run ?? 15);
+    setWorkers(llmCompiler.workers ?? 4);
+    setMaxTokens(llmCompiler.max_tokens ?? 1800);
+    setDisableThinking(llmCompiler.disable_thinking ?? llmCompiler.provider === "local");
     setApiKeyInput("");
     setTestResult(null);
   }, [open, llmCompiler]);
@@ -108,6 +127,9 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
       if (p.base_url) setBaseUrl(p.base_url);
       if (p.model) setModel(p.model);
     }
+    if (presetId === "local") {
+      setDisableThinking(true);
+    }
     setTestResult(null);
   };
 
@@ -122,12 +144,15 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
         ...(apiKeyInput.trim() ? { api_key: apiKeyInput.trim() } : {}),
         auto_compile_on_sync: autoSync,
         max_items_per_run: maxItems,
+        workers,
+        max_tokens: maxTokens,
+        disable_thinking: disableThinking,
       });
       setApiKeyInput("");
       onToast(
         "success",
         saved.ready
-          ? `模型设置已保存（当前使用 ${saved.model}）`
+          ? `模型设置已保存（当前使用 ${saved.model}，并发 ${saved.workers ?? workers}）`
           : "设置已保存，请补充 API Key 以启用自动整理",
       );
       onSaved();
@@ -159,24 +184,29 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setTestResult(null);
     try {
       const res = await api.testLlmConfig({
+        provider,
         protocol,
         base_url: baseUrl.trim(),
         model: model.trim(),
+        disable_thinking: disableThinking,
         ...(apiKeyInput.trim() ? { api_key: apiKeyInput.trim() } : {}),
       });
       setTestResult({
         ok: true,
         msg: `连接成功 (${res.latency_ms} ms，回复: ${res.reply})`,
       });
-      if (apiKeyInput.trim()) {
+      if (apiKeyInput.trim() || keyOptional) {
         await api.saveLlmConfig({
           provider,
           protocol,
           base_url: baseUrl.trim(),
           model: model.trim(),
-          api_key: apiKeyInput.trim(),
+          ...(apiKeyInput.trim() ? { api_key: apiKeyInput.trim() } : {}),
           auto_compile_on_sync: autoSync,
           max_items_per_run: maxItems,
+          workers,
+          max_tokens: maxTokens,
+          disable_thinking: disableThinking,
         });
         setApiKeyInput("");
         onSaved();
@@ -296,7 +326,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
             <div className="mb-1 flex items-center justify-between">
               <label className="flex items-center gap-1.5 font-medium text-[var(--ink-secondary)]">
                 <KeyRound className="h-3.5 w-3.5 text-[var(--accent)]" />
-                API 密钥 (API Key)
+                API 密钥 (API Key){keyOptional ? "（本地模型可留空）" : ""}
               </label>
               {llmCompiler?.has_api_key && (
                 <span className="font-mono text-emerald-700 dark:text-emerald-400">
@@ -318,9 +348,11 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
               value={apiKeyInput}
               onChange={(e) => setApiKeyInput(e.target.value)}
               placeholder={
-                llmCompiler?.has_api_key
-                  ? "已配置密钥；如需更换请粘贴新 API Key，留空则保持不变"
-                  : "粘贴你的 API Key（仅保存在本机）"
+                keyOptional
+                  ? "本地免鉴权接口可直接留空（若服务端开启了校验再填写）"
+                  : llmCompiler?.has_api_key
+                    ? "已配置密钥；如需更换请粘贴新 API Key，留空则保持不变"
+                    : "粘贴你的 API Key（仅保存在本机）"
               }
               className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-subtle)] px-3 py-2 font-mono text-xs text-[var(--ink-primary)] focus:border-[var(--accent)] focus:outline-none"
             />
@@ -328,7 +360,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
 
           {/* Global Automation Policy */}
           <div className="space-y-3 rounded-xl border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3.5">
-            <div className="font-bold text-[var(--ink-primary)]">自动整理设置</div>
+            <div className="font-bold text-[var(--ink-primary)]">自动整理与吞吐设置</div>
             <label className="flex cursor-pointer items-start gap-2.5">
               <input
                 type="checkbox"
@@ -346,21 +378,73 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
               </div>
             </label>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-subtle)] pt-2.5">
-              <span className="font-medium text-[var(--ink-secondary)]">
-                单次最多自动整理文档数
-              </span>
-              <select
-                value={maxItems}
-                onChange={(e) => setMaxItems(Number(e.target.value))}
-                className="rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-1.5 text-xs text-[var(--ink-primary)]"
-              >
-                <option value={5}>每次最多 5 篇</option>
-                <option value={15}>每次最多 15 篇（推荐）</option>
-                <option value={30}>每次最多 30 篇</option>
-                <option value={60}>每次最多 60 篇</option>
-                <option value={100}>每次最多 100 篇</option>
-              </select>
+            <label className="flex cursor-pointer items-start gap-2.5 border-t border-[var(--border-subtle)] pt-2.5">
+              <input
+                type="checkbox"
+                checked={disableThinking}
+                onChange={(e) => setDisableThinking(e.target.checked)}
+                className="mt-0.5"
+              />
+              <div>
+                <div className="font-semibold text-[var(--ink-primary)]">
+                  关闭模型思考链（推荐本地推理模型开启）
+                </div>
+                <div className="mt-0.5 text-[var(--ink-muted)]">
+                  发送 <code className="font-mono">enable_thinking=false</code> 跳过冗长思考过程，显著提升 Qwen3 / DeepSeek-R1 等模型整理速度（不支持时自动降级）。
+                </div>
+              </div>
+            </label>
+
+            <div className="grid grid-cols-1 gap-2.5 border-t border-[var(--border-subtle)] pt-2.5 sm:grid-cols-3">
+              <div>
+                <label className="mb-1 block font-medium text-[var(--ink-secondary)]">
+                  单次最多整理篇数
+                </label>
+                <select
+                  value={maxItems}
+                  onChange={(e) => setMaxItems(Number(e.target.value))}
+                  className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--ink-primary)]"
+                >
+                  <option value={5}>每次 5 篇</option>
+                  <option value={15}>每次 15 篇（推荐）</option>
+                  <option value={30}>每次 30 篇</option>
+                  <option value={60}>每次 60 篇</option>
+                  <option value={100}>每次 100 篇</option>
+                  <option value={300}>每次 300 篇</option>
+                  <option value={500}>每次 500 篇</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block font-medium text-[var(--ink-secondary)]">
+                  并发整理数
+                </label>
+                <select
+                  value={workers}
+                  onChange={(e) => setWorkers(Number(e.target.value))}
+                  className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--ink-primary)]"
+                >
+                  <option value={1}>1 路（串行）</option>
+                  <option value={2}>2 路并发</option>
+                  <option value={4}>4 路并发（推荐）</option>
+                  <option value={6}>6 路并发</option>
+                  <option value={8}>8 路并发</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block font-medium text-[var(--ink-secondary)]">
+                  单页输出上限
+                </label>
+                <select
+                  value={maxTokens}
+                  onChange={(e) => setMaxTokens(Number(e.target.value))}
+                  className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--ink-primary)]"
+                >
+                  <option value={1200}>1200 tokens（极简）</option>
+                  <option value={1800}>1800 tokens（推荐）</option>
+                  <option value={3000}>3000 tokens（详尽）</option>
+                  <option value={4096}>4096 tokens（长文）</option>
+                </select>
+              </div>
             </div>
           </div>
 

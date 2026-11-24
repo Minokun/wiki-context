@@ -21,7 +21,7 @@ from .mcp_server import KBService, run_stdio_server, scrub_secrets, selftest_mcp
 from .memory import MemoryStore
 from .ops import install_service, render_service_definition, run_doctor, service_status, uninstall_service
 from .remote_stdio import run_bridge
-from .scaffold import init_vault
+from .scaffold import init_vault, mount_source_folder, relink_source_path, unmount_source_folder
 from .search import BM25Index, route
 from .sync import sync_vault
 from .synonym_miner import mine_synonyms
@@ -36,11 +36,30 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # init
-    p_init = sub.add_parser("init", help="Initialize a new three-layer knowledge vault")
-    p_init.add_argument("path", help="Target directory for the new vault")
+    p_init = sub.add_parser("init", help="Initialize a new four-layer knowledge vault")
+    p_init.add_argument("path", help="Target directory for the new vault workspace")
     p_init.add_argument("--name", help="Human-readable vault name")
     p_init.add_argument("--layout", choices=["en", "zh"], default="en", help="Directory naming preset (default: en)")
+    p_init.add_argument("--source-dir", help="Optional read-only external source folder (zero-invasion managed mode)")
     p_init.add_argument("--dry-run", action="store_true", help="Preview files without writing")
+
+    # mount / unmount / relink (external read-only source management)
+    p_mnt = sub.add_parser("mount", help="Zero-copy read-only mount an external source folder into a vault")
+    p_mnt.add_argument("source_dir", help="External source directory to mount read-only")
+    p_mnt.add_argument("--vault", default=".", help="Vault workspace root path (default: .)")
+    p_mnt.add_argument("--name", help="Optional virtual subfolder name under sources/")
+    p_mnt.add_argument("--no-sync", action="store_true", help="Update vault.json without running sync immediately")
+
+    p_umnt = sub.add_parser("unmount", help="Remove a mounted external source folder from a vault")
+    p_umnt.add_argument("mount_name", help="Mount name to remove")
+    p_umnt.add_argument("--vault", default=".", help="Vault workspace root path (default: .)")
+    p_umnt.add_argument("--keep-mirrors", action="store_true", help="Keep derived mirrors instead of purging them")
+
+    p_rel = sub.add_parser("relink", help="Update external sources_path or a mount path after moving/renaming a folder")
+    p_rel.add_argument("new_source_dir", help="New directory path for the moved/renamed source folder")
+    p_rel.add_argument("--vault", default=".", help="Vault workspace root path (default: .)")
+    p_rel.add_argument("--mount", help="Optional mount name to relink (default: primary sources_path)")
+    p_rel.add_argument("--no-sync", action="store_true", help="Update vault.json without running sync immediately")
 
     # sync
     p_sync = sub.add_parser("sync", help="Incrementally extract raw sources into Markdown mirrors & rebuild FTS5")
@@ -94,6 +113,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_comp.add_argument("--base-url", help="API base URL (or set WCTX_BASE_URL)")
     p_comp.add_argument("--protocol", choices=["openai", "anthropic"], default="openai")
     p_comp.add_argument("--max-items", type=int, default=10, help="Max pages to compile in one batch")
+    p_comp.add_argument("--workers", type=int, help="Concurrent LLM worker count (default from vault.json or 4)")
+    p_comp.add_argument("--max-tokens", type=int, help="Max completion tokens per page (default from vault.json or 1800)")
+    p_comp.add_argument("--disable-thinking", action="store_true", default=None, help="Send enable_thinking=false for thinking models")
+    p_comp.add_argument("--project-rollup", action="store_true", default=None, help="Synthesize large SVN projects into one overview page")
+    p_comp.add_argument("--skip-csv", action="store_true", default=None, help="Skip raw CSV/TSV files from AI compilation (kept in FTS5)")
+    p_comp.add_argument(
+        "--overwrite-reviewed",
+        action="store_true",
+        help="Allow refreshing stale pages marked status: reviewed (refreshed pages reset to status: draft for re-review)",
+    )
     p_comp.add_argument("--dry-run", action="store_true", help="Show pending mirrors and stale pages without calling LLM")
 
     # serve (stdio MCP)
@@ -168,6 +197,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doc = sub.add_parser("doctor", help="Check Python, wctx PATH, poppler/PDF tools, AI clients & ports")
     p_doc.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
     p_doc.add_argument("--json", action="store_true", help="Print full JSON diagnostic report")
+    p_doc.add_argument(
+        "--probe-tls",
+        action="store_true",
+        help="Handshake-test the configured LLM host to prove the trust store works (no token spend)",
+    )
 
     # service (background daemon helper for launchd / systemd --user)
     p_svc = sub.add_parser("service", help="Render, install, inspect, or remove a background daemon (launchd / systemd)")
@@ -213,7 +247,43 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "init":
-            res = init_vault(args.path, name=args.name, layout=args.layout, dry_run=args.dry_run)
+            res = init_vault(
+                args.path,
+                name=args.name,
+                layout=args.layout,
+                dry_run=args.dry_run,
+                source_dir=args.source_dir,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "mount":
+            res = mount_source_folder(
+                args.vault,
+                args.source_dir,
+                mount_name=args.name,
+                run_sync=not args.no_sync,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "unmount":
+            res = unmount_source_folder(
+                args.vault,
+                args.mount_name,
+                purge_mirrors=not args.keep_mirrors,
+                rebuild=True,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "relink":
+            res = relink_source_path(
+                args.vault,
+                args.new_source_dir,
+                mount_name=args.mount,
+                run_sync=not args.no_sync,
+            )
             print(json.dumps(res, ensure_ascii=False, indent=2))
             return 0
 
@@ -299,6 +369,12 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 protocol=args.protocol,
                 max_items=args.max_items,
+                workers=args.workers,
+                max_tokens=args.max_tokens,
+                disable_thinking=args.disable_thinking,
+                project_rollup=args.project_rollup,
+                skip_csv=args.skip_csv,
+                overwrite_reviewed=args.overwrite_reviewed,
                 dry_run=args.dry_run,
             )
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -433,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.cmd == "doctor":
-            rep = run_doctor(config_dir=args.config_dir)
+            rep = run_doctor(config_dir=args.config_dir, probe_tls=args.probe_tls)
             if args.json:
                 print(json.dumps(rep, ensure_ascii=False, indent=2))
             else:

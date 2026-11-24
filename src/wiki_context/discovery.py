@@ -29,6 +29,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from . import __version__
+from .net import ssl_context
 from .state_lock import resolve_external_tool
 
 UDP_DISCOVERY_PORT = 48765
@@ -236,7 +237,7 @@ def probe_verified_pairing_endpoint(
     def _probe(u: str) -> tuple[str, float, dict[str, Any]]:
         t0 = time.perf_counter()
         req = urllib.request.Request(f"{u.rstrip('/')}/healthz", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             hz = json.loads(resp.read().decode("utf-8"))
         latency_ms = (time.perf_counter() - t0) * 1000.0
         if str(hz.get("instance_id") or "") != expected_instance_id:

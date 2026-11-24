@@ -682,6 +682,23 @@ WCTX_MODEL="gpt-4o-mini" \
 wctx compile --vault ./my-kb
 ```
 
+### Troubleshooting: `CERTIFICATE_VERIFY_FAILED` when compiling
+
+If the console reports `文档整理失败：<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate>`, the runtime has **no HTTPS root certificates at all** — typically a packaged desktop build whose bundled OpenSSL points its default CA file at a python.org framework version that is not installed on the host. It is unrelated to your API key or base URL.
+
+```bash
+# 1) Show the resolved trust store and handshake-test the compiler host (no token spend)
+wctx doctor --probe-tls
+
+# 2) Point at any usable CA bundle, then restart wiki-context
+export WCTX_CA_BUNDLE=/etc/ssl/cert.pem     # or SSL_CERT_FILE=/etc/ssl/cert.pem
+
+# 3) Or let the automatic fallback find one
+pip install certifi
+```
+
+Resolution order: `WCTX_CA_BUNDLE` → `SSL_CERT_FILE` → bundled `certifi` → platform bundles (macOS `/etc/ssl/cert.pem`, Linux `/etc/ssl/certs/ca-certificates.crt`) → OS store. Desktop installers rebuilt after this fix bundle `certifi` under `_internal/certifi/`, so they no longer depend on host certificate files.
+
 ---
 
 ## CLI Reference (`wctx`)
@@ -689,7 +706,7 @@ wctx compile --vault ./my-kb
 | Command | Description |
 | :--- | :--- |
 | `wctx ui [--port 8765]` | Launch the local loopback Web Control Console + dev Gateway (`wctx console`) |
-| `wctx doctor [--json]` | Diagnose Python, `wctx` PATH, `poppler` (`pdftotext`/`pdftoppm`), AI clients & services |
+| `wctx doctor [--json] [--probe-tls]` | Diagnose Python, the HTTPS CA trust store, `wctx` PATH, `poppler` (`pdftotext`/`pdftoppm`), AI clients & services; `--probe-tls` performs a real TLS handshake against the compiler host |
 | `wctx service [status\|render\|install\|uninstall]` | Generate or install a `launchd` / `systemd --user` background service for `gateway` or `ui` |
 | `wctx init <path> [--layout en\|zh]` | Initialize a four-layer vault (`sources/`, `mirrors/`, `wiki/`, `notes/`) |
 | `wctx sync --vault <V> [--list]` | Incrementally extract changed documents & rebuild FTS5 |
