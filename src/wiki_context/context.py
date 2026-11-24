@@ -118,9 +118,11 @@ class PrefixACLPolicy(AccessPolicy):
         group_rules: dict[str, dict[str, list[str]]] | Callable[[], dict[str, dict[str, list[str]]]],
         *,
         public_wiki_without_sources: bool = True,
+        allow_when_unconfigured: bool = False,
     ):
         self._group_rules = group_rules
         self.public_wiki_without_sources = public_wiki_without_sources
+        self.allow_when_unconfigured = bool(allow_when_unconfigured)
 
     @property
     def group_rules(self) -> dict[str, dict[str, list[str]]]:
@@ -138,10 +140,13 @@ class PrefixACLPolicy(AccessPolicy):
     def explain_source_access(self, principal: Principal, source: str) -> ACLDecision:
         if "admin" in principal.groups or "all" in principal.groups:
             return ACLDecision(allowed=True, reason_code="admin_bypass", matched_rule="group:admin|all")
+        rules = self.group_rules
+        if not rules and self.allow_when_unconfigured:
+            return ACLDecision(allowed=True, reason_code="allowed", matched_rule="unconfigured_acl_allow_all")
         denies: list[tuple[str, str]] = []
         allows: list[tuple[str, str]] = []
         for g in principal.groups:
-            rule = self.group_rules.get(g) or {}
+            rule = rules.get(g) or {}
             for d in rule.get("deny") or ():
                 denies.append((g, str(d)))
             for a in rule.get("allow") or ():
@@ -162,6 +167,9 @@ class PrefixACLPolicy(AccessPolicy):
     ) -> ACLDecision:
         if "admin" in principal.groups or "all" in principal.groups:
             return ACLDecision(allowed=True, reason_code="admin_bypass", matched_rule="group:admin|all")
+        rules = self.group_rules
+        if not rules and self.allow_when_unconfigured:
+            return ACLDecision(allowed=True, reason_code="allowed", matched_rule="unconfigured_acl_allow_all")
         valid_refs = [
             r for r in refs
             if isinstance(r, str) and (r.startswith("sources/") or r.startswith("史料/") or "/" in r)
@@ -206,6 +214,9 @@ def compile_acl_filter(policy: AccessPolicy, principal: Principal) -> ACLFilter:
     if isinstance(policy, PrefixACLPolicy):
         if "admin" in principal.groups or "all" in principal.groups:
             return ACLFilter(allow_all=True)
+        rules = policy.group_rules
+        if not rules and policy.allow_when_unconfigured:
+            return ACLFilter(allow_all=True)
         allow_toks: list[str] = []
         deny_toks: list[str] = []
         exact_fts = True
@@ -213,7 +224,7 @@ def compile_acl_filter(policy: AccessPolicy, principal: Principal) -> ACLFilter:
         pred = lambda src: policy.can_access_source(principal, src)  # noqa: E731
 
         for g in principal.groups:
-            rule = policy.group_rules.get(g) or {}
+            rule = rules.get(g) or {}
             for d in rule.get("deny") or ():
                 d_str = str(d).strip()
                 clean_d = d_str.rstrip("*").rstrip("/").replace("\\", "/").strip("/")

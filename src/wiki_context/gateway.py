@@ -171,7 +171,7 @@ class MultiVaultGateway:
             merged.update(self.tokens.acl_rules)
             return merged
 
-        return PrefixACLPolicy(_rules)
+        return PrefixACLPolicy(_rules, allow_when_unconfigured=True)
 
     def upsert_vault(self, vault_id: str, vault_path: Path | str) -> KBService:
         clean_id = vault_id.strip().strip("/")

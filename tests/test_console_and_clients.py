@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -929,6 +930,12 @@ class TestConsoleAndClients(unittest.TestCase):
         ob = self._api("/api/vaults/onboard", {"path": str(v_dir), "vault_id": "wiki-split", "name": "SplitKB"})
         self.assertEqual(ob["vault_id"], "wiki-split")
 
+        v_other = self.root / "split-other-vault"
+        init_vault(v_other, name="OtherKB", layout="zh")
+        (v_other / "史料" / "other.md").write_text("# 其他库\n\n仅授权给管理员。\n", encoding="utf-8")
+        sync_vault(v_other)
+        self._api("/api/vaults/onboard", {"path": str(v_other), "vault_id": "wiki-restricted", "name": "OtherKB"})
+
         vmap, default_tok_file = load_console_vault_map(self.cfg_dir)
         reg = TokenRegistry(token_file=default_tok_file)
         gw_ctx = build_standalone_gateway_context(self.cfg_dir, token_file=default_tok_file, registry=reg)
@@ -980,6 +987,46 @@ class TestConsoleAndClients(unittest.TestCase):
             )
             self.assertEqual(conn1["instance_id"], self.state.instance_id)
             self.assertEqual(len(conn1["connected_vaults"]), 1)
+
+            # Unconfigured ACL (`acl == {}`) allows paired `reader` tokens full read in their `allowed_vaults`
+            paired_tok = consumer_state.get_remote_token(conn1["connected_vaults"][0]["id"])
+            self.assertTrue(paired_tok.startswith("wctx_"))
+            mcp_hdrs = {"Authorization": f"Bearer {paired_tok}", "Content-Type": "application/json"}
+
+            def _mcp_tool(vault_id: str, tool_name: str, args: dict) -> dict:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{gw_port}/mcp/{vault_id}",
+                    data=json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": args},
+                    }).encode("utf-8"),
+                    headers=mcp_hdrs,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as r_mcp:
+                    return json.loads(r_mcp.read().decode("utf-8"))
+
+            wl_open = json.loads(_mcp_tool("wiki-split", "wiki_list", {})["result"]["content"][0]["text"])
+            self.assertEqual(wl_open["count"], 1)
+            self.assertEqual([d["source"] for d in wl_open["docs"]], ["史料/readme.md"])
+            wc_open = _mcp_tool("wiki-split", "wiki_context", {"question": "共享网关端口是多少"})["result"]["content"][0]["text"]
+            self.assertIn("8090", wc_open)
+
+            # Unauthorized vault still blocked with HTTP 403 even when `acl == {}`
+            with self.assertRaises(urllib.error.HTTPError) as unauth_v_err:
+                _mcp_tool("wiki-restricted", "wiki_list", {})
+            unauth_v_err.exception.close()
+            self.assertEqual(unauth_v_err.exception.code, 403)
+
+            # Hot-reload transition: once any folder ACL rule is configured (`staff` only), `reader` becomes fail-closed
+            time.sleep(0.02)
+            self._api("/api/acl/save", {"acl": {"staff": {"allow": ["**"], "deny": []}}})
+            wl_restricted = json.loads(_mcp_tool("wiki-split", "wiki_list", {})["result"]["content"][0]["text"])
+            self.assertEqual(wl_restricted["count"], 0)
+            wc_restricted = _mcp_tool("wiki-split", "wiki_context", {"question": "共享网关端口是多少"})["result"]["content"][0]["text"]
+            self.assertNotIn("8090", wc_restricted)
 
             # Single-use: replaying the same pairing code must fail
             with self.assertRaises(ValueError):
