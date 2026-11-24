@@ -27,6 +27,28 @@ def _reset() -> None:
     net.trust_store.cache_clear()
 
 
+def _sample_pem_text() -> str:
+    """Return a real PEM certificate bundle usable across macOS, Linux, and Windows CI."""
+    for _src, cafile in net.candidate_bundles():
+        try:
+            txt = Path(cafile).read_text(encoding="utf-8", errors="ignore")
+            if "BEGIN CERTIFICATE" in txt:
+                return txt
+        except OSError:
+            continue
+    enum_certs = getattr(ssl, "enum_certificates", None)
+    if callable(enum_certs):
+        pems: list[str] = []
+        for der, enc, _trust in enum_certs("ROOT"):
+            if enc == "x509_asn":
+                pems.append(ssl.DER_cert_to_PEM_cert(der))
+                if len(pems) >= 3:
+                    break
+        if pems:
+            return "\n".join(pems) + "\n"
+    raise unittest.SkipTest("No host PEM or Windows ROOT certificates available to construct test bundle")
+
+
 class TestTrustStore(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -54,7 +76,7 @@ class TestTrustStore(unittest.TestCase):
 
     def test_explicit_env_bundle_wins(self):
         bundle = self.tmp / "ca.pem"
-        bundle.write_text(Path("/etc/ssl/cert.pem").read_text(encoding="utf-8"), encoding="utf-8")
+        bundle.write_text(_sample_pem_text(), encoding="utf-8")
         import os
 
         os.environ["WCTX_CA_BUNDLE"] = str(bundle)
@@ -74,17 +96,25 @@ class TestTrustStore(unittest.TestCase):
         self.assertGreater(store.ca_count, 0)
 
     def test_default_store_without_cas_falls_back(self):
-        """Simulate the frozen engine: default context trusts nothing."""
-        empty = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        """Simulate the frozen engine: default context trusts nothing, bundled/platform CA takes over."""
         original = net._build_context
 
         def fake_build(cafile):
             if cafile is None:
-                return empty
+                return None
             return original(cafile)
 
+        real_candidates = net.candidate_bundles()
+        if real_candidates:
+            cands = real_candidates
+        else:
+            # Bare Windows CI has no /etc/ssl PEM and may not have certifi installed; simulate bundled certifi
+            bundle = self.tmp / "bundled-certifi.pem"
+            bundle.write_text(_sample_pem_text(), encoding="utf-8")
+            cands = [("certifi", str(bundle))]
+
         with mock.patch.object(net, "_build_context", side_effect=fake_build):
-            with mock.patch.object(net, "candidate_bundles", wraps=net.candidate_bundles):
+            with mock.patch.object(net, "candidate_bundles", return_value=cands):
                 store = net._resolve()
         self.assertGreater(store.ca_count, 0)
         self.assertIn(store.source, {"certifi", "platform", "env:SSL_CERT_FILE"})
