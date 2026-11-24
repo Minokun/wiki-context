@@ -21,9 +21,12 @@ from .policy import mirror_skip_reason
 _CANON_COL_RE = re.compile(r"(?:中文|名称|部件|构件|零件|状态|术语|标准词|canonical|name|component|term)", re.I)
 _ALIAS_COL_RE = re.compile(r"(?:英文|简写|缩写|代号|简称|别名|编码|english|abbr|code|alias|short)", re.I)
 
-# Matches `中文术语 (EnglishOrCode)` or `Full Term (ACRONYM)`
+# Matches `中文术语 (EnglishOrCode)` or `Full Term (ACRONYM)` or `中文术语（简称/又称/俗称 别名）`
 _INLINE_CJK_PAREN_RE = re.compile(
     r"([\u4e00-\u9fff]{2,12})\s*[（(]\s*([A-Za-z][A-Za-z0-9_.\-/ ]{1,28})\s*[)）]"
+)
+_INLINE_CJK_ALIAS_PAREN_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,14})\s*[（(]\s*(?:简称|又称|俗称|亦称|别称|代号)\s*[：:]?\s*([\u4e00-\u9fffA-Za-z0-9_.\-/、,， ]{2,24})\s*[)）]"
 )
 _INLINE_EN_ACRONYM_RE = re.compile(
     r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})\s*\(\s*([A-Z][A-Z0-9_-]{1,9})\s*\)"
@@ -92,6 +95,14 @@ def _mine_from_inline_prose(md_text: str) -> list[tuple[str, list[str]]]:
         raw_in = _clean_term(m.group(2))
         # Handle `English Name / ABBR` inside parentheses
         sub_aliases = [_clean_term(p) for p in re.split(r"[/,，;；|]+", raw_in)]
+        sub_aliases = [a for a in sub_aliases if _valid_term(a) and a.lower() != c_term.lower()]
+        if _valid_term(c_term) and sub_aliases:
+            pairs.append((c_term, sub_aliases))
+
+    for m in _INLINE_CJK_ALIAS_PAREN_RE.finditer(md_text):
+        c_term = _clean_term(m.group(1))
+        raw_in = _clean_term(m.group(2))
+        sub_aliases = [_clean_term(p) for p in re.split(r"[、/,，;；|]+", raw_in)]
         sub_aliases = [a for a in sub_aliases if _valid_term(a) and a.lower() != c_term.lower()]
         if _valid_term(c_term) and sub_aliases:
             pairs.append((c_term, sub_aliases))

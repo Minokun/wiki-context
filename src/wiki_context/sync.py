@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .config import VaultConfig
@@ -293,6 +293,7 @@ def sync_vault(
 
         candidates: list[tuple[Path, str, bool]] = []
         offline_mounts: list[dict[str, str]] = []
+        skipped_image_dirs: dict[str, int] = {}
         if source:
             rel = cfg.strip_source_prefix(source)
             resolved = cfg.resolve_source_rel(rel)
@@ -322,6 +323,14 @@ def sync_vault(
                         p, rel, cfg=cfg, explicit=False, include_all_images=include_all_images, has_asr=(asr is not None)
                     )
                     if reason is not None:
+                        if reason == "image-skipped-by-default":
+                            parent_rel = str(PurePosixPath(rel).parent)
+                            src_dir = (
+                                f"{cfg.source_prefix}{parent_rel}"
+                                if parent_rel and parent_rel != "."
+                                else cfg.source_prefix.rstrip("/")
+                            )
+                            skipped_image_dirs[src_dir] = skipped_image_dirs.get(src_dir, 0) + 1
                         continue
                     candidates.append((p, rel, False))
 
@@ -548,6 +557,25 @@ def sync_vault(
             _atomic_write(failed_path, json.dumps(failed_map, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         elif failed_path.is_file():
             failed_path.unlink(missing_ok=True)
+
+        if source is None and (candidates or not manifest):
+            skipped_media_path = cfg.mirrors_root / ".skipped_media.json"
+            if skipped_image_dirs:
+                _atomic_write(
+                    skipped_media_path,
+                    json.dumps(
+                        {
+                            "skipped_image_count": sum(skipped_image_dirs.values()),
+                            "skipped_image_dirs": dict(sorted(skipped_image_dirs.items())),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                )
+            elif skipped_media_path.is_file():
+                skipped_media_path.unlink(missing_ok=True)
 
         index_summary = None
         if rebuild:

@@ -729,6 +729,7 @@ Resolution order: `WCTX_CA_BUNDLE` → `SSL_CERT_FILE` → bundled `certifi` →
 
 ## Documentation
 
+- [Retrieval Engine Technical Advancement & Breakthroughs (vs. Elasticsearch / Vector RAG)](docs/retrieval-breakthroughs.md)
 - [Architecture & 5-Step Retrieval Design](docs/architecture.md)
 - [Vault Layout, Synonyms & SHA-256 Freshness Spec](docs/vault-spec.md)
 - [Multi-Vault Gateway, Authentication & Prefix ACL](docs/gateway-and-acl.md)

@@ -15,8 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from wiki_context.context import PrefixACLPolicy, Principal  # noqa: E402
 from wiki_context.gateway import MultiVaultGateway, TokenRegistry, create_http_server, selftest_gateway  # noqa: E402
-from wiki_context.mcp_server import selftest_mcp  # noqa: E402
+from wiki_context.mcp_server import KBService, handle_jsonrpc_message, selftest_mcp  # noqa: E402
 from wiki_context.scaffold import init_vault  # noqa: E402
 from wiki_context.sync import sync_vault  # noqa: E402
 
@@ -127,6 +128,75 @@ class TestMCPAndGateway(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
                 gw.close()
+
+    def test_initialize_instructions_and_on_demand_pdf_visual(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "pdf_vault"
+            init_vault(v, name="PolicyKB", layout="zh")
+            (v / "史料" / "公开").mkdir(parents=True)
+            (v / "史料" / "机密").mkdir(parents=True)
+
+            minimal_pdf = (
+                b"%PDF-1.4\n"
+                b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+                b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
+                b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 120]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+                b"4 0 obj<</Length 44>>stream\nBT /F1 14 Tf 20 60 Td (Policy 95518) Tj ET\nendstream\nendobj\n"
+                b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+                b"xref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000052 00000 n \n"
+                b"0000000101 00000 n \n0000000212 00000 n \n0000000305 00000 n \n"
+                b"trailer<</Size 6/Root 1 0 R>>\nstartxref\n375\n%%EOF\n"
+            )
+            (v / "史料" / "公开" / "保单.pdf").write_bytes(minimal_pdf)
+            (v / "史料" / "机密" / "内部保单.pdf").write_bytes(minimal_pdf)
+            sync_vault(v)
+
+            acl = PrefixACLPolicy({"staff": {"allow": ["史料/公开/**"], "deny": ["史料/机密/**"]}})
+            svc = KBService(v, policy=acl)
+            try:
+                init_resp = handle_jsonrpc_message(
+                    svc,
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+                )
+                assert init_resp is not None
+                instr = init_resp["result"].get("instructions", "")
+                self.assertIn("wiki_context", instr)
+                self.assertIn("PolicyKB", instr)
+
+                staff = Principal(uid="bob", groups=("staff",))
+                deny_vis = handle_jsonrpc_message(
+                    svc,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "wiki_inspect_visual", "arguments": {"source": "史料/机密/内部保单.pdf"}},
+                    },
+                    principal=staff,
+                )
+                assert deny_vis is not None
+                self.assertTrue(deny_vis["result"]["isError"])
+
+                ok_vis = handle_jsonrpc_message(
+                    svc,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "wiki_inspect_visual", "arguments": {"source": "史料/公开/保单.pdf"}},
+                    },
+                    principal=staff,
+                )
+                assert ok_vis is not None
+                from wiki_context.state_lock import resolve_external_tool
+
+                if resolve_external_tool("pdftoppm") or (sys.platform == "darwin" and Path("/usr/bin/sips").is_file()):
+                    self.assertFalse(ok_vis["result"]["isError"], ok_vis)
+                    meta = json.loads(ok_vis["result"]["content"][0]["text"])
+                    self.assertEqual(meta["asset"], "page-001.png")
+                    self.assertTrue(meta["rendered_on_demand"])
+            finally:
+                svc.close()
 
 
 if __name__ == "__main__":

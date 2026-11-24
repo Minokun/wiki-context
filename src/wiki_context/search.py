@@ -21,11 +21,15 @@ import re
 import shutil
 import sqlite3
 import threading
+import urllib.error
+import urllib.request
 import zlib
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Protocol
 
 from .config import VaultConfig
 from .state_lock import replace_with_retry
@@ -260,6 +264,197 @@ def encode_fts_token(tok: str) -> str:
     )
 
 
+MAX_ACL_INDEX_DEPTH = 10
+
+
+def _normalize_acl_prefix(prefix: str) -> str:
+    clean = prefix.replace("\\", "/").strip()
+    clean = clean.rstrip("*").rstrip("/").strip("/")
+    parts = [p for p in clean.split("/") if p and p != "."]
+    return "/".join(parts).lower()
+
+
+def encode_acl_prefix_token(prefix: str) -> str:
+    norm = _normalize_acl_prefix(prefix)
+    if not norm:
+        return "acl_all"
+    # Sanitize any non-ASCII / punctuation so `tokenize='ascii'` treats each prefix as a single exact token
+    hex_or_ascii = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9" or ch in "_/-.+") else f"x{ord(ch):x}" for ch in norm)
+    return "acl_p_" + encode_fts_token(hex_or_ascii)
+
+
+def source_acl_prefix_tokens(source: str, *, max_depth: int = MAX_ACL_INDEX_DEPTH) -> list[str]:
+    """Emit root wildcard + ancestor directory/file prefix tokens for C-level FTS5 ACL filtering."""
+    norm = _normalize_acl_prefix(source)
+    if not norm:
+        return ["acl_all"]
+    parts = norm.split("/")
+    out = ["acl_all"]
+    limit = min(len(parts), max_depth)
+    for depth in range(1, limit + 1):
+        out.append(encode_acl_prefix_token("/".join(parts[:depth])))
+    return out
+
+
+@dataclass(frozen=True)
+class ACLFilter:
+    """Pre-compiled, hot-reload-safe ACL filter pushed into SQLite FTS5 before `LIMIT`."""
+
+    allow_all: bool = False
+    deny_all: bool = False
+    allow_tokens: tuple[str, ...] = ()
+    deny_tokens: tuple[str, ...] = ()
+    exact_fts: bool = True
+    predicate: Callable[[str], bool] | None = None
+
+    def allows_source(self, source: str) -> bool:
+        if self.allow_all:
+            return True
+        if self.deny_all:
+            return False
+        if self.predicate is not None:
+            return self.predicate(source)
+        src_toks = set(source_acl_prefix_tokens(source))
+        if self.deny_tokens and (src_toks & set(self.deny_tokens)):
+            return False
+        if self.allow_tokens:
+            return bool(src_toks & set(self.allow_tokens))
+        return False
+
+    def wrap_fts_query(self, lexical_expr: str, *, scoped_cols: bool) -> str:
+        base = f"({{head body}} : ({lexical_expr}))" if scoped_cols else f"({lexical_expr})"
+        if not scoped_cols or self.allow_all or not self.exact_fts:
+            return base
+        allow_part = " OR ".join(self.allow_tokens) if self.allow_tokens else "acl_none"
+        expr = f"{base} AND (acl_pfx : ({allow_part}))"
+        if self.deny_tokens:
+            deny_part = " OR ".join(self.deny_tokens)
+            expr = f"{expr} NOT (acl_pfx : ({deny_part}))"
+        return expr
+
+
+class SearchCandidateBackend(Protocol):
+    """Zero-dependency candidate-ID seam for optional hybrid RRF or enterprise federation."""
+
+    def fetch_candidates(
+        self,
+        query: str,
+        weighted_tokens: dict[str, float],
+        *,
+        limit: int = 32,
+    ) -> list[Any]: ...
+
+
+class HttpCandidateBackend:
+    """Stdlib `urllib.request` client for optional remote vector/sparse/federated candidate generation."""
+
+    def __init__(
+        self,
+        endpoint_url: str,
+        *,
+        timeout: float = 1.5,
+        headers: dict[str, str] | None = None,
+        rrf_k: int = 60,
+        rrf_scale: float = 180.0,
+        semantic_floor: float = 3.2,
+    ):
+        self.endpoint_url = endpoint_url.strip()
+        self.timeout = max(0.1, float(timeout))
+        self.headers = dict(headers or {})
+        self.rrf_k = max(1, int(rrf_k))
+        self.rrf_scale = float(rrf_scale)
+        self.semantic_floor = float(semantic_floor)
+
+    def fetch_candidates(
+        self,
+        query: str,
+        weighted_tokens: dict[str, float],
+        *,
+        limit: int = 32,
+    ) -> list[Any]:
+        if not self.endpoint_url:
+            return []
+        payload = json.dumps(
+            {"query": query, "tokens": weighted_tokens, "limit": int(limit)},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            self.endpoint_url,
+            data=payload,
+            headers={"Content-Type": "application/json", **self.headers},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (OSError, urllib.error.URLError, ValueError):
+            return []
+        if isinstance(data, dict):
+            cands = data.get("candidates")
+            return list(cands) if isinstance(cands, list) else []
+        return list(data) if isinstance(data, list) else []
+
+
+def _is_cjk_bigram(tok: str) -> bool:
+    return len(tok) == 2 and "\u4e00" <= tok[0] <= "\u9fff" and "\u4e00" <= tok[1] <= "\u9fff"
+
+
+def _chained_cjk_pairs(ordered_tokens: list[str]) -> list[tuple[str, str]]:
+    """Return adjacent overlapping CJK bigram pairs `(b0, b1)` (`b0[1] == b1[0]`) representing >=3-char compounds."""
+    cjk_seq = [t for t in ordered_tokens if _is_cjk_bigram(t)]
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for i in range(len(cjk_seq) - 1):
+        a, b = cjk_seq[i], cjk_seq[i + 1]
+        if a[1] == b[0] and (a, b) not in seen:
+            seen.add((a, b))
+            pairs.append((a, b))
+    return pairs
+
+
+def _detect_bridge_bigrams(ordered_tokens: list[str], q_df: dict[str, int], n_sources: int) -> set[str]:
+    """Identify low-DF cross-word transition bigrams flanked by established domain bigrams."""
+    if n_sources < 5:
+        return set()
+    cjk_seq = [t for t in ordered_tokens if _is_cjk_bigram(t)]
+    bridges: set[str] = set()
+    for i in range(1, len(cjk_seq) - 1):
+        left, mid, right = cjk_seq[i - 1], cjk_seq[i], cjk_seq[i + 1]
+        if left[1] == mid[0] and mid[1] == right[0]:
+            df_l = q_df.get(left, 0)
+            df_m = q_df.get(mid, 0)
+            df_r = q_df.get(right, 0)
+            if df_m <= 1 and df_l >= 3 and df_r >= 3 and df_m * 3 <= min(df_l, df_r):
+                bridges.add(mid)
+    return bridges
+
+
+def _prune_stage1_probe_tokens(
+    probe_tokens: list[str],
+    q_df: dict[str, int],
+    n_sources: int,
+    *,
+    max_df_ratio: float = 0.25,
+    min_sources: int = 30,
+) -> list[str]:
+    """Corpus-guarded pruning of ultra-high-DF CJK bigrams from Stage-1 `OR` scans."""
+    if n_sources < min_sources or len(probe_tokens) <= 2:
+        return probe_tokens
+    anchors = [
+        t for t in probe_tokens
+        if not _is_cjk_bigram(t) or (q_df.get(t, 0) / n_sources) <= max_df_ratio
+    ]
+    if not anchors:
+        # All tokens are high-DF CJK bigrams: keep at least the 2 most selective tokens
+        ranked = sorted(probe_tokens, key=lambda t: (q_df.get(t, n_sources), t))
+        return ranked[: max(2, min(4, len(ranked)))]
+    if len(anchors) >= 2:
+        return anchors
+    # Preserve a >=2 token floor by keeping the next lowest-DF token alongside the single anchor
+    rest = sorted((t for t in probe_tokens if t not in anchors), key=lambda t: (q_df.get(t, n_sources), t))
+    return [*anchors, *rest[: 2 - len(anchors)]]
+
+
 _LAYER_ROOT_NAMES = frozenset({"sources", "史料", "mirrors", "史料_md", "wiki", "知识库", "notes", "记忆"})
 
 
@@ -296,20 +491,23 @@ def _compute_distinctive_groups(
     q_df: dict[str, int],
     n_sources: int,
     idf_ratio: float,
+    *,
+    bridge_bigrams: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[set[str]], set[str]]:
     if not q_idf:
         return [], set()
     if n_sources >= 20:
-        stable = [v for t, v in q_idf.items() if q_df.get(t, 0) >= 2]
+        stable = [v for t, v in q_idf.items() if q_df.get(t, 0) >= 2 and t not in bridge_bigrams]
         max_idf = max(stable) if stable else max(q_idf.values())
     else:
-        max_idf = max(q_idf.values())
+        non_bridge = [v for t, v in q_idf.items() if t not in bridge_bigrams]
+        max_idf = max(non_bridge) if non_bridge else max(q_idf.values())
     thresh = max_idf * idf_ratio
     dist_groups: list[set[str]] = []
     dist_tokens: set[str] = set()
     seen: set[frozenset[str]] = set()
     for grp in groups:
-        matched = {t for t in grp if t in q_idf and q_idf[t] >= thresh}
+        matched = {t for t in grp if t in q_idf and q_idf[t] >= thresh and t not in bridge_bigrams}
         if not matched:
             continue
         fz = frozenset(matched)
@@ -490,7 +688,7 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
                 text_z BLOB NOT NULL
             );
             CREATE INDEX idx_units_source ON units(source);
-            CREATE VIRTUAL TABLE fts_units USING fts5(head, body, tokenize='ascii');
+            CREATE VIRTUAL TABLE fts_units USING fts5(head, body, acl_pfx, tokenize='ascii');
             """
             + _WIKI_SCHEMA_SQL
         )
@@ -543,7 +741,11 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
             )
             fts_head = " ".join(encode_fts_token(t) for t in (*head_toks, *fname_toks))
             fts_body = " ".join(encode_fts_token(t) for t in body_toks)
-            con.execute("INSERT INTO fts_units(rowid, head, body) VALUES (?, ?, ?)", (uid, fts_head, fts_body))
+            fts_acl = " ".join(source_acl_prefix_tokens(src))
+            con.execute(
+                "INSERT INTO fts_units(rowid, head, body, acl_pfx) VALUES (?, ?, ?, ?)",
+                (uid, fts_head, fts_body, fts_acl),
+            )
 
         avg_dl = (total_dl / len(layer2_rows)) if layer2_rows else 1.0
         con.executemany(
@@ -578,6 +780,10 @@ class BM25Index:
     FILENAME_BOOST = 1.6
     COVERAGE_ALPHA = 1.6
     COVERAGE_IDF_RATIO = 0.45
+    CHAIN_COHESION_BONUS = 0.08
+    MAX_CHAIN_COHESION_BONUS = 0.24
+    HIGH_DF_BIGRAM_RATIO = 0.25
+    HIGH_DF_PRUNE_MIN_SOURCES = 30
     MAX_READ_POOL_SIZE = 16
 
     def __init__(
@@ -586,6 +792,7 @@ class BM25Index:
         *,
         backend: str = "auto",
         exclude_patterns: tuple[str, ...] | None = None,
+        candidate_backend: SearchCandidateBackend | None = None,
     ):
         self.cfg = VaultConfig.load(vault)
         self.vault = self.cfg.root
@@ -594,8 +801,14 @@ class BM25Index:
         )
         self._backend_pref = backend
         self.backend_name = "memory"
+        if candidate_backend is not None:
+            self.candidate_backend: SearchCandidateBackend | None = candidate_backend
+        else:
+            env_cand_url = os.environ.get("WCTX_HYBRID_CANDIDATE_URL", "").strip()
+            self.candidate_backend = HttpCandidateBackend(env_cand_url) if env_cand_url else None
 
         self._sqlite_path: Path | None = None
+        self._has_acl_pfx = False
         self._con_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=self.MAX_READ_POOL_SIZE)
         self._all_cons: set[sqlite3.Connection] = set()
         self._con_lock = threading.Lock()
@@ -701,6 +914,8 @@ class BM25Index:
             try:
                 with self._borrow_con() as con:
                     check_index_compatibility(gen_dir, con)
+                    fts_cols = {str(r[1]) for r in con.execute("PRAGMA table_info('fts_units')").fetchall()}
+                    self._has_acl_pfx = "acl_pfx" in fts_cols
                     meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
                     n_u = int(meta_map.get("n_units", "0"))
                     w_meta = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
@@ -830,14 +1045,52 @@ class BM25Index:
 
     # -- Public Search APIs ------------------------------------------------- #
 
-    def search(self, query: str, *, k: int = 8, kind: str | None = None, max_per_source: int = 2) -> list[dict]:
+    def _fetch_external_rrf_boosts(
+        self,
+        query_text: str,
+        q_counts: dict[str, float],
+        *,
+        limit: int = 32,
+    ) -> list[tuple[Any, float, float]]:
+        if self.candidate_backend is None:
+            return []
+        q_str = query_text or " ".join(q_counts.keys())
+        raw = self.candidate_backend.fetch_candidates(q_str, q_counts, limit=limit)
+        if not raw:
+            return []
+        rrf_k = int(getattr(self.candidate_backend, "rrf_k", 60))
+        rrf_scale = float(getattr(self.candidate_backend, "rrf_scale", 180.0))
+        sem_floor = float(getattr(self.candidate_backend, "semantic_floor", 3.2))
+        boosts: list[tuple[Any, float, float]] = []
+        for rank, item in enumerate(raw):
+            rrf_val = rrf_scale / (rrf_k + rank + 1)
+            boosts.append((item, rrf_val, sem_floor))
+        return boosts
+
+    def search(
+        self,
+        query: str,
+        *,
+        k: int = 8,
+        kind: str | None = None,
+        max_per_source: int = 2,
+        acl_filter: ACLFilter | None = None,
+    ) -> list[dict]:
         if kind == "wiki":
             return self.search_wiki(query, k=k, max_per_source=max_per_source)
         q_toks, groups = tokenize_query(query)
-        if not q_toks:
-            return []
         q_counts = {t: float(c) for t, c in Counter(q_toks).items()}
-        return self.search_weighted(q_counts, groups, k=k, kind=kind, max_per_source=max_per_source)
+        if not q_counts and self.candidate_backend is None:
+            return []
+        return self.search_weighted(
+            q_counts,
+            groups,
+            k=k,
+            kind=kind,
+            max_per_source=max_per_source,
+            acl_filter=acl_filter,
+            query_text=query,
+        )
 
     def search_weighted(
         self,
@@ -847,12 +1100,32 @@ class BM25Index:
         k: int = 8,
         kind: str | None = None,
         max_per_source: int = 2,
+        acl_filter: ACLFilter | None = None,
+        query_text: str = "",
     ) -> list[dict]:
-        if not q_counts or k <= 0:
+        if k <= 0 or (not q_counts and self.candidate_backend is None):
+            return []
+        if acl_filter is not None and acl_filter.deny_all:
             return []
         if self.backend_name == "sqlite":
-            return self._search_l2_sqlite(q_counts, groups, k=k, kind=kind, max_per_source=max_per_source)
-        return self._search_l2_memory(q_counts, groups, k=k, kind=kind, max_per_source=max_per_source)
+            return self._search_l2_sqlite(
+                q_counts,
+                groups,
+                k=k,
+                kind=kind,
+                max_per_source=max_per_source,
+                acl_filter=acl_filter,
+                query_text=query_text,
+            )
+        return self._search_l2_memory(
+            q_counts,
+            groups,
+            k=k,
+            kind=kind,
+            max_per_source=max_per_source,
+            acl_filter=acl_filter,
+            query_text=query_text,
+        )
 
     def _search_l2_memory(
         self,
@@ -862,6 +1135,8 @@ class BM25Index:
         k: int,
         kind: str | None,
         max_per_source: int,
+        acl_filter: ACLFilter | None = None,
+        query_text: str = "",
     ) -> list[dict]:
         if not self.units:
             return []
@@ -873,10 +1148,17 @@ class BM25Index:
             if df > 0:
                 q_df[tok] = df
                 q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
-        if not q_idf:
+
+        ext_boosts = self._fetch_external_rrf_boosts(query_text, q_counts, limit=max(k * 2, 24))
+        if not q_idf and not ext_boosts:
             return []
 
-        dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
+        ordered_q = list(q_counts)
+        bridges = _detect_bridge_bigrams(ordered_q, q_df, n)
+        chain_pairs = _chained_cjk_pairs(ordered_q)
+        dist_groups, dist_tokens = _compute_distinctive_groups(
+            groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO, bridge_bigrams=bridges
+        )
         scores: dict[int, float] = defaultdict(float)
         covered: dict[int, set[str]] = defaultdict(set)
 
@@ -884,13 +1166,18 @@ class BM25Index:
             idf = q_idf.get(tok)
             if idf is None:
                 continue
+            eff_qw = qw * 0.35 if tok in bridges else qw
             is_dist = tok in dist_tokens
             for idx, tf in self.postings.get(tok, {}).items():
-                if kind and self.units[idx].get("kind") != kind:
+                u_meta = self.units[idx]
+                if kind and u_meta.get("kind") != kind:
                     continue
+                if acl_filter is not None and not acl_filter.allow_all:
+                    if not acl_filter.allows_source(u_meta.get("source") or ""):
+                        continue
                 dl = self.lengths[idx] or 1
                 denom = tf + self.K1 * (1 - self.B + self.B * dl / (self.avg_len or 1.0))
-                scores[idx] += qw * idf * (tf * (self.K1 + 1)) / denom
+                scores[idx] += eff_qw * idf * (tf * (self.K1 + 1)) / denom
                 if is_dist and tok in self.body_tok_sets[idx]:
                     covered[idx].add(tok)
 
@@ -900,6 +1187,50 @@ class BM25Index:
                 hit_g = sum(1 for g in dist_groups if g & cov)
                 if hit_g:
                     scores[idx] *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
+            if chain_pairs:
+                bset = self.body_tok_sets[idx]
+                c_hits = sum(1 for a, b in chain_pairs if a in bset and b in bset)
+                if c_hits:
+                    scores[idx] *= 1.0 + min(self.MAX_CHAIN_COHESION_BONUS, self.CHAIN_COHESION_BONUS * c_hits)
+
+        hybrid_marked: set[int] = set()
+        if ext_boosts:
+            src_to_indices: dict[str, list[int]] = defaultdict(list)
+            for idx, u_meta in enumerate(self.units):
+                src_to_indices[u_meta.get("source") or ""].append(idx)
+            for cand_ref, rrf_val, sem_floor in ext_boosts:
+                resolved_idxs: list[int] = []
+                if isinstance(cand_ref, int) and 1 <= cand_ref <= len(self.units):
+                    resolved_idxs = [cand_ref - 1]
+                elif isinstance(cand_ref, str):
+                    resolved_idxs = src_to_indices.get(cand_ref, [])[:2]
+                elif isinstance(cand_ref, dict):
+                    cid = cand_ref.get("id")
+                    csrc = str(cand_ref.get("source") or "")
+                    cls = cand_ref.get("line_start")
+                    if isinstance(cid, int) and 1 <= cid <= len(self.units):
+                        resolved_idxs = [cid - 1]
+                    elif csrc in src_to_indices:
+                        pool = src_to_indices[csrc]
+                        if isinstance(cls, int):
+                            exact = [i for i in pool if self.units[i].get("line_start") == cls]
+                            resolved_idxs = exact or pool[:1]
+                        else:
+                            resolved_idxs = pool[:2]
+                for r_idx in resolved_idxs:
+                    u_meta = self.units[r_idx]
+                    src_val = u_meta.get("source") or ""
+                    if self._excluded(src_val):
+                        continue
+                    if kind and u_meta.get("kind") != kind:
+                        continue
+                    if acl_filter is not None and not acl_filter.allow_all and not acl_filter.allows_source(src_val):
+                        continue
+                    if scores[r_idx] <= 0.0:
+                        scores[r_idx] = sem_floor + rrf_val
+                    else:
+                        scores[r_idx] += rrf_val
+                    hybrid_marked.add(r_idx)
 
         top_pairs = heapq.nlargest(max(k * 6, 40), scores.items(), key=lambda kv: kv[1])
         scored_meta = [(idx, sc, self.units[idx]) for idx, sc in top_pairs]
@@ -911,6 +1242,8 @@ class BM25Index:
             u["score"] = round(sc, 4)
             u["matched"] = sorted(t for t in qt_set if idx in self.postings.get(t, ()))[:12]
             u["_q_idf"] = q_idf
+            if idx in hybrid_marked:
+                u["via_hybrid_rrf"] = True
             out.append(u)
         return out
 
@@ -922,7 +1255,10 @@ class BM25Index:
         k: int,
         kind: str | None,
         max_per_source: int,
+        acl_filter: ACLFilter | None = None,
+        query_text: str = "",
     ) -> list[dict]:
+        ext_boosts = self._fetch_external_rrf_boosts(query_text, q_counts, limit=max(k * 2, 24))
         with self._borrow_con() as con:
             meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
             n_units = int(meta_map.get("n_units", "0"))
@@ -932,9 +1268,15 @@ class BM25Index:
             avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
 
             unique_q = list(q_counts)
-            ph = ",".join("?" for _ in unique_q)
-            rows = con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", unique_q).fetchall()
-            if not rows:
+            rows = (
+                con.execute(
+                    f"SELECT tok, df_sources FROM vocab WHERE tok IN ({','.join('?' for _ in unique_q)})",
+                    unique_q,
+                ).fetchall()
+                if unique_q
+                else []
+            )
+            if not rows and not ext_boosts:
                 return []
 
             q_idf: dict[str, float] = {}
@@ -943,37 +1285,141 @@ class BM25Index:
                 if df > 0:
                     q_df[tok] = df
                     q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
-            if not q_idf:
+            if not q_idf and not ext_boosts:
                 return []
 
-            dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
-            probe_toks = list(dist_tokens) if dist_tokens else list(q_idf)
-            or_expr = " OR ".join(encode_fts_token(t) for t in probe_toks)
-            cand_set: set[int] = {
-                rid for (rid,) in con.execute(
-                    "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 800",
-                    (or_expr,),
+            bridges = _detect_bridge_bigrams(unique_q, q_df, n)
+            chain_pairs = _chained_cjk_pairs(unique_q)
+            dist_groups, dist_tokens = _compute_distinctive_groups(
+                groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO, bridge_bigrams=bridges
+            )
+
+            use_fts_acl = bool(self._has_acl_pfx and acl_filter is not None and not acl_filter.allow_all and acl_filter.exact_fts)
+            scoped_cols = self._has_acl_pfx
+            bm25_expr = "bm25(fts_units, 3.0, 1.0, 0.0)" if scoped_cols else "bm25(fts_units, 3.0, 1.0)"
+            need_legacy_acl_oversample = bool(
+                acl_filter is not None and not acl_filter.allow_all and not use_fts_acl
+            )
+            stage1_or_limit = 2400 if need_legacy_acl_oversample else 800
+
+            def _run_fts(lex_expr: str, limit_n: int) -> list[int]:
+                if not lex_expr:
+                    return []
+                fts_q = (
+                    acl_filter.wrap_fts_query(lex_expr, scoped_cols=scoped_cols)
+                    if acl_filter is not None
+                    else (f"({{head body}} : ({lex_expr}))" if scoped_cols else lex_expr)
                 )
-            }
-            if len(dist_groups) >= 2:
-                and_clauses = ["(" + " OR ".join(encode_fts_token(t) for t in g if t in q_idf) + ")" for g in dist_groups]
-                and_clauses = [c for c in and_clauses if c != "()"]
-                if len(and_clauses) >= 2:
-                    and_expr = " AND ".join(and_clauses)
-                    cand_set.update(
-                        rid for (rid,) in con.execute(
-                            "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 400",
-                            (and_expr,),
-                        )
+                return [
+                    rid
+                    for (rid,) in con.execute(
+                        f"SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY {bm25_expr} LIMIT ?",
+                        (fts_q, limit_n),
                     )
-            if not cand_set:
-                all_or = " OR ".join(encode_fts_token(t) for t in q_idf)
-                cand_set.update(
-                    rid for (rid,) in con.execute(
-                        "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 500",
-                        (all_or,),
-                    )
+                ]
+
+            cand_set: set[int] = set()
+            if q_idf:
+                raw_probe = list(dist_tokens) if dist_tokens else list(q_idf)
+                probe_toks = _prune_stage1_probe_tokens(
+                    raw_probe,
+                    q_df,
+                    n,
+                    max_df_ratio=self.HIGH_DF_BIGRAM_RATIO,
+                    min_sources=self.HIGH_DF_PRUNE_MIN_SOURCES,
                 )
+
+                # 1. Conjunctive leapfrog first (`AND` across distinctive concept groups skips 90%+ postings in C)
+                if len(dist_groups) >= 2:
+                    and_clauses = [
+                        "(" + " OR ".join(encode_fts_token(t) for t in g if t in q_idf) + ")"
+                        for g in dist_groups
+                    ]
+                    and_clauses = [c for c in and_clauses if c != "()"]
+                    if len(and_clauses) >= 2:
+                        # Cap at top-4 highest-IDF groups so noisy 6-group long queries don't over-constrain AND
+                        if len(and_clauses) > 4:
+                            ranked_g = sorted(
+                                dist_groups,
+                                key=lambda g: max((q_idf.get(t, 0.0) for t in g), default=0.0),
+                                reverse=True,
+                            )[:4]
+                            and_clauses = [
+                                "(" + " OR ".join(encode_fts_token(t) for t in g if t in q_idf) + ")"
+                                for g in ranked_g
+                            ]
+                        cand_set.update(_run_fts(" AND ".join(and_clauses), 400))
+
+                # 2. Disjunctive rescue: if large vault already has rich multi-concept hits, probe top-3 rarest anchors;
+                #    otherwise run full pruned OR probe.
+                if n_units >= 5_000 and len(cand_set) >= max(k * 4, 120):
+                    rare_anchors = sorted(probe_toks, key=lambda t: (q_df.get(t, n), -q_idf.get(t, 0.0)))[:3]
+                    if rare_anchors:
+                        cand_set.update(_run_fts(" OR ".join(encode_fts_token(t) for t in rare_anchors), 300))
+                else:
+                    or_expr = " OR ".join(encode_fts_token(t) for t in probe_toks)
+                    cand_set.update(_run_fts(or_expr, stage1_or_limit))
+
+                # 3. Large-corpus exact-phrase rescue when Stage-1 OR hit its cap
+                if n_units >= 5_000 and len(cand_set) >= 600 and chain_pairs:
+                    valid_phrases = [
+                        f'"{encode_fts_token(a)} {encode_fts_token(b)}"'
+                        for a, b in chain_pairs
+                        if a in q_idf and b in q_idf
+                    ]
+                    if valid_phrases:
+                        cand_set.update(_run_fts(" OR ".join(valid_phrases[:6]), 150))
+
+                # 4. Under-filled fallback (`< k*2` candidates, or legacy 2-col index needing post-ACL breadth):
+                #    broaden to all in-vocab query tokens for parity with memory backend.
+                if (len(cand_set) < max(k * 2, 16) or need_legacy_acl_oversample) and len(q_idf) > len(probe_toks):
+                    all_or = " OR ".join(encode_fts_token(t) for t in q_idf)
+                    cand_set.update(_run_fts(all_or, stage1_or_limit))
+
+            rrf_by_uid: dict[int, tuple[float, float]] = {}
+            if ext_boosts:
+                for cand_ref, rrf_val, sem_floor in ext_boosts:
+                    resolved_uids: list[int] = []
+                    if isinstance(cand_ref, int) and 1 <= cand_ref <= n_units:
+                        resolved_uids = [cand_ref]
+                    elif isinstance(cand_ref, str):
+                        resolved_uids = [
+                            r[0]
+                            for r in con.execute(
+                                "SELECT id FROM units WHERE source = ? ORDER BY id LIMIT 2", (cand_ref,)
+                            ).fetchall()
+                        ]
+                    elif isinstance(cand_ref, dict):
+                        cid = cand_ref.get("id")
+                        csrc = str(cand_ref.get("source") or "")
+                        cls = cand_ref.get("line_start")
+                        if isinstance(cid, int) and 1 <= cid <= n_units:
+                            resolved_uids = [cid]
+                        elif csrc:
+                            if isinstance(cls, int):
+                                resolved_uids = [
+                                    r[0]
+                                    for r in con.execute(
+                                        "SELECT id FROM units WHERE source = ? AND line_start = ? LIMIT 1",
+                                        (csrc, cls),
+                                    ).fetchall()
+                                ]
+                            if not resolved_uids:
+                                resolved_uids = [
+                                    r[0]
+                                    for r in con.execute(
+                                        "SELECT id FROM units WHERE source = ? ORDER BY id LIMIT 2",
+                                        (csrc,),
+                                    ).fetchall()
+                                ]
+                    for r_uid in resolved_uids:
+                        cand_set.add(r_uid)
+                        prev = rrf_by_uid.get(r_uid)
+                        if prev is None:
+                            rrf_by_uid[r_uid] = (rrf_val, sem_floor)
+                        else:
+                            rrf_by_uid[r_uid] = (prev[0] + rrf_val, max(prev[1], sem_floor))
+
             if not cand_set:
                 return []
 
@@ -992,6 +1438,8 @@ class BM25Index:
                     continue
                 if self._excluded(source):
                     continue
+                if acl_filter is not None and not acl_filter.allow_all and not acl_filter.allows_source(source):
+                    continue
                 tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
                 body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
                 sc = 0.0
@@ -1005,17 +1453,27 @@ class BM25Index:
                     idf = q_idf.get(tok)
                     if idf is None:
                         continue
-                    sc += qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
+                    eff_qw = qw * 0.35 if tok in bridges else qw
+                    sc += eff_qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
                     matched_toks.append(tok)
                     if tok in dist_tokens and tok in body_set:
                         cov_toks.add(tok)
+                if sc > 0.0:
+                    if dist_groups and cov_toks:
+                        hit_g = sum(1 for g in dist_groups if g & cov_toks)
+                        if hit_g:
+                            sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
+                    if chain_pairs:
+                        c_hits = sum(1 for a, b in chain_pairs if a in body_set and b in body_set)
+                        if c_hits:
+                            sc *= 1.0 + min(self.MAX_CHAIN_COHESION_BONUS, self.CHAIN_COHESION_BONUS * c_hits)
+                rrf_entry = rrf_by_uid.get(uid)
+                if rrf_entry is not None:
+                    rrf_val, sem_floor = rrf_entry
+                    sc = (sem_floor + rrf_val) if sc <= 0.0 else (sc + rrf_val)
                 if sc <= 0.0:
                     continue
-                if dist_groups and cov_toks:
-                    hit_g = sum(1 for g in dist_groups if g & cov_toks)
-                    if hit_g:
-                        sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
-                scored_meta.append((uid, sc, {
+                meta_item: dict[str, Any] = {
                     "kind": ukind,
                     "source": source,
                     "heading": heading,
@@ -1024,7 +1482,10 @@ class BM25Index:
                     "line_end": le,
                     "page_num": pnum,
                     "mirror": mirror,
-                }))
+                }
+                if rrf_entry is not None:
+                    meta_item["via_hybrid_rrf"] = True
+                scored_meta.append((uid, sc, meta_item))
                 matched_map[uid] = sorted(matched_toks)[:12]
 
             scored_meta.sort(key=lambda x: x[1], reverse=True)
@@ -1108,8 +1569,11 @@ class BM25Index:
                 hit_g = sum(1 for g in dist_groups if g & cov)
                 if hit_g:
                     scores[idx] *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
-            if self.wiki_units[idx].get("freshness") in {"stale", "missing"}:
+            w_fresh = self.wiki_units[idx].get("freshness")
+            if w_fresh in {"stale", "missing"}:
                 scores[idx] *= 0.5
+            elif w_fresh == "unverified":
+                scores[idx] *= 0.85
             if _is_wiki_footer_heading(self.wiki_units[idx].get("heading") or ""):
                 scores[idx] *= 0.30
 
@@ -1200,6 +1664,8 @@ class BM25Index:
                         sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
                 if freshness in {"stale", "missing"}:
                     sc *= 0.5
+                elif freshness == "unverified":
+                    sc *= 0.85
                 if _is_wiki_footer_heading(heading or ""):
                     sc *= 0.30
                 scored_meta.append((uid, sc, {

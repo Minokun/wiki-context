@@ -85,7 +85,7 @@ def split_markdown_sections(raw_text: str) -> list[dict]:
     Line numbers (`line_start`, `line_end`) are 1-based over ``raw_text`` (including frontmatter)
     so ``wiki_read(start=line_start, end=line_end)`` aligns to the exact file lines.
     """
-    all_lines = raw_text.split("\n")
+    all_lines = raw_text.splitlines()
     fm_lines = 0
     if raw_text.startswith("---\n") or raw_text.startswith("---\r\n"):
         for idx in range(1, len(all_lines)):
@@ -250,7 +250,11 @@ def _compute_primary_signature(cfg: VaultConfig) -> str:
     h.update(f"schema={SCHEMA_VERSION};policy={POLICY_VERSION};".encode("utf-8"))
     h.update(json.dumps(cfg.config_signature_dict(), sort_keys=True).encode("utf-8"))
 
-    for meta_file in (cfg.mirrors_root / ".manifest.json", cfg.mirrors_root / ".failed.json"):
+    for meta_file in (
+        cfg.mirrors_root / ".manifest.json",
+        cfg.mirrors_root / ".failed.json",
+        cfg.mirrors_root / ".skipped_media.json",
+    ):
         if meta_file.is_file():
             h.update(meta_file.read_bytes())
 
@@ -659,6 +663,7 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
                 "source_hash": source_hash,
                 "converter": converter,
                 "chars": len(body),
+                "lines": len(raw.splitlines()),
                 "pages": len(page_rows),
                 "sections": len(sec_rows),
                 "visual_pages": visual_pages,
@@ -744,6 +749,16 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
         for d in docs:
             by_conv[d["converter"]] = by_conv.get(d["converter"], 0) + 1
 
+        skipped_media: dict = {}
+        skipped_media_path = cfg.mirrors_root / ".skipped_media.json"
+        if skipped_media_path.is_file():
+            try:
+                loaded_sm = json.loads(skipped_media_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_sm, dict):
+                    skipped_media = loaded_sm
+            except (OSError, ValueError):
+                skipped_media = {}
+
         summary = {
             "schema_version": SCHEMA_VERSION,
             "generator": "wiki-context",
@@ -761,6 +776,8 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
             "wiki_sections": len(wiki_sections),
             "policy_skipped": len(policy_skipped),
             "policy_skipped_sources": policy_skipped[:200],
+            "skipped_image_count": int(skipped_media.get("skipped_image_count") or 0),
+            "skipped_image_dirs": dict(list((skipped_media.get("skipped_image_dirs") or {}).items())[:80]),
             "oversized_skipped": oversized_skipped,
             "docs_with_visual": sum(1 for d in docs if d.get("visual_pages")),
             "failed_count": len(failed_map),

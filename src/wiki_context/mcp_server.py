@@ -16,7 +16,9 @@ import itertools
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,8 +27,9 @@ from typing import TYPE_CHECKING
 
 from . import __version__
 from .config import VaultConfig
-from .context import AccessPolicy, ContextPackEngine, Principal, SynonymBook, policy_for_vault
+from .context import AccessPolicy, ContextPackEngine, Principal, SynonymBook, compile_acl_filter, policy_for_vault
 from .policy import mirror_skip_reason
+from .state_lock import resolve_external_tool
 from .search import (
     BM25Index,
     IndexUnavailableError,
@@ -129,7 +132,10 @@ TOOLS_SPEC: list[dict] = [
     },
     {
         "name": "wiki_search",
-        "description": "Fine-grained BM25/FTS5 search returning primary hits (`hits`) and compiled Wiki hits (`wiki_hits`).",
+        "description": (
+            "Low-level lexical BM25/FTS5 lookup returning primary hits (`hits`) and compiled Wiki hits (`wiki_hits`). "
+            "Prefer `wiki_context` first for answering questions; use `wiki_search` only for targeted keyword probing when `wiki_context` is insufficient."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -172,7 +178,10 @@ TOOLS_SPEC: list[dict] = [
     },
     {
         "name": "wiki_list",
-        "description": "List indexed documents in the vault (with optional path substring filter).",
+        "description": (
+            "List indexed documents in the vault (with optional path substring filter). "
+            "For answering domain or factual questions, call `wiki_context` directly instead of listing files first."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -551,6 +560,33 @@ class KBService:
         e_idx = min(total, end)
         return all_lines[s_idx:e_idx], total
 
+    def build_server_instructions(self, *, slim_remote: bool = False) -> str:
+        cheatsheet = self.context_engine.domain_cheatsheet()
+        is_zh = self.cfg.layout == "zh"
+        if is_zh:
+            ref_part = f" {cheatsheet}。" if cheatsheet else ""
+            search_note = (
+                "仅在用户明确要求枚举库内文档时才调 `wiki_list`。"
+                if slim_remote
+                else "仅在用户明确要求列出文件，或 `wiki_context` 未命中需做底层词面排查时，才使用 `wiki_list` / `wiki_search`。"
+            )
+            return (
+                f"知识库「{self.cfg.name}」（wiki-context）。{ref_part}\n"
+                f"- 回答问题时首选且单独调用一次 `wiki_context`（已融合同义词对齐、编译综述、一手原文与缺口诊断），不要在首轮并行陪跑 `wiki_search` 或 `wiki_list`；请直接传入自然提问，勿在提问末尾堆砌通用字段清单。\n"
+                f"- 仅当 `wiki_context` 片段标注「继续深读」需补全上下文时调用 `wiki_read`；需核对扫描件、印章、图表或 PDF 原页版式时调用 `wiki_inspect_visual`（支持 `asset=\"page-001.png\"` 按页渲染 PDF）。{search_note}"
+            )
+        ref_en = f" {cheatsheet}." if cheatsheet else ""
+        search_en = (
+            "Call `wiki_list` ONLY when explicitly asked to list vault files."
+            if slim_remote
+            else "Use `wiki_list` / `wiki_search` ONLY when explicitly listing files or probing exact keywords after `wiki_context`."
+        )
+        return (
+            f"Knowledge vault '{self.cfg.name}' (wiki-context).{ref_en}\n"
+            f"- Call `wiki_context` first as a single standalone call to answer domain or factual questions; do NOT run `wiki_search` or `wiki_list` in parallel alongside it.\n"
+            f"- Follow `wiki_read` hints only when an excerpt is truncated; use `wiki_inspect_visual` to inspect figures, standalone images, or rendered PDF pages (`asset=\"page-001.png\"`). {search_en}"
+        )
+
     def build_tools_spec(self, *, slim_remote: bool = False) -> list[dict]:
         cheatsheet = self.context_engine.domain_cheatsheet()
         is_zh = self.cfg.layout == "zh"
@@ -613,11 +649,12 @@ class KBService:
             return {"error": f"Unsupported kind: {kind}"}
 
         decision = route(query)
+        acl_filter = compile_acl_filter(self.policy, user)
         if kind == "wiki":
             w_raw = snap.index.search_wiki(query, k=k)
             l2_raw = []
         else:
-            l2_raw = snap.index.search(query, k=k * 2, kind=kind)
+            l2_raw = snap.index.search(query, k=k * 2, kind=kind, acl_filter=acl_filter)
             w_raw = snap.index.search_wiki(query, k=2) if kind is None else []
 
         hits: list[dict] = []
@@ -856,31 +893,34 @@ class KBService:
 
         rel_s = self.cfg.strip_source_prefix(norm_src)
         assets = list(snap.assets_by_source.get(norm_src) or ())
+        req_asset = str(args.get("asset") or "").strip()
 
-        # Also support direct standalone images inside primary/mounted sources even if not yet mirrored
+        # Support direct standalone images AND on-demand PDF page rendering inside primary/mounted sources
         resolved_src = self.cfg.resolve_source_rel(rel_s)
         raw_file, s_root = resolved_src if resolved_src is not None else (None, None)
-        if (
-            not assets
-            and raw_file is not None
+        valid_raw = (
+            raw_file is not None
             and s_root is not None
             and s_root in raw_file.parents
             and raw_file.is_file()
             and not raw_file.is_symlink()
-        ):
-            if raw_file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        )
+        if not assets and valid_raw and raw_file is not None:
+            ext_low = raw_file.suffix.lower()
+            if ext_low in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                 mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
                 assets = [{
                     "asset_id": raw_file.name,
                     "name": raw_file.name,
                     "source_direct": True,
-                    "mime": mime_map.get(raw_file.suffix.lower(), "image/png"),
+                    "mime": mime_map.get(ext_low, "image/png"),
                 }]
+            elif ext_low == ".pdf":
+                return self._render_pdf_page_on_demand(snap, norm_src, raw_file, req_asset)
 
         if not assets:
             return {"error": f"No extractable visual assets found for {norm_src}"}, True
 
-        req_asset = str(args.get("asset") or "").strip()
         chosen = assets[0]
         if req_asset:
             matched = next((a for a in assets if a.get("asset_id") == req_asset or a.get("name") == req_asset), None)
@@ -932,6 +972,89 @@ class KBService:
             {"type": "image", "data": base64.b64encode(img_bytes).decode("ascii"), "mimeType": mime},
         ]
         return blocks, False
+
+    def _render_pdf_page_on_demand(
+        self, snap: KBSnapshot, norm_src: str, pdf_file: Path, req_asset: str
+    ) -> tuple[list[dict] | dict, bool]:
+        known_pages = next(
+            (int(d.get("pages") or 0) for d in snap.docs if d.get("source") == norm_src),
+            0,
+        )
+        if not req_asset:
+            page_no = 1
+        else:
+            m = re.match(r"^(?:page[-_]?)?(\d+)(?:\.png)?$", req_asset, re.I)
+            if not m:
+                avail = [f"page-{i:03d}.png" for i in range(1, max(1, min(known_pages, 24)) + 1)]
+                return {
+                    "error": f"Visual asset '{req_asset}' not found for {norm_src} (use e.g. 'page-001.png')",
+                    "available_assets": avail,
+                }, True
+            page_no = int(m.group(1))
+        if page_no < 1 or page_no > 200:
+            return {"error": f"Requested page {page_no} out of supported range (1..200)"}, True
+        if known_pages > 0 and page_no > known_pages:
+            return {
+                "error": f"Page {page_no} exceeds document page count ({known_pages}) for {norm_src}",
+                "available_assets": [f"page-{i:03d}.png" for i in range(1, min(known_pages, 24) + 1)],
+            }, True
+
+        img_bytes: bytes | None = None
+        pdftoppm = resolve_external_tool("pdftoppm")
+        with tempfile.TemporaryDirectory(prefix="wctx-pdfvis-") as td:
+            td_path = Path(td)
+            if pdftoppm:
+                out_stem = td_path / f"page-{page_no:03d}"
+                try:
+                    proc = subprocess.run(
+                        [
+                            pdftoppm, "-png", "-r", "144", "-singlefile",
+                            "-f", str(page_no), "-l", str(page_no),
+                            str(pdf_file), str(out_stem),
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    png_file = td_path / f"page-{page_no:03d}.png"
+                    if proc.returncode == 0 and png_file.is_file():
+                        img_bytes = png_file.read_bytes()
+                except (OSError, subprocess.TimeoutExpired):
+                    img_bytes = None
+            if img_bytes is None and sys.platform == "darwin" and page_no == 1 and Path("/usr/bin/sips").is_file():
+                png_file = td_path / "page-001.png"
+                try:
+                    proc = subprocess.run(
+                        ["/usr/bin/sips", "-s", "format", "png", str(pdf_file), "--out", str(png_file)],
+                        capture_output=True,
+                        timeout=20,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and png_file.is_file():
+                        img_bytes = png_file.read_bytes()
+                except (OSError, subprocess.TimeoutExpired):
+                    img_bytes = None
+
+        if not img_bytes:
+            return {"error": f"No extractable visual assets found for {norm_src}"}, True
+        if len(img_bytes) > MAX_VISUAL_IMAGE_BYTES:
+            return {"error": f"Rendered PDF page exceeds {MAX_VISUAL_IMAGE_BYTES} bytes"}, True
+
+        asset_id = f"page-{page_no:03d}.png"
+        total_avail = max(known_pages, page_no)
+        meta_summary = {
+            "source": norm_src,
+            "asset": asset_id,
+            "page_num": page_no - 1,
+            "mime": "image/png",
+            "bytes": len(img_bytes),
+            "rendered_on_demand": True,
+            "available_assets": [f"page-{i:03d}.png" for i in range(1, min(total_avail, 24) + 1)],
+        }
+        return [
+            {"type": "text", "text": json.dumps(meta_summary, ensure_ascii=False)},
+            {"type": "image", "data": base64.b64encode(img_bytes).decode("ascii"), "mimeType": "image/png"},
+        ], False
 
     def tool_remember(self, args: dict, *, principal: Principal | None = None, is_remote: bool = False) -> dict:
         user = principal or Principal(uid=self.identity)
@@ -1172,6 +1295,7 @@ def handle_jsonrpc_message(
                 "protocolVersion": proto_ver,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": f"wiki-context ({svc.cfg.name})", "version": __version__},
+                "instructions": svc.build_server_instructions(slim_remote=slim_remote),
             },
         }
     if method == "ping":

@@ -20,10 +20,12 @@
 Default SQLite FTS5 tokenizers split technical identifiers (`RFC-042`, `TB/T-2075`, `HTTP-429`) on punctuation and cannot segment unspaced CJK text.
 
 `wiki-context` solves both without external NLP libraries (`search.py`):
-- **Pre-tokenization + `tokenize='ascii'`**: Alphanumeric codes are kept intact and safely escaped (`-` -> `_d_`, `/` -> `_s_`, `.` -> `_p_`) alongside component sub-tokens grouped into a single concept equivalence set; CJK text is segmented into overlapping 2-character bigrams with trailing modal-particle stripping.
-- **Two-Stage Per-Source BM25 Reranking**:
-  1. Stage 1 queries SQLite C-level `fts_units` (`bm25(fts_units, 3.0, 1.0)`) and `fts_wiki` to fetch candidate rowids in ~1 ms.
+- **Pre-tokenization + `tokenize='ascii'`**: Alphanumeric codes are kept intact and safely escaped (`-` -> `_d_`, `/` -> `_s_`, `.` -> `_p_`) alongside component sub-tokens grouped into a single concept equivalence set; CJK text is segmented into overlapping 2-character bigrams with trailing modal-particle stripping, statistical cross-word bridge-bigram discounting, and compound-chain cohesion bonuses.
+- **Two-Stage Per-Source BM25 Reranking + Stateless `acl_pfx` Intersection**:
+  1. Stage 1 queries SQLite C-level `fts_units(head, body, acl_pfx)` (`bm25(fts_units, 3.0, 1.0, 0.0)`) and `fts_wiki` using conjunctive leapfrog `AND` + corpus-guarded high-DF pruning + pre-LIMIT directory-prefix ACL intersection (`acl_pfx`), with an optional zero-dependency `HttpCandidateBackend` RRF seam (`WCTX_HYBRID_CANDIDATE_URL`).
   2. Stage 2 decompresses compact term-frequency maps (`tf_z`) and scores candidates using **document-level DF (`vocab.df_sources`)** so a single 300-page manual cannot flatten term IDF, applying a `COVERAGE_ALPHA` multiplier for multi-concept coverage.
+
+> For a deep-dive comparison against Elasticsearch, Meilisearch, and dense-vector RAG—plus 50,000-chunk scaling benchmarks—see [Retrieval Engine Technical Advancement & Breakthroughs](retrieval-breakthroughs.md) ([简体中文](retrieval-breakthroughs.zh-CN.md)).
 
 ---
 

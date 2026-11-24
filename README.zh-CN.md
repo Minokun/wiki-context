@@ -737,6 +737,7 @@ pip install certifi
 
 ## 详细技术文档
 
+- [检索引擎技术先进性与核心突破报告（对比 Elasticsearch / 向量 RAG + 5 万切片实测）](docs/retrieval-breakthroughs.zh-CN.md)
 - [核心架构与五步确定性检索供料原理](docs/architecture.md)
 - [知识库目录规范、单向同义词与 SHA-256 新鲜度机制](docs/vault-spec.md)
 - [多库 HTTP 网关、Token 鉴权与目录前缀权限（ACL）指南](docs/gateway-and-acl.md)

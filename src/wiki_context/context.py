@@ -24,13 +24,16 @@ from typing import Callable
 from .config import VaultConfig
 from .memory import MemoryNote, MemoryStore
 from .search import (
+    ACLFilter,
     BM25Index,
     CJK_RUN_RE,
     EN_STOPWORDS,
     LATIN_NUM_RE,
+    MAX_ACL_INDEX_DEPTH,
     NUM_MEASURE_RE,
     _MODAL_PARTICLE_SUFFIX_RE,
     _STOP_QUERY_PHRASE_RE,
+    encode_acl_prefix_token,
     is_excluded_source,
     route,
     tokenize,
@@ -196,6 +199,70 @@ def policy_for_vault(cfg: VaultConfig) -> AccessPolicy:
     return AllowAllPolicy()
 
 
+def compile_acl_filter(policy: AccessPolicy, principal: Principal) -> ACLFilter:
+    """Compile runtime hot-reloaded `AccessPolicy` + `Principal` into a C-level FTS5 `ACLFilter`."""
+    if isinstance(policy, AllowAllPolicy):
+        return ACLFilter(allow_all=True)
+    if isinstance(policy, PrefixACLPolicy):
+        if "admin" in principal.groups or "all" in principal.groups:
+            return ACLFilter(allow_all=True)
+        allow_toks: list[str] = []
+        deny_toks: list[str] = []
+        exact_fts = True
+        wild_allow = False
+        pred = lambda src: policy.can_access_source(principal, src)  # noqa: E731
+
+        for g in principal.groups:
+            rule = policy.group_rules.get(g) or {}
+            for d in rule.get("deny") or ():
+                d_str = str(d).strip()
+                clean_d = d_str.rstrip("*").rstrip("/").replace("\\", "/").strip("/")
+                if not clean_d and "*" in d_str:
+                    return ACLFilter(deny_all=True, predicate=pred)
+                if not clean_d:
+                    continue
+                if len([p for p in clean_d.split("/") if p and p != "."]) > MAX_ACL_INDEX_DEPTH:
+                    exact_fts = False
+                tok_d = encode_acl_prefix_token(clean_d)
+                if tok_d not in deny_toks:
+                    deny_toks.append(tok_d)
+
+            for a in rule.get("allow") or ():
+                a_str = str(a).strip()
+                clean_a = a_str.rstrip("*").rstrip("/").replace("\\", "/").strip("/")
+                if not clean_a and "*" in a_str:
+                    wild_allow = True
+                    continue
+                if not clean_a:
+                    continue
+                if len([p for p in clean_a.split("/") if p and p != "."]) > MAX_ACL_INDEX_DEPTH:
+                    exact_fts = False
+                tok_a = encode_acl_prefix_token(clean_a)
+                if tok_a not in allow_toks:
+                    allow_toks.append(tok_a)
+
+        if wild_allow:
+            allow_toks = ["acl_all"]
+        if not allow_toks:
+            # Empty allow-set under PrefixACLPolicy means all-deny (`outside_allowlist`)
+            return ACLFilter(deny_all=True, predicate=pred)
+        return ACLFilter(
+            allow_all=False,
+            deny_all=False,
+            allow_tokens=tuple(allow_toks),
+            deny_tokens=tuple(deny_toks),
+            exact_fts=exact_fts,
+            predicate=pred,
+        )
+
+    return ACLFilter(
+        allow_all=False,
+        deny_all=False,
+        exact_fts=False,
+        predicate=lambda src: policy.can_access_source(principal, src),
+    )
+
+
 # -- Hot-Reloading Synonym Book --------------------------------------------- #
 
 
@@ -292,8 +359,9 @@ _META_INQUIRY_RE = re.compile(
     r"(?:取值范围|测量范围|允许范围|标准范围|可能原因|主要原因|什么原因|根本原因|"
     r"结果不一致|不一致|是否有关联|有关联|是否有关系|检测手段|优先排查|重点检查|"
     r"需要预警|需要报警|注意事项|哪些方面|怎么处理|如何处理|如何确认|如何验证|什么时候|"
+    r"具体信息|详细信息|基本信息|具体内容|什么来着|来着|"
     r"(?:那你|请你|麻烦你|麻烦|帮我|给我|替我|请)?(?:大致|大概|简单|简要|详细|具体|全面|系统地?)?"
-    r"(?:讲解|介绍|讲讲|说说|聊聊|梳理|总结|概括|解释)(?:一下|下)?|"
+    r"(?:讲解|介绍|讲讲|说说|聊聊|梳理|总结|概括|解释|看一下|看看|查一下|查查|找一下|找找)(?:一下|下)?|"
     r"那你给我|请你帮我|麻烦帮我|给我输出出来|输出出来|"
     r"\b(?:what\s+is\s+the|what\s+are\s+the|can\s+you\s+explain|please\s+explain|"
     r"walk\s+me\s+through|tell\s+me\s+about|give\s+me\s+an?\s+overview\s+of|"
@@ -308,12 +376,17 @@ _GENERIC_CORE_WORDS = frozenset({
     "异常", "问题", "故障", "分析", "判断", "控制", "管理", "状态", "运行", "设备", "检查",
     "排查", "影响", "区别", "差异", "关联", "关系", "规则", "指标", "情况", "方法", "原因",
     "严重", "合格", "正常", "超标", "超限", "背景", "需求", "核心", "内容", "目标", "功能",
-    "定位", "概述", "简介", "结论", "结果",
+    "定位", "概述", "简介", "结论", "结果", "信息", "具体", "详情", "详细", "基本",
     "system", "service", "config", "configuration", "architecture", "design", "spec",
     "specification", "standard", "requirement", "requirements", "background", "overview",
     "summary", "status", "issue", "problem", "error", "method", "value", "values", "limit",
     "limits", "threshold", "range", "default", "policy", "rule", "rules", "process", "data",
 })
+
+_COMPOUND_HEAD_ANCHORS = frozenset({
+    "报告", "保单", "服务器", "数据库", "说明书", "手册", "合同", "清单", "配置", "账号",
+})
+_PAREN_ENUM_RE = re.compile(r"[（(]([^（）()]{4,160})[）)]")
 
 
 @dataclass
@@ -332,11 +405,15 @@ class QueryPlan:
 
 
 def _split_cjk_concept(run: str, anchors: tuple[str, ...]) -> list[str]:
-    if len(run) <= 4 or not anchors:
+    if len(run) <= 6 or not anchors:
         return [run]
     out: list[str] = []
     rem = run
     while rem:
+        if len(rem) <= 6:
+            if len(rem) >= 2:
+                out.append(rem)
+            break
         best_anchor = None
         best_pos = len(rem) + 1
         for a in anchors:
@@ -348,13 +425,40 @@ def _split_cjk_concept(run: str, anchors: tuple[str, ...]) -> list[str]:
             if len(rem) >= 2:
                 out.append(rem)
             break
+        if 0 < best_pos <= 4 and best_anchor in _COMPOUND_HEAD_ANCHORS:
+            out.append(rem[: best_pos + len(best_anchor)])
+            rem = rem[best_pos + len(best_anchor):]
+            continue
         if best_pos > 0:
             prefix = rem[:best_pos]
             if len(prefix) >= 2:
                 out.append(prefix)
         out.append(best_anchor)
         rem = rem[best_pos + len(best_anchor):]
-    return out or [run]
+
+    expanded: list[str] = []
+    for seg in (out or [run]):
+        if len(seg) <= 8:
+            expanded.append(seg)
+        else:
+            expanded.append(seg[:4])
+            expanded.append(seg[-4:])
+    return expanded
+
+
+def _strip_paren_field_lists(q: str) -> tuple[str, list[str]]:
+    attr_chunks: list[str] = []
+
+    def _repl(m: re.Match[str]) -> str:
+        inner = m.group(1)
+        sep_cnt = sum(inner.count(ch) for ch in ("、", ",", "，", ";", "；"))
+        if sep_cnt >= 2:
+            attr_chunks.append(inner)
+            return " "
+        return m.group(0)
+
+    stripped = _PAREN_ENUM_RE.sub(_repl, q).strip()
+    return stripped, attr_chunks
 
 
 def build_query_plan(
@@ -375,18 +479,27 @@ def build_query_plan(
     char_budget = int(budget * CHARS_PER_TOKEN)
 
     raw_tokens, groups = tokenize_query(q)
+    main_q_cand, attr_chunks = _strip_paren_field_lists(q)
+    main_core = _STOP_QUERY_PHRASE_RE.sub(" ", _META_INQUIRY_RE.sub(" ", _MODAL_PARTICLE_SUFFIX_RE.sub(" ", main_q_cand)))
+    main_core_toks, _ = tokenize_query(main_core)
+    has_distinct_main = bool(attr_chunks and len(set(main_core_toks)) >= 2)
+
     core_text = _MODAL_PARTICLE_SUFFIX_RE.sub(" ", q)
     core_text = _META_INQUIRY_RE.sub(" ", core_text)
     core_text_clean = _STOP_QUERY_PHRASE_RE.sub(" ", core_text)
     core_tokens_raw, _ = tokenize_query(core_text_clean)
     core_token_set = set(core_tokens_raw)
+    main_token_set = set(main_core_toks) if has_distinct_main else core_token_set
 
     primary_surface_toks = {m.group(0) for m in LATIN_NUM_RE.finditer(q.lower())}
     weights: dict[str, float] = {}
     core_weights: dict[str, float] = {}
+    seen_tok_counts: dict[str, int] = {}
     for tok in raw_tokens:
         if tok in core_token_set:
             base_w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
+            if tok not in main_token_set:
+                base_w *= 0.42
             # Derived sub-variants of a compound code shouldn't stack 3x-5x weight over other query concepts
             is_derived_sub = (
                 bool(re.search(r"[a-z0-9]", tok))
@@ -394,8 +507,12 @@ def build_query_plan(
                 and any(tok in g and len(g) > 1 for g in groups)
             )
             w = base_w * 0.48 if is_derived_sub else base_w
-            weights[tok] = weights.get(tok, 0.0) + w
-            core_weights[tok] = core_weights.get(tok, 0.0) + w
+            occ = seen_tok_counts.get(tok, 0)
+            seen_tok_counts[tok] = occ + 1
+            inc = w if occ == 0 else w * 0.25
+            cap = w * 1.60
+            weights[tok] = min(cap, weights.get(tok, 0.0) + inc)
+            core_weights[tok] = min(cap, core_weights.get(tok, 0.0) + inc)
         else:
             weights[tok] = max(weights.get(tok, 0.0), 0.30)
 
@@ -432,54 +549,62 @@ def build_query_plan(
         if ext_union:
             groups.append(ext_union)
 
-    # Extract readable domain concepts for facet balancing & 0-hit anti-hallucination warning
-    core_concepts: list[tuple[str, set[str]]] = []
-    seen_labels: set[str] = set()
-
-    for m in LATIN_NUM_RE.finditer(core_text_clean):
-        raw_lbl = m.group(0)
-        low_lbl = raw_lbl.lower()
-        if low_lbl in seen_labels or low_lbl in EN_STOPWORDS or low_lbl in _GENERIC_CORE_WORDS:
-            continue
-        if low_lbl.isdigit() and len(low_lbl) <= 2:
-            continue
-        if len(low_lbl) < 2:
-            continue
-        toks, _ = tokenize_query(low_lbl)
-        if toks:
-            seen_labels.add(low_lbl)
-            core_concepts.append((raw_lbl, set(toks)))
-
-    for m in NUM_MEASURE_RE.finditer(core_text_clean.lower()):
-        comp = m.group(1) + m.group(2)
-        if comp not in seen_labels:
-            seen_labels.add(comp)
-            core_concepts.append((comp, {comp}))
-
     anchors = tuple(dict.fromkeys([
         *extra_anchors,
         *(synonym_book.anchor_terms() if synonym_book is not None else ()),
+        *_COMPOUND_HEAD_ANCHORS,
         "标准", "规范", "规则", "接口", "协议", "阈值", "范围", "架构",
     ]))
     clause_filler_re = re.compile(
-        r"(?:与|和|及|或|或者|对|在|从|将|把|被|向|由|跟|同|的|了|着|过|但|而|中|内|上|下|"
+        r"(?:有一台|有一个|有一份|有一张|有一|有个|我的|你的|他的|她的|咱们|怎么样|怎样|"
+        r"与|和|及|或|或者|对|在|从|将|把|被|向|由|跟|同|的|了|着|过|但|而|中|内|上|下|有|是|"
         r"是否|能否|可不可以|有没有|为什么|怎么|如何|哪些|多少|什么|"
         r"连续|超过|低于|高于|大于|小于|达到|通过|判断|发生|出现|存在|进行|使用|采用|导致|引起|说明|需要|应该|可以)+"
     )
-    for seg in clause_filler_re.split(core_text_clean):
-        for run in CJK_RUN_RE.findall(seg):
-            if len(run) < 2 or run in _GENERIC_CORE_WORDS:
+
+    def _extract_concepts_from(text_src: str) -> list[tuple[str, set[str]]]:
+        found: list[tuple[str, set[str]]] = []
+        local_seen: set[str] = set()
+        for m in LATIN_NUM_RE.finditer(text_src):
+            raw_lbl = m.group(0)
+            low_lbl = raw_lbl.lower()
+            if low_lbl in local_seen or low_lbl in EN_STOPWORDS or low_lbl in _GENERIC_CORE_WORDS:
                 continue
-            for sp in _split_cjk_concept(run, anchors):
-                if len(sp) < 2 or len(sp) > 6 or sp in _GENERIC_CORE_WORDS or sp in seen_labels:
+            if low_lbl.isdigit() and len(low_lbl) <= 2:
+                continue
+            if len(low_lbl) < 2:
+                continue
+            toks, _ = tokenize_query(low_lbl)
+            if toks:
+                local_seen.add(low_lbl)
+                found.append((raw_lbl, set(toks)))
+
+        for m in NUM_MEASURE_RE.finditer(text_src.lower()):
+            comp = m.group(1) + m.group(2)
+            if comp not in local_seen:
+                local_seen.add(comp)
+                found.append((comp, {comp}))
+
+        for seg in clause_filler_re.split(text_src):
+            for run in CJK_RUN_RE.findall(seg):
+                if len(run) < 2 or run in _GENERIC_CORE_WORDS:
                     continue
-                sp_toks = set(tokenize(sp))
-                if sp_toks:
-                    seen_labels.add(sp)
-                    core_concepts.append((sp, sp_toks))
+                for sp in _split_cjk_concept(run, anchors):
+                    if len(sp) < 2 or len(sp) > 8 or sp in _GENERIC_CORE_WORDS or sp in local_seen:
+                        continue
+                    sp_toks = set(tokenize(sp))
+                    if sp_toks:
+                        local_seen.add(sp)
+                        found.append((sp, sp_toks))
+        return found
+
+    core_concepts = _extract_concepts_from(core_text_clean)
+    facet_source_concepts = _extract_concepts_from(main_core) if has_distinct_main else core_concepts
+    if not facet_source_concepts:
+        facet_source_concepts = core_concepts
 
     facets: list[tuple[str, set[str]]] = []
-    for lbl, tset in core_concepts:
+    for lbl, tset in facet_source_concepts:
         if not any(tset & prev_set for _, prev_set in facets):
             facets.append((lbl, tset))
 
@@ -676,13 +801,27 @@ class ContextPackEngine:
                 })
             return False
 
-        # Step 2: Parallel coarse retrieval
+        # Step 2: Parallel coarse retrieval (with pre-LIMIT C-level FTS5 ACL filtering)
+        acl_filter = compile_acl_filter(self.policy, user)
         wiki_max_k = 3 if plan.route_mode == "complex" or len(plan.facets) >= 2 else 2
         raw_wiki = index.search_wiki_weighted(plan.weighted_tokens, plan.groups, k=8, max_per_source=3)
         wiki_candidates = [w for w in raw_wiki if allowed_wiki(w)]
 
-        raw_l2 = index.search_weighted(plan.weighted_tokens, plan.groups, k=28, max_per_source=6)
+        raw_l2 = index.search_weighted(
+            plan.weighted_tokens,
+            plan.groups,
+            k=28,
+            max_per_source=6,
+            acl_filter=acl_filter,
+            query_text=q,
+        )
+        # Defense-in-depth assert: re-verify returned rows through Python AccessPolicy
         l2_candidates = [h for h in raw_l2 if allowed_l2(h.get("source") or "", hit=h)]
+
+        if include_debug and not acl_filter.allow_all:
+            # Populate Playground X-Ray Shadow Diff for hits pruned inside SQLite FTS5 `acl_pfx`
+            for sh_hit in index.search_weighted(plan.weighted_tokens, plan.groups, k=10, max_per_source=3, query_text=q):
+                allowed_l2(sh_hit.get("source") or "", hit=sh_hit)
 
         if len(plan.facets) >= 2:
             wiki_candidates, l2_candidates = self._ensure_facet_candidates(
@@ -692,6 +831,7 @@ class ContextPackEngine:
                 l2_candidates=l2_candidates,
                 allowed_wiki=allowed_wiki,
                 allowed_l2=allowed_l2,
+                acl_filter=acl_filter,
             )
 
         # Step 3: Controlled 1-hop Wiki provenance
@@ -709,8 +849,15 @@ class ContextPackEngine:
         selected_wiki = self._select_balanced_hits(
             wiki_candidates, plan.facets, max_k=wiki_max_k, max_per_source=wiki_per_source
         )
-        provenance_sources = self._collect_scoped_provenance(selected_wiki, allowed_l2)
-
+        if len(selected_wiki) > 1:
+            top_w_best = float(selected_wiki[0].get("score") or 0.0)
+            selected_wiki = [
+                selected_wiki[0],
+                *[
+                    w for w in selected_wiki[1:]
+                    if float(w.get("score") or 0.0) >= top_w_best * 0.28 or w.get("facet_rescued")
+                ],
+            ]
         core_tok_set = set(plan.core_weighted_tokens)
         q_idf_sample = (l2_candidates[0].get("_q_idf") if l2_candidates else None) or {}
         core_idfs = [q_idf_sample[t] for t in core_tok_set if t in q_idf_sample]
@@ -719,6 +866,30 @@ class ContextPackEngine:
             dist_core_toks = {t for t in core_tok_set if q_idf_sample.get(t, 0.0) >= idf_floor} or core_tok_set
         else:
             dist_core_toks = core_tok_set
+
+        raw_l2_top_sc = float(l2_candidates[0].get("score") or 0.0) if l2_candidates else 0.0
+        if selected_wiki and raw_l2_top_sc >= 20.0:
+            top_l2_srcs = {h.get("source") for h in l2_candidates[:3] if h.get("source")}
+            high_idf_toks = (
+                {t for t in core_tok_set if q_idf_sample.get(t, 0.0) >= max(core_idfs) * 0.78}
+                if core_idfs
+                else set()
+            )
+            kept_wiki: list[dict] = []
+            for w in selected_wiki:
+                w_sc = float(w.get("score") or 0.0)
+                if w_sc >= raw_l2_top_sc * 0.22:
+                    kept_wiki.append(w)
+                    continue
+                w_refs = {self.cfg.normalize_source_ref(r) for r in (w.get("sources") or ()) if isinstance(r, str)}
+                if w_refs & top_l2_srcs:
+                    kept_wiki.append(w)
+                    continue
+                if high_idf_toks and (set(w.get("matched") or ()) & high_idf_toks):
+                    kept_wiki.append(w)
+            selected_wiki = kept_wiki
+
+        provenance_sources = self._collect_scoped_provenance(selected_wiki, allowed_l2)
 
         existing_l2_sources: set[str] = set()
         for h in l2_candidates:
@@ -748,7 +919,13 @@ class ContextPackEngine:
         # Step 4: Bounded merge -> elastic selection -> table-header-pinned windowing
         merged_pool = self._merge_adjacent_candidates(l2_candidates, resolve_mirror_fn=resolve_mirror_fn)
         target_l2_k = 6 if plan.route_mode == "complex" else 4
-        selected_l2 = self._select_l2_with_elastic_cap(merged_pool, plan.facets, max_k=target_l2_k)
+        selected_l2 = self._select_l2_with_elastic_cap(
+            merged_pool,
+            plan.facets,
+            max_k=target_l2_k,
+            route_mode=plan.route_mode,
+            q_idf=q_idf_sample,
+        )
 
         usable_chars = max(1200, plan.char_budget - 260)
         wiki_char_budget = int(usable_chars * 0.24) if selected_wiki else 0
@@ -758,7 +935,9 @@ class ContextPackEngine:
         actual_wiki_chars = sum(len(w["content"]) + 80 for w in formatted_wiki)
         l2_char_budget = max(l2_char_budget, usable_chars - actual_wiki_chars)
 
-        formatted_l2 = self._format_l2_blocks(selected_l2, plan, l2_char_budget, snap=snap)
+        formatted_l2 = self._format_l2_blocks(
+            selected_l2, plan, l2_char_budget, snap=snap, resolve_mirror_fn=resolve_mirror_fn
+        )
 
         # Layer-4 Operational Memory & 1-hop Source-Anchored Errata Pins
         retrieved_src_set: set[str] = set()
@@ -807,16 +986,35 @@ class ContextPackEngine:
         ]
 
         # Step 5: Anti-hallucination missing-concept & unmirrored boundary check
+        top_l2_sc = max((float(s.get("score") or 0.0) for s in formatted_l2), default=0.0)
+        top_w_sc_fmt = max((float(w.get("score") or 0.0) for w in formatted_wiki), default=0.0)
+        scoped_l2 = (
+            [s for s in formatted_l2 if float(s.get("score") or 0.0) >= top_l2_sc * 0.35]
+            if top_l2_sc >= 15.0
+            else formatted_l2
+        )
+        scoped_wiki = (
+            [w for w in formatted_wiki if float(w.get("score") or 0.0) >= top_w_sc_fmt * 0.50]
+            if top_w_sc_fmt >= 15.0
+            else formatted_wiki
+        )
         combined_text = "\n".join(
             [
-                *(w["content"] + " " + w["heading"] for w in formatted_wiki),
-                *(s["content"] + " " + s["heading"] + " " + s["source"] for s in formatted_l2),
+                *(w["content"] + " " + w["heading"] for w in scoped_wiki),
+                *(s["content"] + " " + s["heading"] + " " + s["source"] for s in scoped_l2),
                 *pinned_errata_texts,
                 *(m["text"] for m in memory_blocks),
             ]
         ).lower()
         missing_concepts = self._detect_missing_concepts(plan, combined_text)
-        boundary_notes = self._collect_boundary_notes(snap, formatted_l2)
+        boundary_notes = self._collect_boundary_notes(
+            snap,
+            formatted_l2,
+            plan=plan,
+            missing_concepts=missing_concepts,
+            top_l2_score=top_l2_sc,
+            allowed_l2=allowed_l2,
+        )
 
         context_md = self._render_markdown(
             generation_id=snap.generation_id or "unknown",
@@ -874,6 +1072,7 @@ class ContextPackEngine:
         l2_candidates: list[dict],
         allowed_wiki: Callable[[dict], bool],
         allowed_l2: Callable[[str], bool],
+        acl_filter: ACLFilter | None = None,
     ) -> tuple[list[dict], list[dict]]:
         top_l2_text = " ".join(
             f"{h.get('source', '')} {h.get('heading', '')} {h.get('text', '')[:500]}"
@@ -895,7 +1094,14 @@ class ContextPackEngine:
             sub_groups = [set(f_toks)]
 
             if lbl.lower() not in top_l2_text and not any(t in top_l2_text for t in f_toks if len(t) >= 2):
-                for sh in index.search_weighted(sub_weights, sub_groups, k=3, max_per_source=2):
+                for sh in index.search_weighted(
+                    sub_weights,
+                    sub_groups,
+                    k=3,
+                    max_per_source=2,
+                    acl_filter=acl_filter,
+                    query_text=lbl,
+                ):
                     key = (sh.get("source"), sh.get("line_start"), sh.get("page_num"))
                     if key not in seen_l2 and allowed_l2(sh.get("source") or ""):
                         sh["facet_rescued"] = lbl
@@ -1086,13 +1292,55 @@ class ContextPackEngine:
         return False
 
     def _select_l2_with_elastic_cap(
-        self, candidates: list[dict], facets: list[tuple[str, set[str]]], *, max_k: int
+        self,
+        candidates: list[dict],
+        facets: list[tuple[str, set[str]]],
+        *,
+        max_k: int,
+        route_mode: str = "fact",
+        q_idf: dict[str, float] | None = None,
     ) -> list[dict]:
         if not candidates or max_k <= 0:
             return []
-        top_src = candidates[0].get("source") or ""
+        top_cand = candidates[0]
+        top_src = top_cand.get("source") or ""
+        top_sc = float(top_cand.get("score") or 0.0)
+        min_ratio = 0.15 if route_mode == "complex" else 0.25
+
+        # Single-subject fact guard: when one clear subject facet exists and top_cand matches its
+        # distinctive tokens, prevent sibling documents that miss the subject from diluting budget.
+        dist_subj_toks: set[str] = set()
+        if route_mode == "fact" and len(facets) == 1 and top_sc >= 20.0:
+            f_toks = facets[0][1]
+            idf_map = q_idf or {}
+            f_idfs = [idf_map[t] for t in f_toks if t in idf_map]
+            if f_idfs:
+                floor_f = max(f_idfs) * 0.72
+                dist_subj_toks = {t for t in f_toks if idf_map.get(t, 0.0) >= floor_f} or set(f_toks)
+            else:
+                dist_subj_toks = set(f_toks)
+            top_blob = f"{top_src} {top_cand.get('heading', '')} {top_cand.get('text', '')[:1200]}".lower()
+            if not any(t in top_blob for t in dist_subj_toks):
+                dist_subj_toks = set()
+
+        def _eligible_secondary(c: dict) -> bool:
+            if c is top_cand:
+                return True
+            sc = float(c.get("score") or 0.0)
+            if top_sc > 0 and sc < top_sc * min_ratio and not c.get("facet_rescued"):
+                return False
+            c_src = c.get("source") or ""
+            if dist_subj_toks and c_src != top_src:
+                c_blob = f"{c_src} {c.get('heading', '')} {c.get('text', '')[:1200]}".lower()
+                if not any(t in c_blob for t in dist_subj_toks):
+                    return False
+                if sc < top_sc * 0.60:
+                    return False
+            return True
+
+        filtered = [c for c in candidates if _eligible_secondary(c)] or [top_cand]
         other_best = max(
-            (float(c.get("score") or 0.0) for c in candidates if c.get("source") != top_src),
+            (float(c.get("score") or 0.0) for c in filtered if c.get("source") != top_src),
             default=0.0,
         )
         picked: list[dict] = []
@@ -1101,10 +1349,13 @@ class ContextPackEngine:
         reserve = 1 if len(facets) >= 2 and max_k >= 3 else 0
         main_cap = max(1, max_k - reserve)
 
-        for c in candidates:
+        for c in filtered:
             src = c.get("source") or ""
             cnt = per_src.get(src, 0)
-            limit = 4 if (src == top_src and float(c.get("score") or 0.0) >= other_best * 1.4) else 3
+            if src == top_src:
+                limit = 4 if float(c.get("score") or 0.0) >= other_best * 1.4 else 3
+            else:
+                limit = 1 if dist_subj_toks else 3
             if cnt >= limit or self._fold_into_picked(c, picked, picked_sets):
                 continue
             picked.append(c)
@@ -1123,7 +1374,7 @@ class ContextPackEngine:
                     break
                 if lbl.lower() in cov_blob or any(t in cov_blob for t in f_toks if len(t) >= 2):
                     continue
-                for c in candidates:
+                for c in filtered:
                     if c in picked or self._fold_into_picked(c, picked, picked_sets):
                         continue
                     c_blob = f"{c.get('source', '')} {c.get('heading', '')} {c.get('text', '')[:800]}".lower()
@@ -1135,13 +1386,14 @@ class ContextPackEngine:
                         cov_blob += " " + c_blob
                         break
 
-        for c in candidates:
+        for c in filtered:
             if len(picked) >= max_k:
                 break
             if c in picked:
                 continue
             src = c.get("source") or ""
-            if per_src.get(src, 0) >= 3 or self._fold_into_picked(c, picked, picked_sets):
+            sec_limit = 1 if (dist_subj_toks and src != top_src) else 3
+            if per_src.get(src, 0) >= sec_limit or self._fold_into_picked(c, picked, picked_sets):
                 continue
             picked.append(c)
             picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
@@ -1165,11 +1417,29 @@ class ContextPackEngine:
             end_l = (base_line_start + text.count("\n")) if base_line_start is not None else None
             return out, base_line_start, end_l, False
 
-        lines = text.splitlines()
-        if not lines:
+        raw_lines = text.splitlines()
+        if not raw_lines:
             return "", base_line_start, base_line_start, False
 
-        hdr = (table_header or "").strip()
+        # Split compressed single-line HTML `<table><tr>...</tr></table>` rows into virtual sub-lines
+        # while preserving exact 1-based file line offsets for `wiki_read` alignment.
+        lines: list[str] = []
+        line_offsets: list[int] = []
+        html_tbl_hdr = ""
+        for orig_idx, raw_ln in enumerate(raw_lines):
+            if len(raw_ln) > 300 and "</tr>" in raw_ln.lower() and "<tr" in raw_ln.lower():
+                parts = [p for p in re.split(r"(?i)(?<=</tr>)\s*(?=<tr\b)", raw_ln) if p]
+                if len(parts) >= 2:
+                    if not html_tbl_hdr and len(parts[0]) <= 320:
+                        html_tbl_hdr = parts[0]
+                    for pt in parts:
+                        lines.append(pt)
+                        line_offsets.append(orig_idx)
+                    continue
+            lines.append(raw_ln)
+            line_offsets.append(orig_idx)
+
+        hdr = (table_header or "").strip() or html_tbl_hdr
         hdr_low = hdr.lower()
         hdr_cost = (len(hdr) + 2) if hdr else 0
         body_budget = max(240, max_chars - hdr_cost)
@@ -1244,11 +1514,12 @@ class ContextPackEngine:
             s_idx = max(0, min(pos - body_budget // 3, len(selected_slice) - body_budget))
             selected_slice = selected_slice[s_idx: s_idx + body_budget]
 
+        is_full_span = (best_l == 0 and best_r == len(lines) - 1 and len(selected_slice) >= len(text) - 2)
         prefix = f"{hdr}\n" if (hdr and best_l > 0 and not selected_slice.lstrip().startswith(hdr[:40])) else ""
         out_text = self._scrub(prefix + selected_slice)
-        shown_s = (base_line_start + best_l) if base_line_start is not None else None
-        shown_e = (base_line_start + best_r) if base_line_start is not None else None
-        return out_text, shown_s, shown_e, True
+        shown_s = (base_line_start + line_offsets[best_l]) if base_line_start is not None else None
+        shown_e = (base_line_start + line_offsets[best_r]) if base_line_start is not None else None
+        return out_text, shown_s, shown_e, (not is_full_span)
 
     def _format_wiki_blocks(self, wiki_hits: list[dict], plan: QueryPlan, total_budget: int) -> list[dict]:
         if not wiki_hits or total_budget <= 0:
@@ -1278,18 +1549,69 @@ class ContextPackEngine:
             })
         return out
 
-    def _format_l2_blocks(self, l2_hits: list[dict], plan: QueryPlan, total_budget: int, *, snap) -> list[dict]:
+    def _format_l2_blocks(
+        self,
+        l2_hits: list[dict],
+        plan: QueryPlan,
+        total_budget: int,
+        *,
+        snap,
+        resolve_mirror_fn: Callable[[str, str], Path | None] | None = None,
+    ) -> list[dict]:
         if not l2_hits or total_budget <= 0:
             return []
         n = len(l2_hits)
-        weights = [1.30 if i == 0 else (1.10 if i == 1 else 0.90) for i in range(n)]
+        s0 = float(l2_hits[0].get("score") or 0.0)
+        s1 = float(l2_hits[1].get("score") or 0.0) if n > 1 else 0.0
+        lead_w = 1.85 if (n > 1 and s1 > 0 and s0 >= s1 * 1.55) else 1.40
+        weights = [lead_w if i == 0 else (1.05 if i == 1 else 0.85) for i in range(n)]
         w_sum = sum(weights) or 1.0
+
+        # Water-filling budget allocation: recycle unused chars from compact blocks to longer top hits
+        allocs = [max(480, int(total_budget * (wt / w_sum))) for wt in weights]
+        text_lens = [len(h.get("text") or "") + len(h.get("table_header") or "") + 16 for h in l2_hits]
+        surplus = 0
+        needy_indices: list[int] = []
+        for i in range(n):
+            if text_lens[i] < allocs[i]:
+                freed = allocs[i] - max(240, text_lens[i])
+                if freed > 0:
+                    allocs[i] -= freed
+                    surplus += freed
+            elif text_lens[i] > allocs[i]:
+                needy_indices.append(i)
+        if surplus > 0 and needy_indices:
+            needy_w_sum = sum(weights[i] for i in needy_indices) or 1.0
+            for i in needy_indices:
+                allocs[i] += int(surplus * (weights[i] / needy_w_sum))
+
         dup_map = getattr(snap, "duplicates_by_source", {}) or {}
         assets_map = getattr(snap, "assets_by_source", {}) or {}
+        docs_by_src = {r.get("source"): r for r in (getattr(snap, "docs", ()) or ()) if isinstance(r, dict)}
+        mirror_lines_cache: dict[str, int] = {}
+
+        def _doc_total_lines(src_name: str) -> int | None:
+            if src_name in mirror_lines_cache:
+                return mirror_lines_cache[src_name]
+            d_row = docs_by_src.get(src_name) or {}
+            if isinstance(d_row.get("lines"), int) and d_row["lines"] > 0:
+                mirror_lines_cache[src_name] = d_row["lines"]
+                return d_row["lines"]
+            if resolve_mirror_fn is not None and self.cfg.is_source_ref(src_name):
+                rel_p = self.cfg.strip_source_prefix(src_name)
+                mp = resolve_mirror_fn(src_name, rel_p)
+                if mp is not None and mp.is_file():
+                    try:
+                        cnt = len(mp.read_text(encoding="utf-8", errors="replace").splitlines())
+                        mirror_lines_cache[src_name] = cnt
+                        return cnt
+                    except OSError:
+                        pass
+            return None
+
         out: list[dict] = []
 
-        for idx, (h, wt) in enumerate(zip(l2_hits, weights), 1):
-            alloc = max(480, int(total_budget * (wt / w_sum)))
+        for idx, (h, alloc) in enumerate(zip(l2_hits, allocs), 1):
             content, shown_s, shown_e, windowed = self._window_block_safely(
                 h.get("text") or "",
                 plan=plan,
@@ -1299,15 +1621,24 @@ class ContextPackEngine:
                 base_line_start=h.get("line_start"),
             )
             src = h["source"]
+            tot_l = _doc_total_lines(src)
+            sec_s = h.get("line_start")
+            sec_e = h.get("line_end")
+            if tot_l is not None:
+                if isinstance(shown_e, int) and shown_e > tot_l:
+                    shown_e = tot_l
+                if isinstance(sec_e, int) and sec_e > tot_l:
+                    sec_e = tot_l
+
             entry: dict = {
                 "id": f"S{idx}",
                 "source": src,
                 "kind": h.get("kind") or "section",
                 "heading": h.get("heading") or "",
-                "line_start": shown_s if shown_s is not None else h.get("line_start"),
-                "line_end": shown_e if shown_e is not None else h.get("line_end"),
-                "section_line_start": h.get("line_start"),
-                "section_line_end": h.get("line_end"),
+                "line_start": shown_s if shown_s is not None else sec_s,
+                "line_end": shown_e if shown_e is not None else sec_e,
+                "section_line_start": sec_s,
+                "section_line_end": sec_e,
                 "page_num": h.get("page_num"),
                 "score": h.get("score"),
                 "via_wiki": bool(h.get("via_wiki")),
@@ -1315,11 +1646,19 @@ class ContextPackEngine:
                 "content": content,
             }
             if windowed and isinstance(shown_s, int) and isinstance(shown_e, int):
-                entry["read_more"] = {
-                    "source": src,
-                    "start": max(1, shown_s - 40),
-                    "end": shown_e + 80,
-                }
+                rm_start = max(1, shown_s - 40)
+                rm_end = min(shown_e + 80, tot_l) if tot_l is not None else (shown_e + 80)
+                already_covers_all = (
+                    tot_l is not None
+                    and shown_s <= (sec_s or 1)
+                    and shown_e >= tot_l
+                )
+                if not already_covers_all and rm_end >= rm_start:
+                    entry["read_more"] = {
+                        "source": src,
+                        "start": rm_start,
+                        "end": rm_end,
+                    }
             elif h.get("kind") == "page" and h.get("page_num") is not None and windowed:
                 entry["read_more"] = {"source": src, "page_num": h.get("page_num")}
 
@@ -1354,20 +1693,36 @@ class ContextPackEngine:
                 continue
             if len(low_lbl) >= 3 and len(tset) >= 2 and all(t in combined_text_lower for t in tset):
                 continue
+            if 2 <= len(low_lbl) <= 3 and CJK_RUN_RE.fullmatch(low_lbl):
+                if re.search(rf"{re.escape(low_lbl[0])}[\u4e00-\u9fff]{re.escape(low_lbl[1:])}", combined_text_lower):
+                    continue
             if len(low_lbl) >= 4 and CJK_RUN_RE.fullmatch(low_lbl):
                 bgs = [low_lbl[i:i + 2] for i in range(len(low_lbl) - 1)]
                 hits = sum(1 for bg in bgs if bg in combined_text_lower)
-                if (len(low_lbl) == 4 and low_lbl[:2] in combined_text_lower and low_lbl[2:] in combined_text_lower) or (
-                    len(bgs) >= 3 and hits >= len(bgs) - 1
-                ):
+                p1, p2 = re.escape(low_lbl[:2]), re.escape(low_lbl[2:])
+                near_4 = (
+                    len(low_lbl) == 4
+                    and bool(re.search(rf"{p1}[^\n]{{0,16}}{p2}|{p2}[^\n]{{0,16}}{p1}", combined_text_lower))
+                )
+                if near_4 or (len(bgs) >= 4 and hits >= len(bgs) - 1):
                     continue
             missing.append(lbl)
         return missing
 
-    def _collect_boundary_notes(self, snap, formatted_l2: list[dict]) -> list[str]:
+    def _collect_boundary_notes(
+        self,
+        snap,
+        formatted_l2: list[dict],
+        *,
+        plan: QueryPlan | None = None,
+        missing_concepts: list[str] | None = None,
+        top_l2_score: float = 0.0,
+        allowed_l2: Callable[[str], bool] | None = None,
+    ) -> list[str]:
         notes: list[str] = []
         summary = getattr(snap, "summary", {}) or {}
         skipped_srcs = summary.get("policy_skipped_sources") or []
+        skipped_img_dirs: dict[str, int] = summary.get("skipped_image_dirs") or {}
         failed_srcs = summary.get("failed_sources") or []
         is_zh = self.cfg.layout == "zh"
 
@@ -1380,13 +1735,39 @@ class ContextPackEngine:
             if parent and parent != ".":
                 hit_dirs.add(parent)
 
+        reported_img_dirs: set[str] = set()
         for d in sorted(hit_dirs):
-            cnt = sum(1 for s in skipped_srcs if str(PurePosixPath(s).parent) == d)
+            cnt = sum(1 for s in skipped_srcs if str(PurePosixPath(s).parent) == d) + int(skipped_img_dirs.get(d) or 0)
             if cnt > 0:
+                if d in skipped_img_dirs:
+                    reported_img_dirs.add(d)
                 notes.append(
                     f"目录「{d}」下另有 {cnt} 个图片/非文档文件未做全文收录"
                     if is_zh
                     else f"Directory '{d}' has {cnt} non-indexed image/binary file(s)"
+                )
+
+        # Surface unindexed image directories when query concepts are missing or top hits are weak
+        if skipped_img_dirs and (missing_concepts or top_l2_score < 15.0):
+            q_toks = set(plan.weighted_tokens) if plan is not None else set()
+            ranked_dirs: list[tuple[int, int, str]] = []
+            for img_d, img_cnt in skipped_img_dirs.items():
+                if img_d in reported_img_dirs or int(img_cnt or 0) <= 0:
+                    continue
+                if allowed_l2 is not None and not allowed_l2(f"{img_d}/_"):
+                    continue
+                d_toks = set(tokenize(img_d.lower()))
+                overlap = len(q_toks & d_toks)
+                if overlap > 0 or missing_concepts or top_l2_score < 8.0:
+                    ranked_dirs.append((overlap, int(img_cnt), img_d))
+            ranked_dirs.sort(key=lambda item: (-item[0], -item[1], item[2]))
+            for overlap, img_cnt, img_d in ranked_dirs[:2]:
+                if overlap == 0 and len(notes) >= 2:
+                    break
+                notes.append(
+                    f"源目录「{img_d}」下有 {img_cnt} 张图片默认未做文字入库（可按路径调 wiki_inspect_visual 查看，或在 vault.json 的 ocr_image_dirs 中开启入库）"
+                    if is_zh
+                    else f"Source directory '{img_d}' has {img_cnt} unindexed image(s) (view via wiki_inspect_visual or enable in vault.json ocr_image_dirs)"
                 )
 
         docs_by_src = {r.get("source"): r for r in (getattr(snap, "docs", ()) or ())}
