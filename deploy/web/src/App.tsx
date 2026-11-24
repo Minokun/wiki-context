@@ -2,12 +2,18 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { api, subscribeLogStream } from "./api/client";
 import { AgentConfigModal } from "./components/AgentConfigModal";
 import { ToastHost, type ToastItem } from "./components/ToastHost";
+import { UpdateModal } from "./components/UpdateModal";
 import { AppShell, type WorkspaceTab } from "./layouts/AppShell";
 import { AccessPage } from "./pages/AccessPage";
 import { NetworkPage } from "./pages/NetworkPage";
 import { VaultsPage } from "./pages/VaultsPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
-import { getBootstrapConfig } from "./platform/adapter";
+import {
+  checkForAppUpdate,
+  getBootstrapConfig,
+  type AppUpdateHandle,
+  type UpdateProgress,
+} from "./platform/adapter";
 import { ThemeProvider } from "./theme";
 import type {
   AsyncJobRecord,
@@ -35,6 +41,12 @@ const AppInner: React.FC = () => {
   const [openOnboardSignal, setOpenOnboardSignal] = useState(0);
   const [focusPairSignal, setFocusPairSignal] = useState(0);
   const [compileJobs, setCompileJobs] = useState<Record<string, AsyncJobRecord>>({});
+  const [availableUpdate, setAvailableUpdate] = useState<AppUpdateHandle | null>(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
+  const [updateError, setUpdateError] = useState("");
   const compilePollErrorsRef = useRef<Record<string, number>>({});
   const vaultsRef = useRef(overview?.vaults || []);
   vaultsRef.current = overview?.vaults || [];
@@ -265,6 +277,67 @@ const AppInner: React.FC = () => {
     }
   };
 
+  // Silent startup check in desktop mode (after initial load settles)
+  useEffect(() => {
+    if (mode !== "desktop") return;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void checkForAppUpdate()
+        .then((upd) => {
+          if (cancelled || !upd) {
+            void upd?.close();
+            return;
+          }
+          setAvailableUpdate((prev) => {
+            if (prev && prev.version !== upd.version) void prev.close();
+            return upd;
+          });
+        })
+        .catch(() => {
+          // Offline or no published release yet — stay quiet on background check
+        });
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [mode]);
+
+  const handleManualCheckUpdate = async () => {
+    if (mode !== "desktop" || checkingUpdate) return;
+    setCheckingUpdate(true);
+    setUpdateError("");
+    try {
+      const upd = await checkForAppUpdate();
+      if (upd) {
+        setAvailableUpdate((prev) => {
+          if (prev && prev.version !== upd.version) void prev.close();
+          return upd;
+        });
+        setUpdateModalOpen(true);
+      } else {
+        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.4.0"})`);
+      }
+    } catch {
+      pushToast("info", "暂未检测到线上新版本（请确认网络或已发布 GitHub Release）");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!availableUpdate || installingUpdate) return;
+    setInstallingUpdate(true);
+    setUpdateError("");
+    setUpdateProgress({ phase: "downloading", downloaded: 0, percent: 0 });
+    try {
+      await availableUpdate.install((p) => setUpdateProgress(p));
+    } catch (e) {
+      setUpdateError(e instanceof Error ? e.message : String(e));
+      setInstallingUpdate(false);
+    }
+  };
+
   if (bootError && !overview) {
     return (
       <div className="flex h-screen w-screen flex-col items-center justify-center bg-[var(--bg-app)] p-6 text-center text-[var(--ink-primary)]">
@@ -308,6 +381,13 @@ const AppInner: React.FC = () => {
         }}
         compileJobs={compileJobs}
         onRefresh={() => void refresh()}
+        availableUpdateVersion={availableUpdate?.version}
+        checkingUpdate={checkingUpdate}
+        onCheckUpdate={() => void handleManualCheckUpdate()}
+        onOpenUpdateModal={() => {
+          setUpdateError("");
+          setUpdateModalOpen(true);
+        }}
       >
         {tab === "workbench" && (
           <WorkbenchPage
@@ -376,6 +456,16 @@ const AppInner: React.FC = () => {
         onClose={() => setAgentModalOpen(false)}
         onSaved={() => void refresh()}
         onToast={pushToast}
+      />
+
+      <UpdateModal
+        open={updateModalOpen}
+        updateInfo={availableUpdate}
+        installing={installingUpdate}
+        progress={updateProgress}
+        error={updateError}
+        onInstall={() => void handleInstallUpdate()}
+        onClose={() => setUpdateModalOpen(false)}
       />
 
       <ToastHost

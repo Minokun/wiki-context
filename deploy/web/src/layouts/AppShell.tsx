@@ -33,6 +33,10 @@ interface AppShellProps {
   onOpenAgentConfig: () => void;
   onQuickPair: () => void;
   onRefresh: () => void;
+  availableUpdateVersion?: string;
+  checkingUpdate?: boolean;
+  onCheckUpdate?: () => void;
+  onOpenUpdateModal?: () => void;
   children: React.ReactNode;
 }
 
@@ -64,6 +68,10 @@ export const AppShell: React.FC<AppShellProps> = ({
   onOpenAgentConfig,
   onQuickPair,
   onRefresh,
+  availableUpdateVersion,
+  checkingUpdate,
+  onCheckUpdate,
+  onOpenUpdateModal,
   children,
 }) => {
   const [showMoreInstalled, setShowMoreInstalled] = useState(false);
@@ -117,9 +125,32 @@ export const AppShell: React.FC<AppShellProps> = ({
           <span className="hidden truncate text-[14px] font-bold tracking-tight text-[var(--ink-primary)] sm:inline">
             wiki-context
           </span>
-          <span className="hidden font-mono text-xs text-[var(--ink-muted)] xl:inline">
-            v{overview?.version || "0.4.0"}
-          </span>
+          {mode === "desktop" && onCheckUpdate ? (
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={onCheckUpdate}
+              title={checkingUpdate ? "正在检查更新..." : "点击检查在线更新"}
+              className="hidden rounded px-1 py-0.5 font-mono text-xs text-[var(--ink-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)] disabled:opacity-60 xl:inline"
+            >
+              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.4.0"}`}
+            </button>
+          ) : (
+            <span className="hidden font-mono text-xs text-[var(--ink-muted)] xl:inline">
+              v{overview?.version || "0.4.0"}
+            </span>
+          )}
+          {mode === "desktop" && availableUpdateVersion && onOpenUpdateModal && (
+            <button
+              type="button"
+              onClick={onOpenUpdateModal}
+              title={`点击更新到 v${availableUpdateVersion}`}
+              className="inline-flex items-center gap-1 rounded-md border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--accent)] hover:bg-[var(--accent)]/15"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+              <span>新版本 v{availableUpdateVersion}</span>
+            </button>
+          )}
           <span className="hidden rounded-md border border-[var(--border-default)] bg-[var(--bg-surface)] px-2 py-0.5 text-xs font-medium text-[var(--ink-secondary)] 2xl:inline">
             {mode === "desktop" ? "桌面版" : "Web 版"}
           </span>

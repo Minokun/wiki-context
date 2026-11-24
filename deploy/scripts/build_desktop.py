@@ -47,6 +47,15 @@ def main() -> int:
 
     npx = shutil.which("npx") or ("npx.cmd" if os.name == "nt" else "npx")
     tauri_cmd = [npx, "tauri", "build"]
+    if not env.get("TAURI_SIGNING_PRIVATE_KEY"):
+        local_key = Path.home() / ".tauri" / "wiki-context.key"
+        if local_key.is_file():
+            env["TAURI_SIGNING_PRIVATE_KEY"] = local_key.read_text(encoding="utf-8").strip()
+            env.setdefault("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "")
+            print(f"[build_desktop] Loaded Tauri signing key from {local_key}", flush=True)
+        else:
+            tauri_cmd.extend(["--config", '{"bundle":{"createUpdaterArtifacts":false}}'])
+            print("[build_desktop] No signing key found; skipping updater bundle artifacts.", flush=True)
     if args.bundles:
         tauri_cmd.extend(["--bundles", args.bundles])
 
@@ -83,8 +92,10 @@ def main() -> int:
     OUT_DIST.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
     if bundle_root.is_dir():
-        for ext in ("*.dmg", "*.exe", "*.msi", "*.AppImage", "*.deb"):
+        for ext in ("*.dmg", "*.exe", "*.msi", "*.AppImage", "*.deb", "*.tar.gz", "*.sig"):
             for artifact in bundle_root.rglob(ext):
+                if artifact.name.startswith("rw."):
+                    continue
                 dest = OUT_DIST / artifact.name
                 shutil.copy2(artifact, dest)
                 copied.append(str(dest))

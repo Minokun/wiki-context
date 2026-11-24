@@ -4,7 +4,7 @@
   "version": "0.4.0",
   "identifier": "io.wikicontext.desktop",
   "build": {
-    "beforeBuildCommand": "python3 ../scripts/build_web.py",
+    "beforeBuildCommand": "npm --prefix ../web run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../../src/wiki_context/ui_dist"
   },
@@ -26,6 +26,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
       "icons/32x32.png",
@@ -44,6 +45,14 @@
       "nsis": {
         "installMode": "currentUser"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDNzExNUNBNEM1NUFDQUUKUldTdXJGVk15aFZ4N0xiQWgxdTZQLy82QTVkVjNVL0VGS0R5SlVQTGU0Z3pmNmdMOVlEekxLb3gK",
+      "endpoints": [
+        "https://github.com/Minokun/wiki-context/releases/latest/download/latest.json"
+      ]
     }
   }
 }

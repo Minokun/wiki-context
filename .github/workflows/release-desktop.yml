@@ -28,14 +28,18 @@ jobs:
           path: dist/*.whl
 
   build-desktop:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
+      # Run platforms sequentially so the second job cleanly merges into the first job's latest.json
+      max-parallel: 1
       matrix:
         include:
           - os: macos-latest
             bundles: "app,dmg"
           - os: windows-latest
-            bundles: "nsis,msi"
+            bundles: "nsis"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +52,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install PyInstaller
         run: pip install pyinstaller
-      - name: Build Desktop Installer (${{ matrix.os }})
-        run: python deploy/scripts/build_desktop.py --bundles "${{ matrix.bundles }}"
-      - uses: actions/upload-artifact@v4
+      - name: Build Web UI Dependencies & Bundle
+        run: python deploy/scripts/build_web.py
+      - name: Build Bundled Python Engine
+        run: python deploy/scripts/build_engine.py
+      - name: Install Tauri CLI Dependencies
+        run: npm --prefix deploy/desktop ci
+      - name: Build, Sign & Publish Desktop Release (${{ matrix.os }})
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          name: desktop-${{ matrix.os }}
-          path: deploy/dist/*
+          projectPath: deploy/desktop
+          tagName: v__VERSION__
+          releaseName: "wiki-context v__VERSION__"
+          releaseBody: "桌面控制中心安装包。已安装的桌面端用户可在应用内自动检查并一键签名更新。"
+          releaseDraft: ${{ github.event_name != 'push' }}
+          prerelease: false
+          includeUpdaterJson: true
+          args: --bundles ${{ matrix.bundles }}

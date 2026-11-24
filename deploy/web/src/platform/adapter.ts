@@ -129,3 +129,82 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     return false;
   }
 }
+
+export interface AppUpdateInfo {
+  version: string;
+  currentVersion: string;
+  date?: string;
+  body?: string;
+}
+
+export interface UpdateProgress {
+  phase: "downloading" | "installing";
+  downloaded: number;
+  total?: number;
+  percent?: number;
+}
+
+export interface AppUpdateHandle extends AppUpdateInfo {
+  install: (onProgress?: (progress: UpdateProgress) => void) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+export async function checkForAppUpdate(): Promise<AppUpdateHandle | null> {
+  if (!isTauriRuntime()) return null;
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const update = await check({ timeout: 15000 });
+  if (!update) return null;
+
+  return {
+    version: update.version,
+    currentVersion: update.currentVersion,
+    date: update.date,
+    body: update.body,
+    close: async () => {
+      try {
+        await update.close();
+      } catch {
+        // ignore double-close
+      }
+    },
+    install: async (onProgress) => {
+      let downloaded = 0;
+      let total: number | undefined;
+      onProgress?.({ phase: "downloading", downloaded: 0, total, percent: 0 });
+      await update.download((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength;
+          onProgress?.({
+            phase: "downloading",
+            downloaded: 0,
+            total,
+            percent: total ? 0 : undefined,
+          });
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          const pct = total && total > 0 ? Math.min(99, Math.round((downloaded / total) * 100)) : undefined;
+          onProgress?.({
+            phase: "downloading",
+            downloaded,
+            total,
+            percent: pct,
+          });
+        } else if (event.event === "Finished") {
+          onProgress?.({
+            phase: "downloading",
+            downloaded,
+            total,
+            percent: 100,
+          });
+        }
+      });
+
+      onProgress?.({ phase: "installing", downloaded, total, percent: 100 });
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("prepare_for_update");
+      await update.install();
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    },
+  };
+}

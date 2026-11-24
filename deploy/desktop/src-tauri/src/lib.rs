@@ -12,6 +12,11 @@ fn get_bootstrap_config(state: tauri::State<'_, Arc<SidecarState>>) -> Result<Bo
     state.get_bootstrap()
 }
 
+#[tauri::command]
+fn prepare_for_update(state: tauri::State<'_, Arc<SidecarState>>) {
+    state.shutdown();
+}
+
 pub fn run() {
     let sidecar = Arc::new(SidecarState::new());
     let sidecar_setup = Arc::clone(&sidecar);
@@ -24,8 +29,10 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(sidecar)
-        .invoke_handler(tauri::generate_handler![get_bootstrap_config])
+        .invoke_handler(tauri::generate_handler![get_bootstrap_config, prepare_for_update])
         .setup(move |app| {
             let handle = app.handle().clone();
             tray::setup_tray(&handle, sidecar_tray)?;
