@@ -248,7 +248,7 @@ class TestCompilerAndLint(unittest.TestCase):
             )
             sync_vault(v)
 
-            plan = plan_compilation(v)
+            plan = plan_compilation(v, skip_csv=False)
             self.assertFalse(any("周报日报" in s for s in plan["uncompiled_sources"]))
 
             seen_titles: list[str] = []
@@ -267,7 +267,7 @@ class TestCompilerAndLint(unittest.TestCase):
                     f"# {title}\n\n## 概览\n综合整理。\n\n## 关联页面\n\n[[知识库总览]]\n"
                 )
 
-            res = compile_vault(v, llm_fn=fake_cluster_llm, max_items=10)
+            res = compile_vault(v, llm_fn=fake_cluster_llm, max_items=10, skip_csv=False)
             self.assertEqual(len(res["compiled_pages"]), 2)
             self.assertEqual(res["remaining_uncompiled"], 0)
             self.assertTrue(res["lint"]["ok"], res["lint"])
@@ -280,7 +280,7 @@ class TestCompilerAndLint(unittest.TestCase):
             meta = parse_wiki_frontmatter(fm)
             self.assertEqual(len(meta["sources"]), 2)
             self.assertEqual(len(meta["source_hashes"]), 2)
-            self.assertEqual(plan_compilation(v)["uncompiled_sources"], [])
+            self.assertEqual(plan_compilation(v, skip_csv=False)["uncompiled_sources"], [])
 
     def test_concurrent_compile_failure_isolation_catalog_summary_and_reviewed_protection(self):
         import json as _json
@@ -751,6 +751,101 @@ class TestCompilerAndLint(unittest.TestCase):
             self.assertEqual(res_c["remaining_uncompiled"], 7)
             self.assertTrue(res_c["lint"]["ok"])
             self.assertEqual(len(plan_compilation(v2)["uncompiled_sources"]), 7)
+
+    def test_smart_defaults_skip_csv_fallback_project_rollup_and_console_toggles(self):
+        import json as _json
+        from wiki_context.cli import _build_parser
+        from wiki_context.console import ConsoleState
+
+        # 1. VaultConfig defaults ON while honoring explicit false overrides
+        with tempfile.TemporaryDirectory() as td:
+            v_mix = Path(td) / "mixed-kb"
+            init_vault(v_mix, name="MixedKB", layout="zh")
+            cfg_default = VaultConfig.load(v_mix)
+            self.assertTrue(cfg_default.compile_skip_csv)
+            self.assertTrue(cfg_default.compile_project_rollup)
+            self.assertFalse(cfg_default.compile_skip_csv_explicit)
+            self.assertFalse(cfg_default.compile_project_rollup_explicit)
+
+            (v_mix / "史料" / "核心说明.md").write_text("# 核心说明\n\n系统核心原理。\n", encoding="utf-8")
+            (v_mix / "史料" / "参数明细.csv").write_text("项,值\nK,1\n", encoding="utf-8")
+            proj_dir = v_mix / "史料" / "svn" / "JC26-01示范工程" / "03方案设计"
+            proj_dir.mkdir(parents=True)
+            for i in range(1, 11):
+                (proj_dir / f"方案{i:02d}.md").write_text(f"# 方案 {i}\n\n内容 {i}。\n", encoding="utf-8")
+            sync_vault(v_mix)
+
+            # With zero flags, mixed vault skips CSV and rolls up svn project into 1 overview page
+            dry = compile_vault(v_mix, dry_run=True)
+            self.assertFalse(any(s.endswith(".csv") for s in dry["uncompiled_sources"]))
+            self.assertEqual(dry["cluster_count"], 2)
+            self.assertIn("JC26-01示范工程-项目总览", {c["title"] for c in dry["top_clusters"]})
+
+            # Explicit vault.json false overrides disable defaults
+            v_json = _json.loads((v_mix / "vault.json").read_text(encoding="utf-8"))
+            v_json["compile_skip_csv"] = False
+            v_json["compile_project_rollup"] = False
+            (v_mix / "vault.json").write_text(_json.dumps(v_json, ensure_ascii=False), encoding="utf-8")
+            cfg_explicit = VaultConfig.load(v_mix)
+            self.assertFalse(cfg_explicit.compile_skip_csv)
+            self.assertFalse(cfg_explicit.compile_project_rollup)
+            self.assertTrue(cfg_explicit.compile_skip_csv_explicit)
+            self.assertTrue(cfg_explicit.compile_project_rollup_explicit)
+            dry_exp = compile_vault(v_mix, dry_run=True)
+            self.assertTrue(any(s.endswith(".csv") for s in dry_exp["uncompiled_sources"]))
+            self.assertGreater(dry_exp["cluster_count"], 2)
+
+        # 2. CSV-only mini vault automatically retains CSV files instead of showing 0 pending
+        with tempfile.TemporaryDirectory() as td:
+            v_csv = Path(td) / "csv-only"
+            init_vault(v_csv, name="CsvOnly", layout="en")
+            (v_csv / "sources" / "metrics.csv").write_text("col,val\na,1\n", encoding="utf-8")
+            sync_vault(v_csv)
+            p_csv = plan_compilation(v_csv)
+            self.assertEqual(p_csv["uncompiled_sources"], ["sources/metrics.csv"])
+            self.assertFalse(p_csv["effective_skip_csv"])
+
+        # 3. ConsoleState defaults ON, invalidates plan cache on toggle save, and CLI supports --no-*
+        with tempfile.TemporaryDirectory() as td:
+            v_con = Path(td) / "con-vault"
+            cfg_dir = Path(td) / "wctx-home"
+            fake_home = Path(td) / "fake-home"
+            fake_home.mkdir()
+            init_vault(v_con, name="ConsoleKB", layout="zh")
+            (v_con / "史料" / "指南.md").write_text("# 指南\n\n正文。\n", encoding="utf-8")
+            (v_con / "史料" / "台账.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+            p_svn = v_con / "史料" / "svn" / "JC26-09测试线" / "03方案"
+            p_svn.mkdir(parents=True)
+            for i in range(1, 10):
+                (p_svn / f"doc{i}.md").write_text(f"# Doc {i}\n\nDetail {i}.\n", encoding="utf-8")
+            sync_vault(v_con)
+
+            st = ConsoleState(
+                config_dir=cfg_dir,
+                extra_vault_specs={"con": v_con},
+                client_home=fake_home,
+                enable_watcher=False,
+            )
+            try:
+                llm_rt = st.get_llm_compiler_status()
+                self.assertTrue(llm_rt["skip_csv"])
+                self.assertTrue(llm_rt["project_rollup"])
+
+                v_before = next(v for v in st.list_vaults_detailed() if v["id"] == "con")
+                self.assertEqual(v_before["uncompiled_count"], 10)
+                self.assertEqual(v_before["cluster_count"], 2)
+
+                st.save_llm_compiler_config({"skip_csv": False, "project_rollup": False})
+                v_after = next(v for v in st.list_vaults_detailed() if v["id"] == "con")
+                self.assertEqual(v_after["uncompiled_count"], 11)
+                self.assertEqual(v_after["cluster_count"], 4)
+            finally:
+                st.close()
+
+        parser = _build_parser()
+        ns_off = parser.parse_args(["compile", "--no-skip-csv", "--no-project-rollup"])
+        self.assertFalse(ns_off.skip_csv)
+        self.assertFalse(ns_off.project_rollup)
 
 
 if __name__ == "__main__":

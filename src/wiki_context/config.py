@@ -65,8 +65,10 @@ class VaultConfig:
     exclude_patterns: tuple[str, ...] = ()
     compile_exclude_patterns: tuple[str, ...] = ()
     compile_include_patterns: tuple[str, ...] = ()
-    compile_skip_csv: bool = False
-    compile_project_rollup: bool = False
+    compile_skip_csv: bool = True
+    compile_project_rollup: bool = True
+    compile_skip_csv_explicit: bool = False
+    compile_project_rollup_explicit: bool = False
     compile_workers: int = 4
     compile_max_tokens: int = 4096
     compile_disable_thinking: bool = False
@@ -125,8 +127,13 @@ class VaultConfig:
         compile_include_patterns = tuple(
             str(x).strip() for x in cmp_incl_raw if isinstance(x, str) and str(x).strip()
         )
-        compile_skip_csv = bool(raw_cfg.get("compile_skip_csv") is True)
-        compile_project_rollup = bool(raw_cfg.get("compile_project_rollup") is True)
+        raw_skip_csv = raw_cfg.get("compile_skip_csv")
+        compile_skip_csv_explicit = isinstance(raw_skip_csv, bool)
+        compile_skip_csv = raw_skip_csv if compile_skip_csv_explicit else True
+
+        raw_project_rollup = raw_cfg.get("compile_project_rollup")
+        compile_project_rollup_explicit = isinstance(raw_project_rollup, bool)
+        compile_project_rollup = raw_project_rollup if compile_project_rollup_explicit else True
         compile_workers = max(1, min(16, int(raw_cfg.get("compile_workers") or 4)))
         compile_max_tokens = max(256, min(16384, int(raw_cfg.get("compile_max_tokens") or 4096)))
         compile_disable_thinking = bool(raw_cfg.get("compile_disable_thinking") is True)
@@ -199,6 +206,8 @@ class VaultConfig:
             compile_include_patterns=compile_include_patterns,
             compile_skip_csv=compile_skip_csv,
             compile_project_rollup=compile_project_rollup,
+            compile_skip_csv_explicit=compile_skip_csv_explicit,
+            compile_project_rollup_explicit=compile_project_rollup_explicit,
             compile_workers=compile_workers,
             compile_max_tokens=compile_max_tokens,
             compile_disable_thinking=compile_disable_thinking,

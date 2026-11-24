@@ -1204,9 +1204,12 @@ def plan_compilation(
     *,
     include_images: bool = False,
     skip_csv: bool | None = None,
+    project_rollup: bool | None = None,
 ) -> dict:
     """Inspect vault and return deduplicated ``uncompiled_sources`` + ``stale_wiki_pages`` without calling an LLM."""
     cfg = VaultConfig.load(vault)
+    eff_skip_csv = cfg.compile_skip_csv if skip_csv is None else bool(skip_csv)
+    eff_rollup = cfg.compile_project_rollup if project_rollup is None else bool(project_rollup)
     covered_sources: set[str] = set()
     if cfg.wiki_root.is_dir():
         for wp in sorted(cfg.wiki_root.glob("*.md")):
@@ -1235,6 +1238,10 @@ def plan_compilation(
         if h and src_ref in covered_sources:
             covered_hashes.add(h)
 
+    has_non_csv_doc = any(
+        PurePosixPath(s).suffix.lower() not in {".csv", ".tsv"}
+        for s in covered_sources
+    )
     raw_candidates: list[dict] = []
     for src_rel, entry in sorted(manifest.items()):
         if not isinstance(entry, dict):
@@ -1243,16 +1250,26 @@ def plan_compilation(
         m_path = cfg.mirrors_root / m_rel
         if not m_path.is_file() or mirror_skip_reason(m_path, m_rel, cfg=cfg, manifest_entry=entry) is not None:
             continue
-        if _compile_skip_reason(src_rel, cfg, include_images=include_images, skip_csv=skip_csv) is not None:
+        if _compile_skip_reason(src_rel, cfg, include_images=include_images, skip_csv=False) is not None:
             continue
+        norm_rel = src_rel.replace("\\", "/").lstrip("/")
+        is_csv = PurePosixPath(norm_rel).suffix.lower() in {".csv", ".tsv"}
+        if not is_csv:
+            has_non_csv_doc = True
         src_ref = f"{cfg.source_prefix}{src_rel.lstrip('/')}"
         if src_ref not in covered_sources:
             raw_candidates.append({
                 "source": src_ref,
-                "rel": src_rel.replace("\\", "/").lstrip("/"),
+                "rel": norm_rel,
                 "mirror_path": m_path,
                 "hash": str(entry.get("hash") or "").strip(),
+                "is_csv": is_csv,
             })
+
+    # Safeguard: CSV-only mini vaults keep tabular mirrors compilable instead of showing 0 pending.
+    active_skip_csv = eff_skip_csv and has_non_csv_doc
+    if active_skip_csv:
+        raw_candidates = [c for c in raw_candidates if not c["is_csv"]]
 
     # Content-hash deduplication: keep highest-priority copy per identical SHA-256 hash
     uncompiled: list[dict] = []
@@ -1281,6 +1298,12 @@ def plan_compilation(
         key=lambda x: x["source"],
     )
 
+    clusters = _group_uncompiled_into_clusters(
+        uncompiled,
+        cfg,
+        project_rollup=eff_rollup,
+        is_zh=(cfg.layout == "zh"),
+    )
     stale_pages = check_vault_freshness(cfg.root, only_stale=True)
     mem_store = MemoryStore(cfg.root)
     active_notes = mem_store.list_notes(status="active")
@@ -1290,6 +1313,9 @@ def plan_compilation(
         "stale_pages": [s["page"] for s in stale_pages],
         "active_notes": [n.note_id for n in active_notes],
         "duplicate_sources_skipped": duplicate_skipped,
+        "cluster_count": len(clusters),
+        "effective_skip_csv": active_skip_csv,
+        "effective_project_rollup": eff_rollup,
         "_uncompiled_items": uncompiled,
         "_stale_items": stale_pages,
         "_active_notes": active_notes,
@@ -1335,7 +1361,12 @@ def compile_vault(
         else (1 if llm_fn is not None else max(1, cfg.compile_workers))
     )
 
-    plan = plan_compilation(cfg.root, include_images=include_images, skip_csv=eff_skip_csv)
+    plan = plan_compilation(
+        cfg.root,
+        include_images=include_images,
+        skip_csv=eff_skip_csv,
+        project_rollup=eff_rollup,
+    )
     is_zh = cfg.layout == "zh"
     units_all = _group_uncompiled_into_clusters(
         plan["_uncompiled_items"],

@@ -87,6 +87,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const [workers, setWorkers] = useState(llmCompiler?.workers ?? 4);
   const [maxTokens, setMaxTokens] = useState(llmCompiler?.max_tokens ?? 4096);
   const [disableThinking, setDisableThinking] = useState(llmCompiler?.disable_thinking ?? false);
+  const [skipCsv, setSkipCsv] = useState(llmCompiler?.skip_csv ?? true);
+  const [projectRollup, setProjectRollup] = useState(llmCompiler?.project_rollup ?? true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -104,6 +106,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setWorkers(llmCompiler.workers ?? 4);
     setMaxTokens(llmCompiler.max_tokens ?? 4096);
     setDisableThinking(llmCompiler.disable_thinking ?? llmCompiler.provider === "local");
+    setSkipCsv(llmCompiler.skip_csv ?? true);
+    setProjectRollup(llmCompiler.project_rollup ?? true);
     setApiKeyInput("");
     setTestResult(null);
   }, [open, llmCompiler]);
@@ -147,6 +151,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
         workers,
         max_tokens: maxTokens,
         disable_thinking: disableThinking,
+        skip_csv: skipCsv,
+        project_rollup: projectRollup,
       });
       setApiKeyInput("");
       onToast(
@@ -207,6 +213,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
           workers,
           max_tokens: maxTokens,
           disable_thinking: disableThinking,
+          skip_csv: skipCsv,
+          project_rollup: projectRollup,
         });
         setApiKeyInput("");
         onSaved();
@@ -361,12 +369,13 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
           {/* Global Automation Policy */}
           <div className="space-y-3 rounded-xl border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3.5">
             <div className="font-bold text-[var(--ink-primary)]">自动整理与吞吐设置</div>
-            <label className="flex cursor-pointer items-start gap-2.5">
+            <label className="flex min-h-[44px] cursor-pointer items-start gap-2.5 py-1">
               <input
                 type="checkbox"
+                name="auto_compile_on_sync"
                 checked={autoSync}
                 onChange={(e) => setAutoSync(e.target.checked)}
-                className="mt-0.5"
+                className="mt-0.5 size-4 shrink-0 cursor-pointer"
               />
               <div>
                 <div className="font-semibold text-[var(--ink-primary)]">
@@ -378,12 +387,49 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
               </div>
             </label>
 
-            <label className="flex cursor-pointer items-start gap-2.5 border-t border-[var(--border-subtle)] pt-2.5">
+            <label className="flex min-h-[44px] cursor-pointer items-start gap-2.5 border-t border-[var(--border-subtle)] pt-2.5 py-1">
               <input
                 type="checkbox"
+                name="skip_csv"
+                checked={skipCsv}
+                onChange={(e) => setSkipCsv(e.target.checked)}
+                className="mt-0.5 size-4 shrink-0 cursor-pointer"
+              />
+              <div>
+                <div className="font-semibold text-[var(--ink-primary)]">
+                  跳过纯 CSV / TSV 数据表（默认开启，推荐）
+                </div>
+                <div className="mt-0.5 text-[var(--ink-muted)]">
+                  表格已在 FTS5 索引中支持带表头精确检索；跳过文字改写可大幅节省调用并提升摘要信噪比（若全库仅有表格则自动保留）。
+                </div>
+              </div>
+            </label>
+
+            <label className="flex min-h-[44px] cursor-pointer items-start gap-2.5 border-t border-[var(--border-subtle)] pt-2.5 py-1">
+              <input
+                type="checkbox"
+                name="project_rollup"
+                checked={projectRollup}
+                onChange={(e) => setProjectRollup(e.target.checked)}
+                className="mt-0.5 size-4 shrink-0 cursor-pointer"
+              />
+              <div>
+                <div className="font-semibold text-[var(--ink-primary)]">
+                  大型工程目录自动聚合为《项目总览》（默认开启，推荐）
+                </div>
+                <div className="mt-0.5 text-[var(--ink-muted)]">
+                  当 <code className="font-mono">svn/</code> 下的单个工程超过 8 份文档时，按权重精选核心方案浓缩为 1 篇总览页，避免拆成大量零碎子页。
+                </div>
+              </div>
+            </label>
+
+            <label className="flex min-h-[44px] cursor-pointer items-start gap-2.5 border-t border-[var(--border-subtle)] pt-2.5 py-1">
+              <input
+                type="checkbox"
+                name="disable_thinking"
                 checked={disableThinking}
                 onChange={(e) => setDisableThinking(e.target.checked)}
-                className="mt-0.5"
+                className="mt-0.5 size-4 shrink-0 cursor-pointer"
               />
               <div>
                 <div className="font-semibold text-[var(--ink-primary)]">

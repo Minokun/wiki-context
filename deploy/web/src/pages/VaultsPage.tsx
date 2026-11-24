@@ -152,6 +152,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     vaultId: string;
     uncompiled_sources: string[];
     stale_pages: string[];
+    cluster_count?: number;
   } | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const [lintReport, setLintReport] = useState<{
@@ -202,6 +203,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
             vaultId: activeVault.id,
             uncompiled_sources: res.uncompiled_sources || [],
             stale_pages: res.stale_pages || [],
+            cluster_count: res.cluster_count,
           });
         }
       })
@@ -209,7 +211,13 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeVault?.id, activeVault?.generation_id, activePendingCount]);
+  }, [
+    activeVault?.id,
+    activeVault?.generation_id,
+    activePendingCount,
+    llmCompiler?.skip_csv,
+    llmCompiler?.project_rollup,
+  ]);
 
   const [cancellingJobId, setCancellingJobId] = useState("");
 
@@ -838,7 +846,10 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                   </div>
                   <div className="mt-0.5 truncate text-xs text-[var(--ink-muted)]">
                     {activeVault.uncompiled_count
-                      ? `${activeVault.uncompiled_count} 篇待整理`
+                      ? (activeVault.cluster_count ?? 0) > 0 &&
+                        (activeVault.cluster_count ?? 0) < activeVault.uncompiled_count
+                        ? `${activeVault.uncompiled_count} 份待整理 → 归并 ${activeVault.cluster_count} 篇`
+                        : `${activeVault.uncompiled_count} 篇待整理`
                       : "已全部同步"}
                   </div>
                 </div>
@@ -1705,8 +1716,12 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                           className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)]"
                         >
                           <span>
-                            待整理文件（新增 {compilePlan.uncompiled_sources.length} · 需更新{" "}
-                            {compilePlan.stale_pages.length}）
+                            待整理文件（新增 {compilePlan.uncompiled_sources.length}
+                            {(compilePlan.cluster_count ?? 0) > 0 &&
+                            (compilePlan.cluster_count ?? 0) < compilePlan.uncompiled_sources.length
+                              ? ` → 归并 ${compilePlan.cluster_count} 篇`
+                              : ""}{" "}
+                            · 需更新 {compilePlan.stale_pages.length}）
                           </span>
                           {queueOpen ? (
                             <ChevronDown className="h-3.5 w-3.5 text-[var(--accent)]" />

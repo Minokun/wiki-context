@@ -59,6 +59,8 @@ export interface LlmCompilerStatus {
   workers?: number;
   max_tokens?: number;
   disable_thinking?: boolean;
+  skip_csv?: boolean;
+  project_rollup?: boolean;
   presets: LlmProviderPreset[];
 }
 
@@ -107,6 +109,7 @@ export interface VaultInfo {
   wiki_sections?: number;
   uncompiled_count?: number;
   stale_count?: number;
+  cluster_count?: number;
   compile_job?: AsyncJobRecord;
   active_memory_notes: number;
   generation_id: string;

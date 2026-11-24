@@ -147,6 +147,7 @@ export const api = {
       active_notes: string[];
       uncompiled_count: number;
       stale_count: number;
+      cluster_count?: number;
     }>(`/api/vaults/compile-plan?vault_id=${encodeURIComponent(vault_id)}`),
   getJob: (job_id: string) =>
     requestJson<AsyncJobRecord>(`/api/jobs/${encodeURIComponent(job_id)}`),
@@ -167,6 +168,8 @@ export const api = {
     workers?: number;
     max_tokens?: number;
     disable_thinking?: boolean;
+    skip_csv?: boolean;
+    project_rollup?: boolean;
   }) => requestJson<LlmCompilerStatus>("/api/llm/config", payload),
   testLlmConfig: (payload?: {
     provider?: string;

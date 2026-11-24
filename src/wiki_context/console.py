@@ -385,7 +385,7 @@ class ConsoleState:
         self._active_compile_jobs: dict[str, str] = {}
         self._job_cancel_events: dict[str, threading.Event] = {}
         self._compile_finished_ts: dict[str, float] = {}
-        self._compile_plan_cache: dict[str, tuple[tuple[str, int], dict[str, int]]] = {}
+        self._compile_plan_cache: dict[str, tuple[tuple[str, int, bool, bool], dict[str, int]]] = {}
         self._job_lock = threading.Lock()
         self._hydrating_vaults: set[str] = set()
         self._vault_access_errors: dict[str, str] = {}
@@ -736,6 +736,8 @@ class ConsoleState:
         workers = max(1, min(16, int(cfg.get("workers") or 4)))
         max_tokens = max(256, min(16384, int(cfg.get("max_tokens") or 4096)))
         disable_thinking = bool(cfg.get("disable_thinking", provider == "local"))
+        skip_csv = cfg["skip_csv"] if isinstance(cfg.get("skip_csv"), bool) else True
+        project_rollup = cfg["project_rollup"] if isinstance(cfg.get("project_rollup"), bool) else True
 
         env_key = (
             os.environ.get("WCTX_API_KEY")
@@ -764,6 +766,8 @@ class ConsoleState:
             "workers": workers,
             "max_tokens": max_tokens,
             "disable_thinking": disable_thinking,
+            "skip_csv": skip_csv,
+            "project_rollup": project_rollup,
         }
 
     def get_llm_compiler_status(self) -> dict[str, Any]:
@@ -813,6 +817,16 @@ class ConsoleState:
                 if "disable_thinking" in payload
                 else prev.get("disable_thinking", provider == "local")
             )
+            skip_csv = (
+                bool(payload["skip_csv"])
+                if "skip_csv" in payload
+                else (prev["skip_csv"] if isinstance(prev.get("skip_csv"), bool) else True)
+            )
+            project_rollup = (
+                bool(payload["project_rollup"])
+                if "project_rollup" in payload
+                else (prev["project_rollup"] if isinstance(prev.get("project_rollup"), bool) else True)
+            )
 
             data["llm_compiler"] = {
                 "provider": provider,
@@ -825,9 +839,12 @@ class ConsoleState:
                 "workers": workers,
                 "max_tokens": max_tokens,
                 "disable_thinking": disable_thinking,
+                "skip_csv": skip_csv,
+                "project_rollup": project_rollup,
                 "updated_at": _now_iso(),
             }
             self._save_console_data(data)
+            self._compile_plan_cache.clear()
 
             if payload.get("clear_api_key"):
                 self._save_llm_secret("")
@@ -835,6 +852,17 @@ class ConsoleState:
                 self._save_llm_secret(str(payload["api_key"]).strip())
 
         return self.get_llm_compiler_status()
+
+    def _effective_compile_flags(self, cfg: VaultConfig, rt: dict[str, Any] | None = None) -> tuple[bool, bool]:
+        """Resolve per-vault `(skip_csv, project_rollup)` honoring explicit `vault.json` overrides."""
+        rt_eff = rt if rt is not None else self._resolve_llm_runtime()
+        eff_skip_csv = cfg.compile_skip_csv if cfg.compile_skip_csv_explicit else bool(rt_eff.get("skip_csv", True))
+        eff_rollup = (
+            cfg.compile_project_rollup
+            if cfg.compile_project_rollup_explicit
+            else bool(rt_eff.get("project_rollup", True))
+        )
+        return eff_skip_csv, eff_rollup
 
     def test_llm_compiler(self, override: dict[str, Any] | None = None) -> dict[str, Any]:
         rt = self._resolve_llm_runtime()
@@ -1009,6 +1037,7 @@ class ConsoleState:
                     probe_cache[k] = (res_p, err_s)
                     self._remote_probe_cache[k] = (time.monotonic(), res_p, err_s)
 
+        rt_once = self._resolve_llm_runtime()
         out: list[dict[str, Any]] = []
         for item in rows:
             if not isinstance(item, dict):
@@ -1286,21 +1315,24 @@ class ConsoleState:
             try:
                 gen_id = str(entry.get("generation_id") or "")
                 w_mtime = cfg.wiki_root.stat().st_mtime_ns if cfg.wiki_root.is_dir() else 0
-                cache_sig = (gen_id, w_mtime)
+                eff_skip_csv, eff_rollup = self._effective_compile_flags(cfg, rt_once)
+                cache_sig = (gen_id, w_mtime, eff_skip_csv, eff_rollup)
                 cached_plan = self._compile_plan_cache.get(vid)
                 if cached_plan is not None and cached_plan[0] == cache_sig:
                     plan_counts = cached_plan[1]
                 else:
-                    pinfo = plan_compilation(vpath)
+                    pinfo = plan_compilation(vpath, skip_csv=eff_skip_csv, project_rollup=eff_rollup)
                     plan_counts = {
                         "uncompiled_count": len(pinfo.get("uncompiled_sources") or []),
                         "stale_count": len(pinfo.get("stale_pages") or []),
+                        "cluster_count": int(pinfo.get("cluster_count") or 0),
                     }
                     self._compile_plan_cache[vid] = (cache_sig, plan_counts)
                 entry.update(plan_counts)
             except Exception:
                 entry.setdefault("uncompiled_count", 0)
                 entry.setdefault("stale_count", 0)
+                entry.setdefault("cluster_count", 0)
 
             with self._job_lock:
                 c_jid = self._active_compile_jobs.get(vid)
@@ -1470,7 +1502,8 @@ class ConsoleState:
         compile_job: dict[str, Any] | None = None
         uncompiled_cnt = 0
         try:
-            plan_info = plan_compilation(registered_path)
+            eff_skip_csv, eff_rollup = self._effective_compile_flags(VaultConfig.load(registered_path), rt)
+            plan_info = plan_compilation(registered_path, skip_csv=eff_skip_csv, project_rollup=eff_rollup)
             uncompiled_cnt = len(plan_info.get("uncompiled_sources") or [])
         except Exception:
             uncompiled_cnt = 0
@@ -1912,7 +1945,9 @@ class ConsoleState:
 
     def plan_vault_compile(self, vault_id: str) -> dict[str, Any]:
         vpath = self.get_vault_path(vault_id)
-        plan = plan_compilation(vpath)
+        cfg = VaultConfig.load(vpath)
+        eff_skip_csv, eff_rollup = self._effective_compile_flags(cfg)
+        plan = plan_compilation(vpath, skip_csv=eff_skip_csv, project_rollup=eff_rollup)
         return {
             "vault_id": vault_id,
             "vault": plan.get("vault", vault_id),
@@ -1921,6 +1956,7 @@ class ConsoleState:
             "active_notes": plan.get("active_notes", []),
             "uncompiled_count": len(plan.get("uncompiled_sources") or []),
             "stale_count": len(plan.get("stale_pages") or []),
+            "cluster_count": int(plan.get("cluster_count") or 0),
         }
 
     def start_compile_job(
@@ -1942,7 +1978,9 @@ class ConsoleState:
             if existing_jid and existing_jid in self._jobs and self._jobs[existing_jid].get("status") == "running":
                 return dict(self._jobs[existing_jid])
 
-        plan = plan_compilation(vpath)
+        cfg = VaultConfig.load(vpath)
+        eff_skip_csv, eff_rollup = self._effective_compile_flags(cfg, rt)
+        plan = plan_compilation(vpath, skip_csv=eff_skip_csv, project_rollup=eff_rollup)
         pending_total = (
             len(plan.get("uncompiled_sources") or [])
             + len(plan.get("stale_pages") or [])
@@ -2014,6 +2052,8 @@ class ConsoleState:
                     workers=rt["workers"],
                     max_tokens=rt["max_tokens"],
                     disable_thinking=rt["disable_thinking"],
+                    project_rollup=eff_rollup,
+                    skip_csv=eff_skip_csv,
                     on_progress=_on_progress,
                     cancel_event=cancel_ev,
                 )

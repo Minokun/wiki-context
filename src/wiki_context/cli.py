@@ -116,8 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_comp.add_argument("--workers", type=int, help="Concurrent LLM worker count (default from vault.json or 4)")
     p_comp.add_argument("--max-tokens", type=int, help="Max completion tokens per page (default from vault.json or 4096)")
     p_comp.add_argument("--disable-thinking", action="store_true", default=None, help="Send enable_thinking=false for thinking models")
-    p_comp.add_argument("--project-rollup", action="store_true", default=None, help="Synthesize large SVN projects into one overview page")
-    p_comp.add_argument("--skip-csv", action="store_true", default=None, help="Skip raw CSV/TSV files from AI compilation (kept in FTS5)")
+    p_comp.add_argument("--project-rollup", action=argparse.BooleanOptionalAction, default=None, help="Synthesize large SVN projects into one overview page (default: on)")
+    p_comp.add_argument("--skip-csv", action=argparse.BooleanOptionalAction, default=None, help="Skip raw CSV/TSV files from AI compilation (kept in FTS5; default: on)")
     p_comp.add_argument(
         "--overwrite-reviewed",
         action="store_true",
