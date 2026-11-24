@@ -8,23 +8,21 @@ hot reloads.
 from __future__ import annotations
 
 import datetime as dt
-try:
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 from pathlib import Path, PurePosixPath
 
 from .config import VaultConfig
-from .freshness import compute_wiki_freshness, parse_wiki_frontmatter, split_frontmatter
+from .freshness import clean_source_ref, compute_wiki_freshness, parse_wiki_frontmatter, split_frontmatter
 from .policy import POLICY_VERSION, mirror_skip_reason
-from .search import build_fts_sqlite, is_excluded_source, load_exclude_patterns
+from .search import INDEX_SCHEMA_VERSION, build_fts_sqlite, is_excluded_source, load_exclude_patterns
+from .state_lock import atomic_write_bytes, atomic_write_text, file_lock, replace_with_retry
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = INDEX_SCHEMA_VERSION
 MAX_SECTION_LINES = 400
 TARGET_CHUNK_LINES = 130
 KEEP_GENERATIONS = 2
@@ -36,15 +34,12 @@ _HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, text)
 
 
 def _stream_write_jsonl(path: Path, rows: list[dict]) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
     h = hashlib.sha256()
     total_bytes = 0
     with tmp.open("wb") as fh:
@@ -53,7 +48,7 @@ def _stream_write_jsonl(path: Path, rows: list[dict]) -> dict:
             fh.write(raw)
             h.update(raw)
             total_bytes += len(raw)
-    tmp.replace(path)
+    replace_with_retry(tmp, path)
     return {"lines": len(rows), "bytes": total_bytes, "sha256": h.hexdigest()}
 
 
@@ -273,15 +268,79 @@ def _compute_input_signature(cfg: VaultConfig) -> str:
     return h.hexdigest()
 
 
+MANAGED_MARKER = ".wctx-managed"
+
+
+def _write_managed_marker(index_root: Path) -> None:
+    """Mark `.index/` as owned by wiki-context.
+
+    Vault-local legacy tooling (``scripts/wiki_index.py`` / ``oxr_sync.py``) checks this marker
+    and delegates to ``wctx index`` instead of publishing an incompatible schema-3 generation.
+    """
+    marker = index_root / MANAGED_MARKER
+    if marker.is_file():
+        return
+    try:
+        _atomic_write_text(
+            marker,
+            json.dumps(
+                {
+                    "generator": "wiki-context",
+                    "schema_version": SCHEMA_VERSION,
+                    "note": "Index is owned by wiki-context; rebuild with `wctx index`, never with legacy scripts.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
+    except OSError:
+        pass
+
+
+def _sweep_trashed_generations(index_root: Path, active_gen: str) -> list[str]:
+    """Retry removing deferred `.trash.json` generations once old SQLite handles release."""
+    trash_file = index_root / ".trash.json"
+    if not trash_file.is_file():
+        return []
+    try:
+        items = json.loads(trash_file.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            items = []
+    except (OSError, ValueError):
+        items = []
+
+    remaining: list[str] = []
+    for name in items:
+        if not isinstance(name, str) or not name or "/" in name or ".." in name:
+            continue
+        if name == active_gen:
+            continue
+        gpath = index_root / name
+        if not gpath.exists():
+            continue
+        try:
+            shutil.rmtree(gpath)
+        except OSError:
+            remaining.append(name)
+
+    if remaining:
+        _atomic_write_text(trash_file, json.dumps(sorted(set(remaining)), indent=2) + "\n")
+    else:
+        try:
+            trash_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return remaining
+
+
 def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
     """Build immutable `gen-<id>/bm25.sqlite` + JSONL snapshot and atomically swap `current.json`."""
     cfg = VaultConfig.load(vault)
     cfg.index_root.mkdir(parents=True, exist_ok=True)
 
     lock_path = cfg.index_root / ".build.lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_fh:
-        if fcntl is not None:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    with file_lock(lock_path, blocking=True, busy_message="Another index build is running on this vault"):
 
         sig = _compute_input_signature(cfg)
         cur_path = cfg.index_root / "current.json"
@@ -456,9 +515,11 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
                 w_meta = parse_wiki_frontmatter(fm_w)
                 title = w_meta["title"] or wp.stem
                 norm_refs = [
-                    cfg.normalize_source_ref(re.split(r"[（(]", r, maxsplit=1)[0].strip())
+                    cfg.normalize_source_ref(cleaned)
                     for r in w_meta["sources"]
-                    if isinstance(r, str) and cfg.is_source_ref(re.split(r"[（(]", r, maxsplit=1)[0].strip())
+                    if isinstance(r, str)
+                    for cleaned in (clean_source_ref(r),)
+                    if cfg.is_source_ref(cleaned)
                 ]
                 fresh_state = compute_wiki_freshness(
                     norm_refs, w_meta["source_hashes"], indexed_hashes, cfg=cfg
@@ -524,6 +585,7 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
 
         summary = {
             "schema_version": SCHEMA_VERSION,
+            "generator": "wiki-context",
             "generation_id": gen_id,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "vault": cfg.name,
@@ -557,20 +619,23 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
         # Dual-publish root JSONL for tooling compatibility, then atomically swap current.json
         for fname in ("docs.jsonl", "pages.jsonl", "sections.jsonl", "wiki_sections.jsonl", "summary.json"):
             dst = cfg.index_root / fname
-            tmp_dst = cfg.index_root / f".{fname}.tmp-{os.getpid()}"
+            tmp_dst = cfg.index_root / f".{fname}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
             shutil.copy2(gen_dir / fname, tmp_dst)
-            tmp_dst.replace(dst)
+            replace_with_retry(tmp_dst, dst)
 
         current_payload = {
             "schema_version": SCHEMA_VERSION,
+            "generator": "wiki-context",
             "generation_id": gen_id,
             "generated_at": summary["generated_at"],
             "input_signature": sig,
             "file_stats": fstats,
         }
         _atomic_write_text(cur_path, json.dumps(current_payload, ensure_ascii=False, indent=2) + "\n")
+        _write_managed_marker(cfg.index_root)
 
-        # Prune older generations beyond KEEP_GENERATIONS
+        # Sweep previously deferred `.trash.json` generations & prune older generations beyond KEEP_GENERATIONS
+        deferred = set(_sweep_trashed_generations(cfg.index_root, gen_id))
         gens = sorted(
             (p for p in cfg.index_root.iterdir() if p.is_dir() and p.name.startswith("gen-")),
             key=lambda p: p.stat().st_mtime,
@@ -578,10 +643,25 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
         )
         kept = 0
         for g in gens:
-            if g.name == gen_id or kept < KEEP_GENERATIONS:
-                kept += 1
+            if g.name == gen_id or (g.name not in deferred and kept < KEEP_GENERATIONS):
+                if g.name not in deferred:
+                    kept += 1
                 continue
-            shutil.rmtree(g, ignore_errors=True)
+            try:
+                shutil.rmtree(g)
+                deferred.discard(g.name)
+            except OSError:
+                # Windows [WinError 32]: open bm25.sqlite read handle still draining; defer to .trash.json
+                deferred.add(g.name)
+
+        trash_file = cfg.index_root / ".trash.json"
+        if deferred:
+            _atomic_write_text(trash_file, json.dumps(sorted(deferred), indent=2) + "\n")
+        elif trash_file.is_file():
+            try:
+                trash_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         return summary
 

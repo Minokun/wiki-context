@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .config import VaultConfig
-from .freshness import split_frontmatter
+from .freshness import parse_wiki_frontmatter, split_frontmatter
 from .search import tokenize
+from .state_lock import atomic_write_text, file_lock
 
 VALID_MEMORY_KINDS = frozenset({"errata", "insight", "decision", "glossary"})
 VALID_MEMORY_STATUSES = frozenset({"active", "consolidated", "archived"})
@@ -133,6 +134,7 @@ class MemoryStore:
         self._lock = threading.Lock()
         self._cache_sig: tuple[int, int] | None = None
         self._notes: list[MemoryNote] = []
+        self._wiki_refs_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
 
     def _compute_sig(self) -> tuple[int, int]:
         nroot = self.cfg.notes_root
@@ -178,7 +180,7 @@ class MemoryStore:
                     if not clean_body:
                         continue
                     norm_srcs = tuple(
-                        self.cfg.normalize_source_ref(s)
+                        self.cfg.normalize_memory_ref(s)
                         for s in (meta.get("related_sources") or ())
                         if isinstance(s, str) and s.strip()
                     )
@@ -208,9 +210,41 @@ class MemoryStore:
             return all_n
         return [n for n in all_n if n.status == status]
 
+    def _wiki_page_sources(self, wiki_ref: str) -> tuple[str, ...]:
+        """Frontmatter ``sources`` of a Layer-3 page (mtime-cached), used for ACL provenance inheritance."""
+        rel = wiki_ref[len(self.cfg.wiki_prefix):] if wiki_ref.startswith(self.cfg.wiki_prefix) else wiki_ref
+        if not rel or ".." in rel.split("/"):
+            return ()
+        path = self.cfg.wiki_root / rel
+        try:
+            st = path.stat()
+        except OSError:
+            return ()
+        cached = self._wiki_refs_cache.get(wiki_ref)
+        if cached is not None and cached[0] == st.st_mtime_ns:
+            return cached[1]
+        try:
+            fm, _body = split_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+            refs = tuple(
+                self.cfg.normalize_source_ref(r)
+                for r in (parse_wiki_frontmatter(fm).get("sources") or ())
+                if isinstance(r, str) and r.strip()
+            )
+        except OSError:
+            refs = ()
+        self._wiki_refs_cache[wiki_ref] = (st.st_mtime_ns, refs)
+        return refs
+
     def can_access_note(self, policy, principal, note: MemoryNote) -> bool:
         if note.related_sources:
-            return all(policy.can_access_source(principal, s) for s in note.related_sources)
+            for ref in note.related_sources:
+                if self.cfg.is_wiki_ref(ref):
+                    # Wiki-anchored notes inherit the page's own provenance ACL.
+                    if not policy.can_access_wiki(principal, ref, list(self._wiki_page_sources(ref))):
+                        return False
+                elif not policy.can_access_source(principal, ref):
+                    return False
+            return True
         return policy.can_access_wiki(principal, f"{self.cfg.notes_dir}/{note.file_path.name}", [])
 
     def remember(
@@ -233,7 +267,7 @@ class MemoryStore:
         for s in (related_sources or ()):
             s_str = str(s).strip()
             if s_str:
-                norm_srcs.append(self.cfg.normalize_source_ref(s_str))
+                norm_srcs.append(self.cfg.normalize_memory_ref(s_str))
 
         clean_tags = [re.sub(r"[^\w\u4e00-\u9fff._-]+", "-", str(t).strip()).strip("-") for t in (tags or ())]
         clean_tags = [t for t in clean_tags if t][:10]
@@ -247,19 +281,18 @@ class MemoryStore:
         nroot = self.cfg.notes_root
         nroot.mkdir(parents=True, exist_ok=True)
         out_path = nroot / f"{note_id}.md"
-        tmp_path = nroot / f".{note_id}.md.tmp-{os.getpid()}"
-        payload = _serialize_note(
-            note_id=note_id,
-            kind=k_norm,
-            status="active",
-            author=(author or "agent").strip()[:64],
-            created_at=now_iso,
-            related_sources=norm_srcs,
-            tags=clean_tags,
-            text=clean_text,
-        )
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(out_path)
+        with file_lock(nroot / ".memory.lock", blocking=True):
+            payload = _serialize_note(
+                note_id=note_id,
+                kind=k_norm,
+                status="active",
+                author=(author or "agent").strip()[:64],
+                created_at=now_iso,
+                related_sources=norm_srcs,
+                tags=clean_tags,
+                text=clean_text,
+            )
+            atomic_write_text(out_path, payload)
 
         with self._lock:
             self._cache_sig = None
@@ -297,9 +330,8 @@ class MemoryStore:
             text=target.text,
             consolidated_into=consolidated_into,
         )
-        tmp = target.file_path.with_name(f".{target.file_path.name}.tmp-{os.getpid()}")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(target.file_path)
+        with file_lock(self.cfg.notes_root / ".memory.lock", blocking=True):
+            atomic_write_text(target.file_path, payload)
         with self._lock:
             self._cache_sig = None
         return True
@@ -335,7 +367,7 @@ class MemoryStore:
             for s in related_sources:
                 s_str = str(s).strip()
                 if s_str:
-                    norm_srcs.append(self.cfg.normalize_source_ref(s_str))
+                    norm_srcs.append(self.cfg.normalize_memory_ref(s_str))
             final_srcs: Sequence[str] = norm_srcs
         else:
             final_srcs = target.related_sources
@@ -356,9 +388,8 @@ class MemoryStore:
             tags=final_tags,
             text=new_text,
         )
-        tmp = target.file_path.with_name(f".{target.file_path.name}.tmp-{os.getpid()}")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(target.file_path)
+        with file_lock(self.cfg.notes_root / ".memory.lock", blocking=True):
+            atomic_write_text(target.file_path, payload)
         with self._lock:
             self._cache_sig = None
         return self.get_note(note_id)

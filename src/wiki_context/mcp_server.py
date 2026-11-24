@@ -19,8 +19,9 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import __version__
 from .config import VaultConfig
@@ -36,6 +37,9 @@ from .search import (
     tokenize_query,
 )
 
+if TYPE_CHECKING:
+    from .telemetry import TelemetryStore
+
 MAX_READ_LINES = 400
 MAX_STDIN_BYTES = 4 * 1024 * 1024
 SNAPSHOT_DRAIN_SECONDS = 30.0
@@ -45,6 +49,14 @@ _SECRET_PATTERNS = (
     (
         re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"),
         "[REDACTED_PRIVATE_KEY]",
+    ),
+    (
+        re.compile(r"\bwctx1_[A-Za-z0-9_-]{12,}\b"),
+        "[REDACTED_PAIR_CODE]",
+    ),
+    (
+        re.compile(r"\bwctx_[A-Za-z0-9_-]{8,}\b"),
+        "[REDACTED_WCTX_TOKEN]",
     ),
     (
         re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}\b"),
@@ -61,6 +73,70 @@ _SECRET_PATTERNS = (
     (
         re.compile(r"(?i)\b(cookie\s*:\s*)[^\r\n]{8,}"),
         r"\1[REDACTED_COOKIE]",
+    ),
+    (
+        # Aliyun AccessKey ID
+        re.compile(r"\bLTAI[A-Za-z0-9]{12,30}\b"),
+        "[REDACTED_ACCESS_KEY_ID]",
+    ),
+    (
+        # Labeled credentials: `密码：xxx`, `AccessKey Secret: xxx`, `password=xxx`, `token: xxx` ...
+        re.compile(
+            r"(?i)((?:登录密码|密码|口令|私钥|助记词|password|passwd|pwd|passphrase|"
+            r"access\s*key\s*secret|secret\s*(?:access\s*)?key|client[_\s-]*secret|app[_\s-]*secret|"
+            r"api[_\s-]*key|auth[_\s-]*key|access[_\s-]*token|refresh[_\s-]*token|token)"
+            r"[\s*_`]*[:：=][\s*_`]*)([^\s|`*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Host credential pair: `1.2.3.4：ubuntu / p@ss`, `host.example.com: root/p@ss`
+        re.compile(
+            r"((?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\.[a-z]{2,})"
+            r"[\]\)]?[^\n|]{0,40}?[:：]\s*`?[A-Za-z_][\w.@-]{0,31}`?\s*/\s*)(?!\s)([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Chinese label separated only by whitespace: `密码 abcd1234`, `口令 p@ss`
+        re.compile(r"((?:登录密码|密码|口令)[ \t]+)([!-~]{4,})"),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Unlabeled but strongly password-shaped value after a colon: `sats量化： ^1234Qwer$`
+        re.compile(
+            r"([:：][ \t]*)"
+            r"(?=[^\s]*[A-Za-z])(?=[^\s]*\d)(?=[^\s]*[!@#$%^~])"
+            r"([^\s|`./:&=*+\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef()\[\]{}<>\"',;]{8,64})(?=\s|$)"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Env-style labels: `API_V3_KEY: xxx`, `DB_PASSWORD=xxx`, `GITHUB_TOKEN=xxx`
+        re.compile(
+            r"(\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD)\b\s*[:：=]\s*)"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})",
+            re.I,
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Whitespace host credential triple: `1.2.3.4 root p@ss`, `[1.2.3.4](http://…) ubuntu p@ss`
+        re.compile(
+            r"(\b(?:\d{1,3}\.){3}\d{1,3}\S*\s+(?:root|ubuntu|admin|administrator|user|pi|ec2-user|centos|debian|oracle)\s+)"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Account + password-shaped token: `13800000000 p@ss1234`, `[a@b.com](mailto:a@b.com) Pass1234`
+        re.compile(
+            r"((?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\)?)[ \t]+)"
+            r"(?![^\s]*@[\w-]+\.[A-Za-z])(?![A-Za-z][\w+.-]*://)"
+            r"(?=[^\s]*(?:[!@#$%^&*~+=?]|\d[^\s]*[A-Za-z]|[A-Za-z][^\s]*\d))"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{6,})"
+        ),
+        r"\1[REDACTED_SECRET]",
     ),
 )
 
@@ -226,7 +302,8 @@ TOOLS_SPEC: list[dict] = [
         "name": "wiki_remember",
         "description": (
             "Save a domain operational finding, field troubleshooting insight, or source-anchored errata pin into Layer-4 "
-            "`notes/` (`记忆/`). Never mutates read-only `sources/`; automatically inherits `PrefixACLPolicy` from `related_sources`."
+            "`notes/` (`记忆/`). Never mutates read-only `sources/`; automatically inherits `PrefixACLPolicy` from `related_sources`. "
+            "Do not put credentials (passwords, keys, tokens) in notes; they are redacted."
         ),
         "inputSchema": {
             "type": "object",
@@ -240,7 +317,11 @@ TOOLS_SPEC: list[dict] = [
                 "related_sources": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional primary source paths (e.g. `sources/specs/rfc-042.md`) for 1-hop pinning & ACL inheritance.",
+                    "description": (
+                        "Optional anchors for 1-hop pinning & ACL inheritance. Use the file that actually contains the fact: "
+                        "a primary source (`sources/...` / `史料/...`) or, when the fact exists only in the compiled wiki, "
+                        "the wiki page (`wiki/...` / `知识库/...`)."
+                    ),
                 },
                 "tags": {
                     "type": "array",
@@ -290,12 +371,109 @@ class KBSnapshot:
     generation_id: str
     mtime_key: tuple[int, int]
     index: BM25Index
-    docs: list[dict]
     summary: dict
-    mirror_by_source: dict[str, Path]
-    pages_by_source: dict[str, list[dict]]
-    duplicates_by_source: dict[str, list[str]]
-    assets_by_source: dict[str, list[dict]]
+    gen_dir: Path
+    cfg: VaultConfig
+    exclude_patterns: tuple[str, ...] = ()
+    _lazy_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _docs_cache: list[dict] | None = field(default=None, repr=False)
+    _mirror_by_source_cache: dict[str, Path] | None = field(default=None, repr=False)
+    _duplicates_by_source_cache: dict[str, list[str]] | None = field(default=None, repr=False)
+    _pages_by_source_cache: dict[str, list[dict]] | None = field(default=None, repr=False)
+    _assets_by_source_cache: dict[str, list[dict]] | None = field(default=None, repr=False)
+
+    def _ensure_docs_loaded(self) -> None:
+        if self._docs_cache is not None:
+            return
+        with self._lazy_lock:
+            if self._docs_cache is not None:
+                return
+            docs: list[dict] = []
+            mirror_by_source: dict[str, Path] = {}
+            duplicates_by_source: dict[str, list[str]] = {}
+            docs_p = self.gen_dir / "docs.jsonl"
+            if docs_p.is_file():
+                for line in docs_p.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    src = row.get("source") or ""
+                    if is_excluded_source(src, self.exclude_patterns):
+                        continue
+                    docs.append(row)
+                    m_rel = self.cfg.strip_mirror_prefix(row.get("mirror") or "")
+                    if m_rel:
+                        cand = (self.cfg.mirrors_root / m_rel).resolve()
+                        if row.get("manifest") is not False or src not in mirror_by_source:
+                            mirror_by_source[src] = cand
+                    if row.get("duplicates"):
+                        duplicates_by_source[src] = list(row["duplicates"])
+            self._mirror_by_source_cache = mirror_by_source
+            self._duplicates_by_source_cache = duplicates_by_source
+            self._docs_cache = docs
+
+    def _ensure_pages_loaded(self) -> None:
+        if self._pages_by_source_cache is not None:
+            return
+        with self._lazy_lock:
+            if self._pages_by_source_cache is not None:
+                return
+            pages_by_source: dict[str, list[dict]] = {}
+            pages_p = self.gen_dir / "pages.jsonl"
+            if pages_p.is_file():
+                for line in pages_p.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    src = row.get("source") or ""
+                    if not is_excluded_source(src, self.exclude_patterns):
+                        pages_by_source.setdefault(src, []).append(row)
+            self._pages_by_source_cache = pages_by_source
+
+    def _ensure_assets_loaded(self) -> None:
+        if self._assets_by_source_cache is not None:
+            return
+        self._ensure_docs_loaded()
+        with self._lazy_lock:
+            if self._assets_by_source_cache is not None:
+                return
+            assets_by_source: dict[str, list[dict]] = {}
+            for src, m_cand in (self._mirror_by_source_cache or {}).items():
+                sc_path = m_cand.with_suffix("")
+                sc_json = Path(str(sc_path) + ".json")
+                if sc_json.is_file():
+                    try:
+                        sc_data = json.loads(sc_json.read_text(encoding="utf-8"))
+                        if isinstance(sc_data, dict) and sc_data.get("assets"):
+                            assets_by_source[src] = list(sc_data["assets"])
+                    except (OSError, ValueError):
+                        pass
+            self._assets_by_source_cache = assets_by_source
+
+    @property
+    def docs(self) -> list[dict]:
+        self._ensure_docs_loaded()
+        return self._docs_cache or []
+
+    @property
+    def mirror_by_source(self) -> dict[str, Path]:
+        self._ensure_docs_loaded()
+        return self._mirror_by_source_cache or {}
+
+    @property
+    def duplicates_by_source(self) -> dict[str, list[str]]:
+        self._ensure_docs_loaded()
+        return self._duplicates_by_source_cache or {}
+
+    @property
+    def pages_by_source(self) -> dict[str, list[dict]]:
+        self._ensure_pages_loaded()
+        return self._pages_by_source_cache or {}
+
+    @property
+    def assets_by_source(self) -> dict[str, list[dict]]:
+        self._ensure_assets_loaded()
+        return self._assets_by_source_cache or {}
 
 
 class KBService:
@@ -307,6 +485,10 @@ class KBService:
         *,
         policy: AccessPolicy | None = None,
         synonym_book: SynonymBook | None = None,
+        telemetry: TelemetryStore | None = None,
+        telemetry_vault_id: str = "",
+        telemetry_mode: str = "stdio",
+        owns_telemetry: bool = False,
     ):
         self.cfg = VaultConfig.load(vault)
         self.vault = self.cfg.root
@@ -316,6 +498,11 @@ class KBService:
             or os.environ.get("KB_USER")
             or "local"
         ).strip()
+        self.client_name = (os.environ.get("WCTX_CLIENT") or "").strip() or "cli"
+        self.telemetry = telemetry
+        self.telemetry_vault_id = telemetry_vault_id or self.cfg.name
+        self.telemetry_mode = telemetry_mode
+        self._owns_telemetry = owns_telemetry
 
         if self.cfg.sensitive:
             if self.identity in {"", "anonymous", "local"} or os.environ.get("WCTX_INTERNAL_MODEL") != "1":
@@ -336,14 +523,26 @@ class KBService:
         self._retired: list[tuple[float, KBSnapshot]] = []
         self._audit_log = (os.environ.get("WCTX_AUDIT_LOG") or os.environ.get("KB_AUDIT_LOG") or "").strip()
         self._audit_lock = threading.Lock()
-        self._snapshot: KBSnapshot = self._load_snapshot()
+        # Last index load/hot-swap failure (e.g. an incompatible generation written by a
+        # legacy indexer). The server stays up: it keeps serving the last-known-good
+        # snapshot, or answers each tool call with a clear error until the index is fixed.
+        self._snapshot_error: str | None = None
+        self._snapshot: KBSnapshot | None
+        try:
+            self._snapshot = self._load_snapshot()
+        except IndexUnavailableError as exc:
+            self._snapshot = None
+            self._snapshot_error = str(exc)
 
     def close(self) -> None:
         with self._snap_lock:
-            snaps = [self._snapshot, *(s for _, s in self._retired)]
+            snaps = [*([self._snapshot] if self._snapshot is not None else []), *(s for _, s in self._retired)]
+            self._snapshot = None
             self._retired.clear()
         for s in snaps:
             s.index.close()
+        if self._owns_telemetry and self.telemetry is not None:
+            self.telemetry.close()
 
     def _current_mtime_key(self) -> tuple[int, int]:
         cur = self.cfg.index_root / "current.json"
@@ -362,61 +561,15 @@ class KBService:
         if sum_p.is_file():
             summary = json.loads(sum_p.read_text(encoding="utf-8"))
 
-        docs: list[dict] = []
-        mirror_by_source: dict[str, Path] = {}
-        duplicates_by_source: dict[str, list[str]] = {}
-        docs_p = gen_dir / "docs.jsonl"
-        if docs_p.is_file():
-            for line in docs_p.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                src = row.get("source") or ""
-                if is_excluded_source(src, self.exclude_patterns):
-                    continue
-                docs.append(row)
-                m_rel = self.cfg.strip_mirror_prefix(row.get("mirror") or "")
-                if m_rel:
-                    cand = (self.cfg.mirrors_root / m_rel).resolve()
-                    if row.get("manifest") is not False or src not in mirror_by_source:
-                        mirror_by_source[src] = cand
-                if row.get("duplicates"):
-                    duplicates_by_source[src] = list(row["duplicates"])
-
-        pages_by_source: dict[str, list[dict]] = {}
-        pages_p = gen_dir / "pages.jsonl"
-        if pages_p.is_file():
-            for line in pages_p.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                src = row.get("source") or ""
-                if not is_excluded_source(src, self.exclude_patterns):
-                    pages_by_source.setdefault(src, []).append(row)
-
-        assets_by_source: dict[str, list[dict]] = {}
-        for src, m_cand in mirror_by_source.items():
-            sc_path = m_cand.with_suffix("")  # `<rel>.md` -> `<rel>`
-            sc_json = Path(str(sc_path) + ".json")
-            if sc_json.is_file():
-                try:
-                    sc_data = json.loads(sc_json.read_text(encoding="utf-8"))
-                    if isinstance(sc_data, dict) and sc_data.get("assets"):
-                        assets_by_source[src] = list(sc_data["assets"])
-                except (OSError, ValueError):
-                    pass
-
         gen_id = str(summary.get("generation_id") or gen_dir.name)
         return KBSnapshot(
             generation_id=gen_id,
             mtime_key=mkey,
             index=index,
-            docs=docs,
             summary=summary,
-            mirror_by_source=mirror_by_source,
-            pages_by_source=pages_by_source,
-            duplicates_by_source=duplicates_by_source,
-            assets_by_source=assets_by_source,
+            gen_dir=gen_dir,
+            cfg=self.cfg,
+            exclude_patterns=self.exclude_patterns,
         )
 
     def _get_snapshot(self) -> KBSnapshot:
@@ -433,27 +586,41 @@ class KBService:
                     still_waiting.append((exp_ts, old_s))
             self._retired = still_waiting
 
-            if now_key != self._snapshot.mtime_key and now_key != (0, 0):
+            cur = self._snapshot
+            if cur is None or (now_key != cur.mtime_key and now_key != (0, 0)):
                 try:
                     fresh = self._load_snapshot()
-                    self._retired.append((now_ts + SNAPSHOT_DRAIN_SECONDS, self._snapshot))
+                except Exception as exc:  # noqa: BLE001 - never let a bad generation kill the server
+                    # Retain last-known-good snapshot if a mid-swap error occurs, but remember
+                    # why so wiki_status / tool errors can tell the agent what to fix.
+                    self._snapshot_error = str(exc) or exc.__class__.__name__
+                    if cur is not None:
+                        # Do not retry the same broken generation on every call.
+                        cur.mtime_key = now_key
+                else:
+                    if cur is not None:
+                        self._retired.append((now_ts + SNAPSHOT_DRAIN_SECONDS, cur))
                     self._snapshot = fresh
-                except Exception:
-                    # Retain last-known-good snapshot if mid-swap error occurs
-                    pass
+                    self._snapshot_error = None
             active = self._snapshot
+            err = self._snapshot_error
 
         for s in to_close:
             s.index.close()
+        if active is None:
+            raise IndexUnavailableError(err or "Index is not available; run `wctx index` first")
         return active
 
     def _resolve_mirror_jailed(self, snap: KBSnapshot, source: str, rel_from_sources: str) -> Path | None:
         m_root = self.cfg.mirrors_root.resolve()
-        cand = snap.mirror_by_source.get(source)
-        if cand is None:
-            cand = (m_root / f"{rel_from_sources}.md").resolve()
+        cand = (m_root / f"{rel_from_sources}.md").resolve()
         if m_root not in cand.parents or cand.is_symlink() or not cand.is_file():
-            return None
+            cand_mapped = snap.mirror_by_source.get(source)
+            if cand_mapped is None:
+                return None
+            cand = cand_mapped
+            if m_root not in cand.parents or cand.is_symlink() or not cand.is_file():
+                return None
         rel_m = cand.relative_to(m_root).as_posix()
         if mirror_skip_reason(cand, rel_m, cfg=self.cfg) is not None:
             return None
@@ -775,6 +942,7 @@ class KBService:
             "failed_count": s.get("failed_count", 0),
             "failed_sources": (s.get("failed_sources") or [])[:20],
             "generated_at": s.get("generated_at"),
+            **({"index_warning": self._snapshot_error} if self._snapshot_error else {}),
         }
 
     def tool_inspect_visual(self, args: dict, *, principal: Principal | None = None) -> tuple[list[dict] | dict, bool]:
@@ -872,11 +1040,21 @@ class KBService:
             return {"error": "text must not be empty"}
         kind = str(args.get("kind") or "insight").strip().lower()
         rel_srcs = [str(x) for x in (args.get("related_sources") or ()) if str(x).strip()]
-        # Verify caller has read access to every source they anchor a note to
+        # Verify caller has read access to every source / wiki page they anchor a note to
+        missing_refs: list[str] = []
         for s in rel_srcs:
-            norm_s = self.cfg.normalize_source_ref(s)
-            if not self.policy.can_access_source(user, norm_s):
+            norm_s = self.cfg.normalize_memory_ref(s)
+            if self.cfg.is_wiki_ref(norm_s):
+                page_refs = list(self.context_engine.memory_store._wiki_page_sources(norm_s))
+                allowed = self.policy.can_access_wiki(user, norm_s, page_refs)
+                exists = (self.cfg.wiki_root / norm_s[len(self.cfg.wiki_prefix):]).is_file()
+            else:
+                allowed = self.policy.can_access_source(user, norm_s)
+                exists = (self.cfg.sources_root / self.cfg.strip_source_prefix(norm_s)).exists()
+            if not allowed:
                 return {"error": f"Access denied to related_source: {norm_s}"}
+            if not exists:
+                missing_refs.append(norm_s)
         tags = [str(x) for x in (args.get("tags") or ()) if str(x).strip()]
         try:
             note = self.context_engine.memory_store.remember(
@@ -888,13 +1066,21 @@ class KBService:
             )
         except ValueError as exc:
             return {"error": str(exc)}
-        return {
+        out = {
             "saved": True,
             "note_id": note.note_id,
             "kind": note.kind,
             "related_sources": list(note.related_sources),
             "file": f"{self.cfg.notes_dir}/{note.file_path.name}",
         }
+        if missing_refs:
+            out["warning"] = (
+                "related_sources not found in the vault: " + ", ".join(missing_refs)
+                + ". Anchor notes to the file that actually contains the fact."
+            )
+        if note.text != text:
+            out["redacted"] = True
+        return out
 
     def tool_forget(self, args: dict, *, principal: Principal | None = None, is_remote: bool = False) -> dict:
         user = principal or Principal(uid=self.identity)
@@ -967,8 +1153,64 @@ class KBService:
             is_err = True
             payload_out = json.dumps(out, ensure_ascii=False)
 
-        self._write_audit(user.uid, name, args, out, round((time.perf_counter() - t0) * 1000, 2))
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        self._write_audit(user.uid, name, args, out, elapsed_ms)
+        self._record_telemetry(
+            principal=user,
+            tool=canonical,
+            args=args,
+            out=out,
+            elapsed_ms=elapsed_ms,
+            is_err=is_err,
+            is_remote=is_remote,
+        )
         return payload_out, is_err
+
+    def _record_telemetry(
+        self,
+        *,
+        principal: Principal,
+        tool: str,
+        args: dict,
+        out: dict,
+        elapsed_ms: float,
+        is_err: bool,
+        is_remote: bool,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        query_str = str(args.get("question") or args.get("query") or args.get("source") or args.get("filter") or "")
+        hit_sources: list[str] = []
+        if isinstance(out, dict):
+            for h in (out.get("wiki_hits") or ()):
+                if isinstance(h, dict) and h.get("source"):
+                    hit_sources.append(str(h["source"]))
+            for h in (out.get("primary_hits") or out.get("hits") or ()):
+                if isinstance(h, dict) and h.get("source"):
+                    hit_sources.append(str(h["source"]))
+            if out.get("source"):
+                hit_sources.append(str(out["source"]))
+
+        client_lbl = f"remote:{principal.uid}" if is_remote else self.client_name
+        mode_lbl = "http" if is_remote else self.telemetry_mode
+        self.telemetry.record({
+            "client": client_lbl,
+            "mode": mode_lbl,
+            "principal_uid": principal.uid,
+            "vault_id": self.telemetry_vault_id,
+            "tool": tool,
+            "query": query_str,
+            "route": str(out.get("route") or "") if isinstance(out, dict) else "",
+            "elapsed_ms": elapsed_ms,
+            "wiki_count": int(out.get("wiki_count") or len(out.get("wiki_hits") or ())) if isinstance(out, dict) else 0,
+            "primary_count": int(out.get("primary_count") or len(out.get("hits") or ())) if isinstance(out, dict) else 0,
+            "memory_count": int(out.get("memory_count") or 0) if isinstance(out, dict) else 0,
+            "acl_filtered_count": int(out.get("acl_filtered_count") or 0) if isinstance(out, dict) else 0,
+            "missing_concepts": (out.get("missing_concepts") or []) if isinstance(out, dict) else [],
+            "hit_sources": list(dict.fromkeys(hit_sources)),
+            "is_error": is_err,
+            "error_text": str(out.get("error") or "") if (is_err and isinstance(out, dict)) else "",
+        })
 
     def _write_audit(self, uid: str, tool: str, args: dict, out: dict, elapsed_ms: float) -> None:
         if not self._audit_log:
@@ -1049,6 +1291,11 @@ def handle_jsonrpc_message(
             payload, is_err = svc.dispatch_tool(tname, targs, principal=principal, is_remote=slim_remote)
         except IndexUnavailableError as exc:
             payload, is_err = json.dumps({"error": str(exc)}, ensure_ascii=False), True
+        except Exception as exc:  # noqa: BLE001 - a tool failure must not take down the transport
+            payload = json.dumps(
+                {"error": f"Tool '{tname}' failed: {exc.__class__.__name__}: {exc}"}, ensure_ascii=False
+            )
+            is_err = True
         content_blocks = payload if isinstance(payload, list) else [{"type": "text", "text": payload}]
         return {
             "jsonrpc": "2.0",
@@ -1063,8 +1310,27 @@ def handle_jsonrpc_message(
     }
 
 
+def _write_stdout_json(obj: dict) -> None:
+    payload = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8", errors="replace")
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(payload)
+        buf.flush()
+    else:
+        sys.stdout.write(payload.decode("utf-8"))
+        sys.stdout.flush()
+
+
 def run_stdio_server(vault: Path | str) -> int:
-    svc = KBService(vault)
+    tel = None
+    if os.environ.get("WCTX_TELEMETRY", "1").strip().lower() not in {"0", "false", "no"}:
+        try:
+            from .telemetry import TelemetryStore
+            db_override = os.environ.get("WCTX_TELEMETRY_DB") or None
+            tel = TelemetryStore(db_path=db_override, async_writer=False)
+        except Exception:
+            tel = None
+    svc = KBService(vault, telemetry=tel, telemetry_mode="stdio", owns_telemetry=True)
     try:
         while True:
             raw_line = sys.stdin.buffer.readline(MAX_STDIN_BYTES + 1)
@@ -1072,8 +1338,7 @@ def run_stdio_server(vault: Path | str) -> int:
                 break
             if len(raw_line) > MAX_STDIN_BYTES:
                 err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Request line too large"}}
-                sys.stdout.write(json.dumps(err) + "\n")
-                sys.stdout.flush()
+                _write_stdout_json(err)
                 continue
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -1082,13 +1347,22 @@ def run_stdio_server(vault: Path | str) -> int:
                 msg = json.loads(line)
             except ValueError:
                 err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
-                sys.stdout.write(json.dumps(err) + "\n")
-                sys.stdout.flush()
+                _write_stdout_json(err)
                 continue
-            resp = handle_jsonrpc_message(svc, msg)
+            try:
+                resp = handle_jsonrpc_message(svc, msg)
+            except Exception as exc:  # noqa: BLE001 - keep the stdio session alive
+                req_id = msg.get("id") if isinstance(msg, dict) else None
+                if isinstance(msg, dict) and "id" not in msg:
+                    resp = None  # notification: no response allowed
+                else:
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32603, "message": f"Internal error: {exc.__class__.__name__}: {exc}"},
+                    }
             if resp is not None:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                _write_stdout_json(resp)
     finally:
         svc.close()
     return 0

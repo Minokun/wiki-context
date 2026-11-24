@@ -24,6 +24,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from . import __version__
 from .clients import inspect_all_clients, resolve_wctx_command
+from .state_lock import resolve_external_tool
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -374,9 +375,10 @@ def run_doctor(
             pass
 
     cmd, base_args = resolve_wctx_command()
-    wctx_in_path = shutil.which("wctx")
-    pdftotext_path = shutil.which("pdftotext")
-    pdftoppm_path = shutil.which("pdftoppm")
+    wctx_in_path = shutil.which("wctx") or (cmd if Path(cmd).name.startswith("wctx") else None)
+    pdftotext_path = resolve_external_tool("pdftotext")
+    pdftoppm_path = resolve_external_tool("pdftoppm")
+    tailscale_path = resolve_external_tool("tailscale")
     ocr_cmd = (os.environ.get("WCTX_OCR_CMD") or "").strip()
     asr_cmd = (os.environ.get("WCTX_ASR_CMD") or "").strip()
     vlm_key_set = bool((os.environ.get("WCTX_VLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip())
@@ -452,6 +454,7 @@ def run_doctor(
         "tools": {
             "pdftotext": {"available": bool(pdftotext_path), "path": pdftotext_path or "", "install_hint": poppler_hint},
             "pdftoppm": {"available": bool(pdftoppm_path), "path": pdftoppm_path or "", "install_hint": poppler_hint},
+            "tailscale": {"available": bool(tailscale_path), "path": tailscale_path or ""},
             "ocr_cmd_configured": bool(ocr_cmd),
             "asr_cmd_configured": bool(asr_cmd),
             "vlm_key_configured": vlm_key_set,

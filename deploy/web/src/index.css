@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --font-sans: "Plus Jakarta Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --font-disp: "Archivo", "Plus Jakarta Sans", "Noto Sans SC", sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+    --bg-app: #EEF0F4;
+    --bg-toolbar: rgba(245, 246, 249, 0.94);
+    --bg-sidebar: #F4F5F8;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #F7F9FC;
+    --bg-muted: #E6E9F0;
+
+    --border-strong: #CBD2E0;
+    --border-default: #DFE3EC;
+    --border-subtle: #ECEFF5;
+
+    --ink-primary: #14171F;
+    --ink-secondary: #475061;
+    --ink-muted: #687082;
+
+    --accent: #1A56DB;
+    --accent-hover: #1648B8;
+    --accent-soft: #E8F0FE;
+    --brand-mono: #181C25;
+
+    --chart-plot-bg: #F9FBFE;
+    --chart-axis: #CBD5E1;
+    --chart-grid-major: #DCE3EF;
+    --chart-grid-minor: #ECF0F7;
+    --chart-bar: rgba(100, 116, 139, 0.12);
+    --chart-bar-active: rgba(26, 86, 219, 0.16);
+    --chart-stdio: #1A56DB;
+    --chart-http: #0891B2;
+    --chart-block: #E11D48;
+    --chart-amber: #D97706;
+  }
+
+  :root.dark {
+    color-scheme: dark;
+    --bg-app: #0C0F16;
+    --bg-toolbar: rgba(17, 21, 30, 0.94);
+    --bg-sidebar: #111620;
+    --bg-surface: #151B26;
+    --bg-subtle: #1B2230;
+    --bg-muted: #222B3C;
+
+    --border-strong: #333F56;
+    --border-default: #252F42;
+    --border-subtle: #1E2636;
+
+    --ink-primary: #F1F5F9;
+    --ink-secondary: #B8C3D6;
+    --ink-muted: #8491A8;
+
+    --accent: #3B82F6;
+    --accent-hover: #2563EB;
+    --accent-soft: rgba(59, 130, 246, 0.18);
+    --brand-mono: #E2E8F0;
+
+    --chart-plot-bg: #111621;
+    --chart-axis: #334155;
+    --chart-grid-major: #243044;
+    --chart-grid-minor: #1B2333;
+    --chart-bar: rgba(148, 163, 184, 0.14);
+    --chart-bar-active: rgba(59, 130, 246, 0.26);
+    --chart-stdio: #60A5FA;
+    --chart-http: #22D3EE;
+    --chart-block: #FB7185;
+    --chart-amber: #FBBF24;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--bg-app);
+    color: var(--ink-primary);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  .theme-switching,
+  .theme-switching *,
+  .theme-switching *::before,
+  .theme-switching *::after {
+    transition: none !important;
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  .font-disp {
+    font-family: var(--font-disp);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 130, 150, 0.28);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 130, 150, 0.46);
+}

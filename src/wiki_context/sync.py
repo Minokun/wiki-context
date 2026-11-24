@@ -12,10 +12,6 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
-try:
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 import hashlib
 import json
 import os
@@ -28,6 +24,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import VaultConfig
+from .state_lock import atomic_write_text, file_lock, resolve_external_tool
 from .extract import (
     ExtractedDocument,
     _extract_transcript,
@@ -176,7 +173,7 @@ class HttpVLMProvider:
 
 
 def _render_pdf_visual_pages(pdf_path: Path, asset_dir: Path, visual_pages: list[int], *, max_pages: int = 12) -> list[dict]:
-    pdftoppm = shutil.which("pdftoppm")
+    pdftoppm = resolve_external_tool("pdftoppm")
     if not pdftoppm or not visual_pages:
         return []
     rendered: list[dict] = []
@@ -213,10 +210,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, content)
 
 
 def sync_vault(
@@ -246,12 +240,11 @@ def sync_vault(
     vlm = vlm_provider or HttpVLMProvider.from_env()
 
     lock_path = cfg.mirrors_root / ".sync.lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_fh:
-        if fcntl is not None:
-            try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError("Another sync process is already running on this vault") from exc
+    with file_lock(
+        lock_path,
+        blocking=False,
+        busy_message="Another sync process is already running on this vault",
+    ):
 
         manifest_path = cfg.mirrors_root / ".manifest.json"
         failed_path = cfg.mirrors_root / ".failed.json"

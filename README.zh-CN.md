@@ -163,6 +163,11 @@ pip install -e .
 wctx doctor
 ```
 
+> **让 AI 帮你自动下载并安装（推荐）**：如果你已经在使用 Claude Code、Cursor、Codex CLI 等任意编码 Agent，可以直接把下面这句话发给它：
+> ```text
+> 请从 https://github.com/Minokun/wiki-context.git 下载安装 wiki-context（用 pipx 或 Python >= 3.14 的独立环境安装），运行 wctx doctor 检查环境，并打开 wctx ui 帮我引导配置。
+> ```
+
 *（全程无需下载任何第三方 Python 依赖包；如需原生提取 PDF 文本与渲染 PDF 视觉页，可按需安装系统级 `poppler`：`brew install poppler` 或 `sudo apt install poppler-utils`。）*
 
 ### 2. 运行内置可复现基准评测
@@ -209,14 +214,250 @@ wctx ui
 
 ---
 
-## 可视化 Web 控制中心（`wctx ui`）
+## 使用场景与部署指南（个人 / 局域网 / 服务器 / 纯 MCP 接入）
 
-不想手改多份配置文件？直接运行 `wctx ui`（零第三方依赖，默认绑定本机 `http://127.0.0.1:8765` 并内置 CSRF 防护，同时挂载多库 HTTP 网关），在一个清爽页面内完成全流程管控：
+不同角色只需按自己的场景选一种方式即可，无需全部折腾：
 
-1. **文件夹纳管与一键初始化**：内置本地目录浏览器，支持识别「空白目录」「已有知识库」以及「已存有零散文档的普通文件夹」（自动将现有资料安全归入只读 `史料/` 层并构建四层结构与 FTS5 索引），支持向现有库导入外部资料夹、一键增量同步、健康体检与 `wiki_context` 在线演练。
-2. **令牌签发与多级访问权限（RBAC）**：可视化签发 SHA-256 哈希令牌（明文仅展示一次），精确勾选每枚令牌**允许访问的知识库范围（`allowed_vaults`）**与**角色目录前缀白/黑名单（`allow`/`deny`）**，内置**权限沙盒验证器**即时预览被拦截的原件及因溯源继承自动隐藏的 Wiki 页面，保存即热生效。
-3. **多客户端 MCP 插件一键配置**：自动检测本机 **DeepSeek Harness (DSH)**、**Codex CLI**、**Claude Code**、**WorkBuddy**、**Cursor** 与 **Antigravity (AGY)**，支持本地直连（`stdio`）与令牌网关（`streamable-http` / `bridge`）双模式片段预览、自动备份（`.wctx.bak`）及无损合并写入（DSH 自动递增 `WCTX_MCP_VERSION` 热重载，并同步 Magpie 配置库）。
-4. **第 4 层记忆与勘误钉可视化管理**：按知识库、类型（`errata` 原件勘误钉 / `insight` / `decision` / `glossary`）与状态筛选搜索记忆，支持关联原件自动补全、新建、编辑、归档遗忘（`forget`）、恢复生效与 JSON 批量导入。
+| 使用场景 | 推荐方式 | 对方/本机需要装什么？ | 适用说明 |
+| :--- | :--- | :--- | :--- |
+| **1. 个人本机使用** | **桌面 App** 或 **`wctx ui`（Web 端）** | 本机装桌面 App（或 `wctx`） | 拖入本地文件夹即可建索引，自动扫描并一键连本机 19 款主流 AI 工具 |
+| **2. 个人多电脑 / 局域网共享** | 桌面 App / `wctx ui` 开启局域网共享 | 两台电脑装桌面 App 或 `wctx` | 生成 5 分钟一次性配对码，免填 IP 自动互联 |
+| **3. 团队服务器部署（管理员）** | **`wctx gateway`** + **`wctx service install`** | 服务器装 Python 3.14+、`wctx`（可选 `poppler`） | 多人共享、Bearer 密钥鉴权、按文件夹隔绝权限；按需 SSH 隧道开 `wctx ui` |
+| **4. 纯 MCP 接入团队服务器（支持 HTTP MCP）** | **客户端直连 Streamable HTTP** | **零安装**（无需装 Python 或 `wctx`） | 向管理员拿 URL + 个人密钥 `wctx_...`，直接填进 Claude Code / Cursor / VS Code / WorkBuddy |
+| **5. 纯 MCP 接入团队服务器（仅支持 stdio / 一键全配）** | **`wctx remote add`** 或 **`wctx bridge`** | 仅需全局装 `wctx` CLI（或桌面端） | 自动发现并同步本机全部 AI 工具，或为仅支持本地 stdio 的工具做轻量转发 |
+
+---
+
+### 场景一：个人本机使用（桌面 App 或 Web 端）
+
+- **方式 A：桌面 App（推荐）**  
+  打开 `wiki-context.app`，把本地资料文件夹拖进去（支持 Markdown、PDF、Word、Excel、PPT），在右上角「整理模型设置」填入大模型 API Key 即可后台自动整理摘要、监听文件变动并托盘常驻。进入 **「设备与客户端」** 页会自动扫描本机已安装的 **19 款主流 AI 工具**并保留原有配置，点一下即可完成连接（支持随时查看或单独断开）：
+  - **IDE 编辑器**：**Cursor、VS Code (Copilot)、Windsurf、Trae、Kiro、Cline、Roo Code、Antigravity (AGY)、Zed**
+  - **命令行 CLI**：**Claude Code、Codex CLI、Gemini CLI、Qwen Code、Kimi CLI、OpenCode**
+  - **桌面客户端**：**Claude Desktop、WorkBuddy、LM Studio、DeepSeek Harness (DSH)**
+- **方式 B：Web 控制中心（`wctx ui`）**  
+  不装桌面端也可以直接跑命令启动内置 Web 管理界面（界面源码已打包在 Python 包内，**无需安装 Node.js 或单独部署前端**）：
+  ```bash
+  wctx ui                # 默认监听 http://127.0.0.1:8765 并自动打开浏览器
+  wctx ui --port 8765 --no-browser
+  ```
+- **即使关掉桌面 App / Web 端**：本机 AI 工具如果是直连模式（`wctx serve`），依然能直接查询本地索引；只有需要**自动监听文件变动、AI 自动整理新文档**或**共享给其他电脑**时，才需要保持软件运行。
+
+> **关于 `poppler` 依赖说明**：`wiki-context` 解析 Word、Excel、PPT、Markdown 均零依赖；仅当知识库里包含 **`.pdf`** 文件时，会调用系统级开源工具 **`poppler`**（提供 `pdftotext` 提取文本与表格、`pdftoppm` 渲染页面给视觉工具看图）。未安装 `poppler` 时服务可正常启动，遇到 PDF 会自动跳过并提示：
+> - macOS：`brew install poppler`
+> - Ubuntu / Debian：`sudo apt-get update && sudo apt-get install -y poppler-utils`
+
+---
+
+### 场景二：个人多电脑 / 局域网共享
+
+想在笔记本或家里电脑上直接检索主力工作机里的知识库：
+1. **主力电脑（提供端）**：打开桌面 App 或 `wctx ui` → 进入 **「设备与客户端」** → 点击 **「开启局域网共享」** → 选择共享的知识库与权限角色，点击 **「生成一次性配对码」**（5 分钟有效，用完即失效）。
+2. **另一台电脑（连接端）**：打开桌面 App 或 `wctx ui` → **「设备与客户端」** → 粘贴配对码点击 **「立即连接」**，会自动探测局域网或 Tailscale 最快链路，并一键同步到这台电脑上的 AI 工具。
+
+---
+
+### 场景三：团队服务器集中部署（管理员指南）
+
+适用于把公司/团队知识库部署到内网或云端 Linux / macOS 服务器，统一维护索引与权限，同事只需用密钥接入。
+
+> [!IMPORTANT]
+> **安全边界：`wctx ui`（Web 管理后台）vs `wctx gateway`（生产数据网关）**
+> - **`wctx ui`（默认 `8765` 端口）**：是无登录密码的本地管理后台（能浏览服务器目录、配置模型 Key、签发密钥、修改权限），**默认只允许监听 `127.0.0.1`**，切勿在公网裸开 `--allow-remote-admin`。
+> - **`wctx gateway`（默认 `8090` 端口）**：是专用于团队对外服务的无界面生产网关——**不暴露任何 `/api/*` 管理接口**，仅提供 `/healthz`、`/mcp`、`/v1/*`，并强制校验 SHA-256 Bearer 密钥与目录级 ACL 权限。
+
+#### 1. 服务器安装与体检
+
+```bash
+# 安装系统 PDF 工具（可选，有 PDF 文档时建议安装）
+sudo apt-get update && sudo apt-get install -y poppler-utils
+
+# 安装 wiki-context（要求 Python >= 3.14，零第三方 Python 依赖）
+pipx install git+https://github.com/Minokun/wiki-context.git
+# 或从源码 / wheel 安装：python3.14 -m pip install .
+
+wctx doctor
+```
+
+#### 2. 准备知识库与构建索引
+
+```bash
+wctx init /srv/vaults/company --name "公司知识库" --layout zh
+# 将文档放入 /srv/vaults/company/史料/ 后提取并建立索引
+wctx sync --vault /srv/vaults/company
+
+# （可选）调用大模型生成整理摘要并刷新索引
+export WCTX_BASE_URL="https://api.deepseek.com/v1"
+export WCTX_MODEL="deepseek-chat"
+export WCTX_API_KEY="sk-..."
+wctx compile --vault /srv/vaults/company --max-items 50
+```
+
+#### 3. 配置访问密钥与目录权限（保存即热生效）
+
+你有两种方式管理成员密钥与文件夹权限（写入 `/etc/wiki-context/tokens.json` 或 `~/.wiki-context/tokens.json`，修改保存后**无需重启网关**立即生效）：
+
+- **方式 A（推荐，通过 SSH 隧道安全使用 Web 端管理）**：  
+  在自己电脑执行端口转发，把服务器的 `127.0.0.1:8765` 映射到本地浏览器打开，外人无法访问管理后台：
+  ```bash
+  # 在本地电脑执行：
+  ssh -L 8765:127.0.0.1:8765 user@your-server
+  # 在服务器上执行：
+  wctx ui --no-browser --port 8765
+  ```
+  浏览器访问 `http://127.0.0.1:8765` 添加知识库、在「共享权限」配置角色目录树并生成密钥（也可以用 Nginx 套 HTTPS + `auth_basic` 登录密码再长期映射 Web 端）。
+- **方式 B（纯命令行生成 SHA-256 密钥文件）**：
+  ```bash
+  # 生成随机密钥及对应的 SHA-256（明文发给同事，哈希写入服务器配置）
+  python3.14 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("明文发给同事:", t); print("写入配置的 sha256:", hashlib.sha256(t.encode()).hexdigest())'
+  ```
+  写入 `/etc/wiki-context/tokens.json`（`chmod 600 /etc/wiki-context/tokens.json`）：
+  ```json
+  {
+    "tokens": [
+      {
+        "uid": "admin-wxk",
+        "token_sha256": "<管理员密钥的 sha256>",
+        "groups": ["admin"],
+        "allowed_vaults": ["*"]
+      },
+      {
+        "uid": "partner-01",
+        "token_sha256": "<成员密钥的 sha256>",
+        "groups": ["partner"],
+        "allowed_vaults": ["company"]
+      }
+    ],
+    "acl": {
+      "partner": {
+        "allow": ["史料/公开资料/**"],
+        "deny": ["史料/财务/**", "史料/涉密/**"]
+      }
+    }
+  }
+  ```
+
+#### 4. 启动常驻服务、定时更新与暴露访问
+
+```bash
+# 先在前台测试启动（如只走 Nginx 反代建议绑 127.0.0.1；内网/Tailscale 直连可绑 0.0.0.0）
+wctx gateway \
+  --vault company=/srv/vaults/company \
+  --token-file /etc/wiki-context/tokens.json \
+  --host 127.0.0.1 --port 8090
+
+# 一键安装为系统后台服务（Linux 生成 systemd --user，macOS 生成 launchd）
+wctx service install --target gateway \
+  --vault company=/srv/vaults/company \
+  --token-file /etc/wiki-context/tokens.json \
+  --host 127.0.0.1 --port 8090
+wctx service status --target gateway
+
+# Linux 建议开启用户级常驻，防止退出 SSH 后服务停止：
+sudo loginctl enable-linger $USER
+```
+
+- **对外暴露方式**：公网域名建议在前面挂 Nginx HTTPS 反代（设置 `proxy_buffering off;` 并透传 `Authorization`，详见 [网关与 Nginx 配置文档](docs/gateway-and-acl.md)）；公司内网推荐直接用 **Tailscale** 组网直连 `8090` 端口，免配证书。
+- **验收**：`curl http://127.0.0.1:8090/healthz` 返回 `200`，再测 `curl -H "Authorization: Bearer wctx_..." http://127.0.0.1:8090/v1/vaults`。
+- **定时增量更新索引**：索引采用不可变快照原子热切换，更新全程**不中断在线检索**，在 `crontab -e` 加一行即可：
+  ```cron
+  */15 * * * * wctx sync --vault /srv/vaults/company >> ~/.wiki-context/sync.log 2>&1
+  ```
+
+---
+
+### 场景四：仅通过 MCP 接入团队服务器（普通成员，无需部署服务）
+
+如果公司已经在服务器上部署好 `wctx gateway`（假设地址为 `https://kb.example.com` 或内网 `http://192.168.1.25:8090`），其他成员只管从自己电脑用 AI 工具调 MCP 查资料即可，有两种接入方式：
+
+#### 方式 4A：零安装直连 Streamable HTTP（推荐）
+
+适用支持远端 HTTP MCP 的客户端（**Claude Code、WorkBuddy、Cursor 及支持 Streamable HTTP 的自研 Agent**）——**成员电脑不用装 Python、`wiki-context` 或桌面 App**，向管理员获取「库地址」与「个人密钥 `wctx_...`」后直接配置即可（默认库用 `/mcp`，指定库用 `/mcp/<vault_id>`）：
+
+- **Claude Code**（一行命令或写入 `~/.claude.json`）：
+  ```bash
+  claude mcp add --transport http company-kb https://kb.example.com/mcp/company \
+    --header "Authorization: Bearer wctx_你的个人密钥"
+  ```
+  对应的 `~/.claude.json`：
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "type": "http",
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_你的个人密钥"
+        }
+      }
+    }
+  }
+  ```
+- **WorkBuddy**：
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "type": "streamable-http",
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_你的个人密钥"
+        }
+      }
+    }
+  }
+  ```
+- **Cursor / 其他标准 Streamable HTTP MCP 客户端**（在 `~/.cursor/mcp.json` 或客户端 MCP 设置中填入 `url` 与 `Authorization` 请求头）：
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_你的个人密钥"
+        }
+      }
+    }
+  }
+  ```
+- **也可以用 REST JSON 接口直接调**（适合脚本、CI 或自研平台）：
+  ```bash
+  curl -X POST https://kb.example.com/v1/context \
+    -H "Authorization: Bearer wctx_你的个人密钥" \
+    -H "Content-Type: application/json" \
+    -d '{"vault": "company", "question": "网关限流阈值是多少？"}'
+  ```
+
+#### 方式 4B：本地客户端仅支持 stdio / 想一键同步本机所有 AI 工具
+
+如果使用的客户端仅支持本地 `stdio` 进程（如部分版本的 **Codex CLI**、**DeepSeek Harness**、老版本工具），或服务器挂了多个知识库懒得一个个手写配置：
+
+- **方法 1：一键自动发现并写入本机已安装的 AI 工具**（支持上述 19 款主流客户端；安装 `wctx` CLI 后运行一行即可，或在桌面 App「设备与客户端 → 手动填写地址和密钥」）：
+  ```bash
+  wctx remote add --url https://kb.example.com --token wctx_你的个人密钥
+  ```
+  会自动拉取你密钥有权限访问的所有知识库，并无损写入本机已安装的客户端配置。
+- **方法 2：手动配置 `wctx bridge`（stdio 转远端 HTTP 转发）**  
+  推荐把密钥放在 `env.WCTX_TOKEN` 环境变量里，避免出现在进程命令行参数中：
+  - **Codex CLI (`~/.codex/config.toml`)**：
+    ```toml
+    [mcp_servers.company-kb]
+    command = "wctx"
+    args = ["bridge", "--url", "https://kb.example.com/mcp/company"]
+    env = { WCTX_TOKEN = "wctx_你的个人密钥", PYTHONUTF8 = "1" }
+    ```
+  - **通用 Stdio JSON（Cursor / Claude Code / 其他兼容工具）**：
+    ```json
+    {
+      "mcpServers": {
+        "company-kb": {
+          "command": "wctx",
+          "args": ["bridge", "--url", "https://kb.example.com/mcp/company"],
+          "env": { "WCTX_TOKEN": "wctx_你的个人密钥", "PYTHONUTF8": "1" }
+        }
+      }
+    }
+    ```
 
 ---
 
@@ -426,9 +667,9 @@ wctx gateway \
   --host 127.0.0.1 --port 8090
 ```
 
-- **Streamable HTTP MCP（`2025-03-26`）**：默认库 `POST http://<host>:8090/mcp`，按库独立挂载 `POST http://<host>:8090/mcp/tech`、`/mcp/rules`，零宿主机 Shell 暴露。
+- **Streamable HTTP MCP（`2025-03-26`）**：默认库 `POST http://<host>:8090/mcp`，按库独立挂载 `POST http://<host>:8090/mcp/tech`、`/mcp/rules`；支持客户端零安装直连（`Authorization: Bearer <token>`）。
 - **REST JSON 接口**：`POST /v1/context`、`POST /v1/read`、`GET /v1/vaults`、`GET /v1/whoami`、`GET /healthz`。
-- **本地 Stdio 桥接**：仅支持本地 stdio 的客户端可通过 `wctx bridge --url http://<host>:8090/mcp/tech --token <token>` 零依赖转发接入。
+- **一键接入与 Stdio 桥接**：成员端可运行 `wctx remote add --url http://<host>:8090 --token <token>` 一键同步本机全部 AI 客户端，或通过 `wctx bridge --url http://<host>:8090/mcp/tech`（配合 `WCTX_TOKEN` 环境变量）桥接仅支持本地 stdio 的工具。详情参考上方「场景三 / 场景四」与 [网关与权限指南](docs/gateway-and-acl.md)。
 
 ---
 

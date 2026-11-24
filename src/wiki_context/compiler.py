@@ -17,19 +17,109 @@ import datetime as dt
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Any, Callable
 
 from .config import VaultConfig
-from .freshness import check_vault_freshness, parse_wiki_frontmatter, snapshot_wiki_hashes, split_frontmatter
+from .freshness import (
+    check_vault_freshness,
+    clean_source_ref,
+    parse_wiki_frontmatter,
+    snapshot_wiki_hashes,
+    split_frontmatter,
+)
 from .indexer import rebuild_index
 from .lint import lint_vault
 from .memory import MemoryStore
 from .policy import mirror_skip_reason
 
 LLMCallable = Callable[[str, str], str]
+
+LLM_PROVIDER_PRESETS: list[dict[str, str]] = [
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "protocol": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+    },
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "protocol": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    },
+    {
+        "id": "qwen",
+        "label": "通义千问 (DashScope)",
+        "protocol": "openai",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+    },
+    {
+        "id": "zhipu",
+        "label": "智谱 GLM (BigModel)",
+        "protocol": "openai",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+    },
+    {
+        "id": "anthropic",
+        "label": "Anthropic Claude",
+        "protocol": "anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-sonnet-4-20250514",
+    },
+    {
+        "id": "custom",
+        "label": "自定义兼容接口",
+        "protocol": "openai",
+        "base_url": "",
+        "model": "",
+    },
+]
+
+
+def test_llm_connection(
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    protocol: str = "openai",
+    timeout_sec: int = 20,
+) -> dict[str, Any]:
+    """Verify LLM credentials & endpoint connectivity with a minimal ping request."""
+    caller = build_http_llm_caller(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        protocol=protocol,
+        timeout_sec=timeout_sec,
+    )
+    t0 = time.perf_counter()
+    try:
+        reply = caller("You are a connectivity check.", "Reply with the single word OK.").strip()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"大模型接口返回 HTTP {exc.code}: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"无法连接大模型接口 ({base_url}): {exc.reason}") from exc
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    return {
+        "ok": True,
+        "latency_ms": elapsed_ms,
+        "reply": reply[:60] or "OK",
+        "model": model or "",
+        "base_url": base_url or "",
+    }
 
 
 def _slugify_title(name: str) -> str:
@@ -138,7 +228,7 @@ def plan_compilation(vault: Path | str) -> dict:
             fm, _ = split_frontmatter(raw)
             meta = parse_wiki_frontmatter(fm)
             for s in meta["sources"]:
-                clean = re.split(r"[（(]", s, maxsplit=1)[0].strip()
+                clean = clean_source_ref(s)
                 if cfg.is_source_ref(clean):
                     covered_sources.add(cfg.normalize_source_ref(clean))
 
@@ -186,6 +276,7 @@ def compile_vault(
     protocol: str = "openai",
     max_items: int = 10,
     dry_run: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """Compile unindexed primary mirrors and refresh stale Wiki pages."""
     cfg = VaultConfig.load(vault)
@@ -203,6 +294,13 @@ def compile_vault(
     remaining_budget = max(0, max_items - len(uncompiled_items))
     stale_items = plan["_stale_items"][:remaining_budget]
     active_notes = plan["_active_notes"]
+    pending_total = (
+        len(plan["_uncompiled_items"])
+        + len(plan["_stale_items"])
+        + (1 if active_notes else 0)
+    )
+    remaining_uncompiled = max(0, len(plan["_uncompiled_items"]) - len(uncompiled_items))
+    remaining_stale = max(0, len(plan["_stale_items"]) - len(stale_items))
 
     if not uncompiled_items and not stale_items and not active_notes:
         return {
@@ -210,6 +308,9 @@ def compile_vault(
             "compiled_pages": [],
             "refreshed_pages": [],
             "consolidated_notes": [],
+            "remaining_uncompiled": 0,
+            "remaining_stale": 0,
+            "batch_limit": max_items,
             "noop": True,
         }
 
@@ -233,10 +334,29 @@ def compile_vault(
     compiled_pages: list[str] = []
     refreshed_pages: list[str] = []
     catalog_additions: list[tuple[str, str]] = []
+    total_steps = len(uncompiled_items) + len(stale_items) + (1 if active_notes else 0)
+    done_steps = 0
+
+    def _emit(phase: str, current: str = "") -> None:
+        if on_progress is not None:
+            try:
+                on_progress({
+                    "phase": phase,
+                    "done": done_steps,
+                    "total": total_steps,
+                    "pending_total": pending_total,
+                    "batch_limit": max_items,
+                    "current": current,
+                    "compiled_count": len(compiled_pages),
+                    "refreshed_count": len(refreshed_pages),
+                })
+            except Exception:
+                pass
 
     # 1) Compile newly added uncompiled sources
     for item in uncompiled_items:
         src_ref = item["source"]
+        _emit("compiling_new", src_ref)
         m_path: Path = item["mirror_path"]
         raw_m = m_path.read_text(encoding="utf-8", errors="replace")
         _, m_body = split_frontmatter(raw_m)
@@ -284,16 +404,19 @@ def compile_vault(
         target_wp.write_text(generated.rstrip() + "\n", encoding="utf-8")
         compiled_pages.append(page_filename)
         catalog_additions.append((target_wp.stem, f"Compiled from `{src_ref}`"))
+        done_steps += 1
+        _emit("compiling_new", src_ref)
 
     # 2) Refresh stale Wiki pages
     for s_item in stale_items:
         wp = cfg.wiki_root / s_item["page"]
+        _emit("refreshing_stale", s_item["page"])
         if not wp.is_file():
             continue
         old_raw = wp.read_text(encoding="utf-8", errors="replace")
         src_blobs: list[str] = []
         for s_ref in s_item["sources"]:
-            rel = cfg.strip_source_prefix(re.split(r"[（(]", s_ref, maxsplit=1)[0].strip())
+            rel = cfg.strip_source_prefix(clean_source_ref(s_ref))
             mp = cfg.mirrors_root / f"{rel}.md"
             if mp.is_file():
                 _, mb = split_frontmatter(mp.read_text(encoding="utf-8", errors="replace"))
@@ -311,6 +434,8 @@ def compile_vault(
         if updated_md.startswith("---"):
             wp.write_text(updated_md.rstrip() + "\n", encoding="utf-8")
             refreshed_pages.append(wp.name)
+        done_steps += 1
+        _emit("refreshing_stale", wp.name)
 
     # 2.5) Consolidate Layer-4 Operational Memory (`notes/` / `记忆/`) into Compiled Wiki
     consolidated_notes: list[str] = []
@@ -384,6 +509,7 @@ def compile_vault(
             cfg.log_path.write_text(f"{log_txt}\n\n{header}\n{tbl_hdr}\n{row}\n", encoding="utf-8")
 
     # 4) Snapshot verified hashes, rebuild FTS5 index, then lint
+    _emit("rebuilding_index", cfg.name)
     for pname in (*compiled_pages, *refreshed_pages):
         snapshot_wiki_hashes(cfg.root, page=pname)
 
@@ -395,6 +521,9 @@ def compile_vault(
         "compiled_pages": compiled_pages,
         "refreshed_pages": refreshed_pages,
         "consolidated_notes": consolidated_notes,
+        "remaining_uncompiled": remaining_uncompiled,
+        "remaining_stale": remaining_stale,
+        "batch_limit": max_items,
         "lint": lint_report,
         "index": idx_summary,
     }

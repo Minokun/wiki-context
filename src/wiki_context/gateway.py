@@ -18,10 +18,14 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlparse
 
 from .context import PrefixACLPolicy, Principal
 from .mcp_server import KBService, handle_jsonrpc_message
+
+if TYPE_CHECKING:
+    from .telemetry import TelemetryStore
 
 MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024
 
@@ -139,10 +143,18 @@ class MultiVaultGateway:
         *,
         tokens: TokenRegistry,
         allow_empty_vaults: bool = False,
+        telemetry: TelemetryStore | None = None,
+        instance_id: str = "",
+        fp: str = "",
+        on_redeem_pairing: Callable[[str, str, str], dict[str, Any]] | None = None,
     ):
         if not vault_map and not allow_empty_vaults:
             raise ValueError("At least one vault must be configured for MultiVaultGateway")
         self.tokens = tokens
+        self.telemetry = telemetry
+        self.instance_id = instance_id
+        self.fp = fp
+        self.on_redeem_pairing = on_redeem_pairing
         self._lock = threading.RLock()
         self.services: dict[str, KBService] = {}
         self.default_vault_id: str = ""
@@ -165,7 +177,13 @@ class MultiVaultGateway:
         clean_id = vault_id.strip().strip("/")
         if not clean_id:
             raise ValueError("vault_id cannot be empty")
-        svc = KBService(vault_path, policy=self._build_policy(vault_path))
+        svc = KBService(
+            vault_path,
+            policy=self._build_policy(vault_path),
+            telemetry=self.telemetry,
+            telemetry_vault_id=clean_id,
+            telemetry_mode="http",
+        )
         with self._lock:
             old = self.services.get(clean_id)
             self.services[clean_id] = svc
@@ -207,6 +225,15 @@ class MultiVaultGateway:
 class _HighBacklogHTTPServer(ThreadingHTTPServer):
     request_queue_size = 128
     daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, RequestHandlerClass, *, max_workers: int = 32):
+        self._worker_sem = threading.BoundedSemaphore(max_workers)
+        super().__init__(server_address, RequestHandlerClass)
+
+    def process_request_thread(self, request, client_address) -> None:
+        with self._worker_sem:
+            super().process_request_thread(request, client_address)
 
 
 class GatewayRoutesMixin:
@@ -292,7 +319,12 @@ class GatewayRoutesMixin:
                     if (raw_def and user.can_access_vault(raw_def))
                     else (next(iter(vaults_stat), ""))
                 )
-            self._send_json(200, {"status": "ok", "default_vault": def_vid, "vaults": vaults_stat})
+            payload: dict[str, Any] = {"status": "ok", "default_vault": def_vid, "vaults": vaults_stat}
+            if self.gateway.instance_id:
+                payload["instance_id"] = self.gateway.instance_id
+            if self.gateway.fp:
+                payload["fp"] = self.gateway.fp
+            self._send_json(200, payload)
             return True
 
         is_mcp, vid, _ = self._match_mcp_route(path)
@@ -359,6 +391,26 @@ class GatewayRoutesMixin:
         return False
 
     def try_gateway_post(self, path: str) -> bool:
+        if path == "/v1/pair/exchange":
+            body, err = self._read_json_body()
+            if err is not None or not isinstance(body, dict):
+                self._send_json(400, {"error": err or "JSON object body required"})
+                return True
+            if self.gateway.on_redeem_pairing is None:
+                self._send_json(404, {"error": "Pairing exchange is not enabled on this gateway"})
+                return True
+            try:
+                res = self.gateway.on_redeem_pairing(
+                    str(body.get("otp_id") or ""),
+                    str(body.get("otp_secret") or ""),
+                    str(body.get("client_label") or "Paired Device"),
+                )
+            except ValueError as exc:
+                self._send_json(403, {"error": str(exc)})
+                return True
+            self._send_json(200, res)
+            return True
+
         is_mcp, mcp_vid, mcp_svc = self._match_mcp_route(path)
         if not is_mcp and path not in {"/v1/context", "/v1/read"}:
             return False
@@ -419,6 +471,15 @@ class GatewayRoutesMixin:
         status = 400 if "error" in out else 200
         if isinstance(out.get("error"), str) and "Access denied" in out["error"]:
             status = 403
+        svc._record_telemetry(
+            principal=user,
+            tool="wiki_context" if path == "/v1/context" else "wiki_read",
+            args=body,
+            out=out,
+            elapsed_ms=float(out.get("elapsed_ms") or 0.0),
+            is_err=("error" in out),
+            is_remote=True,
+        )
         self._send_json(status, out)
         return True
 

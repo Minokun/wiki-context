@@ -520,7 +520,7 @@ class TestConsoleAndClients(unittest.TestCase):
             self.assertEqual(len(conn["connected_vaults"]), 1)
             self.assertEqual(len(conn["client_sync"]), 6)
 
-            # Overview on B shows both local + remote vaults, all 5 clients "synced", and never leaks raw token
+            # Overview on B shows both local + remote vaults, all 6 installed clients "synced", and never leaks raw token
             ov_b = api_b("/api/overview")
             ov_raw_str = json.dumps(ov_b, ensure_ascii=False)
             self.assertNotIn(bob_token, ov_raw_str)
@@ -528,7 +528,9 @@ class TestConsoleAndClients(unittest.TestCase):
             self.assertEqual(by_id["wiki-personal"]["kind"], "local")
             self.assertEqual(by_id["wiki-team"]["kind"], "remote")
             self.assertTrue(by_id["wiki-team"]["ready"])
-            for c in ov_b["clients"]:
+            installed_clients = [c for c in ov_b["clients"] if c["installed"]]
+            self.assertEqual(len(installed_clients), 6)
+            for c in installed_clients:
                 self.assertEqual(c["sync_status"], "synced", f"Client {c['id']} not synced: {c}")
                 self.assertEqual(c["matched_count"], 2)
 
@@ -590,6 +592,158 @@ class TestConsoleAndClients(unittest.TestCase):
         claude_cfg = json.loads((self.fake_home / ".claude.json").read_text(encoding="utf-8"))
         self.assertIn("wiki-eng", claude_cfg["mcpServers"])
         self.assertNotIn("kb-legacy", claude_cfg["mcpServers"])
+
+    def test_mainstream_agent_discovery_formats_and_disconnect(self) -> None:
+        # 1. Seed diverse mainstream agent configs inside self.fake_home (including JSONC comments + trailing comma)
+        if sys.platform == "darwin":
+            app_sup = self.fake_home / "Library" / "Application Support"
+        elif sys.platform.startswith("win"):
+            app_sup = self.fake_home / "AppData" / "Roaming"
+        else:
+            app_sup = self.fake_home / ".config"
+
+        # VS Code (`servers` root key + JSONC // comment + trailing comma)
+        vsc_dir = app_sup / "Code" / "User"
+        vsc_dir.mkdir(parents=True, exist_ok=True)
+        (vsc_dir / "mcp.json").write_text(
+            '{\n'
+            '  // Existing MCP server with URL literal inside string\n'
+            '  "servers": {\n'
+            '    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" },\n'
+            '  },\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        # Windsurf (`serverUrl` for HTTP)
+        ws_dir = self.fake_home / ".codeium" / "windsurf"
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        (ws_dir / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}),
+            encoding="utf-8",
+        )
+        # OpenCode (`mcp` root key, list `command`, `type: local` / `remote`)
+        oc_dir = self.fake_home / ".config" / "opencode"
+        oc_dir.mkdir(parents=True, exist_ok=True)
+        (oc_dir / "opencode.json").write_text(
+            json.dumps({"mcp": {"pencil": {"type": "local", "command": ["npx", "pencil"], "enabled": True}}}),
+            encoding="utf-8",
+        )
+        # Zed (`context_servers` root key + JSONC comment)
+        zed_dir = (app_sup / "Zed") if sys.platform.startswith("win") else (self.fake_home / ".config" / "zed")
+        zed_dir.mkdir(parents=True, exist_ok=True)
+        (zed_dir / "settings.json").write_text(
+            '{\n  // Zed user settings\n  "theme": "One Dark",\n  "context_servers": {\n    "postgres": { "command": "npx", "args": ["pg-mcp"] }\n  }\n}\n',
+            encoding="utf-8",
+        )
+        # Gemini CLI (`~/.gemini/settings.json` with existing `httpUrl`), Qwen Code, Kimi CLI, Kiro, Claude Desktop, LM Studio
+        (self.fake_home / ".gemini" / "settings.json").write_text(
+            json.dumps({"general": {"vim": False}, "mcpServers": {"pencil": {"command": "pencil"}}}),
+            encoding="utf-8",
+        )
+        (self.fake_home / ".qwen").mkdir(parents=True, exist_ok=True)
+        (self.fake_home / ".qwen" / "settings.json").write_text("{}", encoding="utf-8")
+        (self.fake_home / ".kimi-code").mkdir(parents=True, exist_ok=True)
+        (self.fake_home / ".kimi-code" / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+        (self.fake_home / ".kiro" / "settings").mkdir(parents=True, exist_ok=True)
+        (self.fake_home / ".kiro" / "settings" / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+        (app_sup / "Claude").mkdir(parents=True, exist_ok=True)
+        (app_sup / "Claude" / "claude_desktop_config.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+        (self.fake_home / ".lmstudio").mkdir(parents=True, exist_ok=True)
+        (self.fake_home / ".lmstudio" / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+
+        # Skills-only decoy directories MUST NOT trigger false installation positives
+        (self.fake_home / ".roo" / "skills").mkdir(parents=True, exist_ok=True)
+        (self.fake_home / ".trae" / "skills").mkdir(parents=True, exist_ok=True)
+
+        # 2. Prepare 1 vault and scan all supported mainstream agents
+        docs_dir = self.root / "agent-scan-vault"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "spec.md").write_text("# 架构规范\n\n服务间通过 HTTPS 通信。\n", encoding="utf-8")
+        self._api("/api/vaults/onboard", {"path": str(docs_dir), "vault_id": "wiki-core", "name": "核心规范", "layout": "zh"})
+
+        scan = self._api("/api/clients/scan")
+        self.assertGreaterEqual(scan["total_supported"], 19)
+        by_id = {c["id"]: c for c in scan["clients"]}
+        for expected_installed in ("vscode", "windsurf", "opencode", "zed", "gemini-cli", "qwen-code", "kimi", "kiro", "claude-desktop", "lmstudio"):
+            self.assertTrue(by_id[expected_installed]["installed"], f"{expected_installed} should be detected")
+        self.assertFalse(by_id["roo-code"]["installed"], "skills-only ~/.roo/skills must not trigger roo-code")
+        self.assertFalse(by_id["trae"]["installed"], "skills-only ~/.trae/skills must not trigger trae")
+        self.assertEqual(by_id["vscode"]["other_mcp_count"], 1)
+        self.assertEqual(by_id["opencode"]["other_mcp_count"], 1)
+        self.assertEqual(by_id["zed"]["other_mcp_count"], 1)
+
+        # 3. Sync stdio configs into the diverse schemas & verify lossless preservation
+        sync_targets = ["vscode", "windsurf", "opencode", "zed", "gemini-cli", "kimi", "lmstudio"]
+        sync_res = self._api("/api/clients/sync", {
+            "client_ids": sync_targets,
+            "mode": "stdio",
+            "vault_ids": ["wiki-core"],
+        })
+        self.assertEqual(len(sync_res["results"]), len(sync_targets))
+
+        vsc_cfg = json.loads((vsc_dir / "mcp.json").read_text(encoding="utf-8"))
+        self.assertIn("github", vsc_cfg["servers"])
+        self.assertEqual(vsc_cfg["servers"]["wiki-core"]["type"], "stdio")
+
+        oc_cfg = json.loads((oc_dir / "opencode.json").read_text(encoding="utf-8"))
+        self.assertIn("pencil", oc_cfg["mcp"])
+        self.assertEqual(oc_cfg["mcp"]["wiki-core"]["type"], "local")
+        self.assertIsInstance(oc_cfg["mcp"]["wiki-core"]["command"], list)
+        self.assertTrue(oc_cfg["mcp"]["wiki-core"]["enabled"])
+
+        zed_cfg = json.loads((zed_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(zed_cfg["theme"], "One Dark")
+        self.assertIn("postgres", zed_cfg["context_servers"])
+        self.assertIn("wiki-core", zed_cfg["context_servers"])
+
+        # 4. Verify schema-specific HTTP snippets via /api/clients/preview
+        p_ws = self._api("/api/clients/preview", {
+            "client_id": "windsurf",
+            "mode": "http",
+            "vault_ids": ["wiki-core"],
+            "gateway_url": "https://kb.example.com",
+            "token": "wctx_demo_tok",
+        })
+        self.assertEqual(json.loads(p_ws["snippet"])["mcpServers"]["wiki-core"]["serverUrl"], "https://kb.example.com/mcp/wiki-core")
+
+        p_gem = self._api("/api/clients/preview", {
+            "client_id": "gemini-cli",
+            "mode": "http",
+            "vault_ids": ["wiki-core"],
+            "gateway_url": "https://kb.example.com",
+            "token": "wctx_demo_tok",
+        })
+        self.assertEqual(json.loads(p_gem["snippet"])["mcpServers"]["wiki-core"]["httpUrl"], "https://kb.example.com/mcp/wiki-core")
+
+        p_oc = self._api("/api/clients/preview", {
+            "client_id": "opencode",
+            "mode": "http",
+            "vault_ids": ["wiki-core"],
+            "gateway_url": "https://kb.example.com",
+            "token": "wctx_demo_tok",
+        })
+        oc_http = json.loads(p_oc["snippet"])["mcp"]["wiki-core"]
+        self.assertEqual(oc_http["type"], "remote")
+        self.assertEqual(oc_http["url"], "https://kb.example.com/mcp/wiki-core")
+
+        # 5. Re-scan must count matched wiki-core across synced diverse clients
+        scan_after = self._api("/api/clients/scan")
+        after_by_id = {c["id"]: c for c in scan_after["clients"]}
+        for cid in sync_targets:
+            self.assertEqual(after_by_id[cid]["sync_status"], "synced", f"{cid} not synced after write")
+            self.assertEqual(after_by_id[cid]["matched_count"], 1)
+
+        # 6. Disconnect opencode & vscode -> removes wiki-core, preserves unrelated MCPs AND preserves Magpie!
+        disc = self._api("/api/clients/disconnect", {"client_ids": ["opencode", "vscode"]})
+        self.assertEqual(len(disc["results"]), 2)
+        oc_after_disc = json.loads((oc_dir / "opencode.json").read_text(encoding="utf-8"))
+        self.assertIn("pencil", oc_after_disc["mcp"])
+        self.assertNotIn("wiki-core", oc_after_disc["mcp"])
+        vsc_after_disc = json.loads((vsc_dir / "mcp.json").read_text(encoding="utf-8"))
+        self.assertIn("github", vsc_after_disc["servers"])
+        self.assertNotIn("wiki-core", vsc_after_disc["servers"])
+        magpie_after_disc = json.loads((self.fake_home / ".config" / "magpie" / "library.json").read_text(encoding="utf-8"))
+        self.assertIn("wiki-core", [m["name"] for m in magpie_after_disc["mcp"]])
 
 
 if __name__ == "__main__":

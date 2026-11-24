@@ -94,6 +94,23 @@ def parse_wiki_frontmatter(fm: str) -> dict:
     }
 
 
+_TRAILING_SOURCE_NOTE_RE = re.compile(
+    r"(?:(\.[A-Za-z0-9]{1,8})|(/))\s*[（(][^）)]*[）)]\s*$"
+)
+
+
+def clean_source_ref(raw: str) -> str:
+    """Strip optional parenthetical annotation after a file extension or trailing slash,
+    without corrupting parentheses inside filenames."""
+    s = raw.strip()
+    if not s:
+        return ""
+    m = _TRAILING_SOURCE_NOTE_RE.search(s)
+    if m:
+        s = s[: m.start() + len(m.group(1) or m.group(2))].strip()
+    return s
+
+
 def compute_wiki_freshness(
     sources: list[str],
     recorded_hashes: dict[str, str],
@@ -109,7 +126,7 @@ def compute_wiki_freshness(
     for s in sources:
         if not isinstance(s, str):
             continue
-        clean = re.split(r"[（(]", s, maxsplit=1)[0].strip()
+        clean = clean_source_ref(s)
         if cfg is not None:
             if cfg.is_source_ref(clean):
                 primary_refs.append(cfg.normalize_source_ref(clean))
@@ -221,7 +238,7 @@ def snapshot_wiki_hashes(vault: Path | str, *, page: str | None = None) -> list[
         meta = parse_wiki_frontmatter(fm)
         hash_pairs: list[tuple[str, str]] = []
         for s in meta["sources"]:
-            clean = re.split(r"[（(]", s, maxsplit=1)[0].strip()
+            clean = clean_source_ref(s)
             if cfg.is_source_ref(clean):
                 norm_s = cfg.normalize_source_ref(clean)
                 sh = indexed_hashes.get(norm_s)

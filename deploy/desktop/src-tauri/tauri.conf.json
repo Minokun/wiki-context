@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "wiki-context",
+  "version": "0.4.0",
+  "identifier": "io.wikicontext.desktop",
+  "build": {
+    "beforeBuildCommand": "python3 ../scripts/build_web.py",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../../../src/wiki_context/ui_dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "wiki-context 控制中心",
+        "width": 1240,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/engine/**/*"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

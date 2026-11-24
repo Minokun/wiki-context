@@ -161,6 +161,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--vault", action="append", default=[], help="Extra vault spec `path` or `id=path` to register")
     p_ui.add_argument("--no-browser", action="store_true", help="Do not auto-open browser window on startup")
     p_ui.add_argument("--allow-remote-admin", action="store_true", help="Allow binding admin UI to non-loopback host")
+    p_ui.add_argument("--sidecar", action="store_true", help="Run in desktop sidecar mode (prints WCTX_READY <port> <pid>)")
+    p_ui.add_argument("--watch-stdin-eof", action="store_true", help="Exit cleanly when stdin closes (parent process watchdog)")
 
     # doctor (environment & setup diagnostic)
     p_doc = sub.add_parser("doctor", help="Check Python, wctx PATH, poppler/PDF tools, AI clients & ports")
@@ -417,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
                 extra_vault_specs=extra_v,
                 open_browser=not args.no_browser,
                 allow_remote_admin=args.allow_remote_admin,
+                sidecar=args.sidecar,
+                watch_stdin_eof=args.watch_stdin_eof,
             )
 
         if args.cmd == "doctor":

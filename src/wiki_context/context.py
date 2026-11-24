@@ -53,6 +53,22 @@ class Principal:
         return vault_id in self.allowed_vaults
 
 
+@dataclass(frozen=True)
+class ACLDecision:
+    allowed: bool
+    reason_code: str = "allowed"  # "allowed" | "admin_bypass" | "deny_prefix" | "outside_allowlist" | "wiki_provenance_blocked" | "excluded"
+    matched_rule: str = ""
+    blocked_refs: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "allowed": self.allowed,
+            "reason_code": self.reason_code,
+            "matched_rule": self.matched_rule,
+            "blocked_refs": list(self.blocked_refs),
+        }
+
+
 class AccessPolicy:
     def can_access_source(self, principal: Principal, source: str) -> bool:
         raise NotImplementedError
@@ -61,6 +77,16 @@ class AccessPolicy:
         self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
     ) -> bool:
         raise NotImplementedError
+
+    def explain_source_access(self, principal: Principal, source: str) -> ACLDecision:
+        ok = self.can_access_source(principal, source)
+        return ACLDecision(allowed=ok, reason_code="allowed" if ok else "outside_allowlist")
+
+    def explain_wiki_access(
+        self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
+    ) -> ACLDecision:
+        ok = self.can_access_wiki(principal, wiki_source, refs)
+        return ACLDecision(allowed=ok, reason_code="allowed" if ok else "wiki_provenance_blocked")
 
 
 class AllowAllPolicy(AccessPolicy):
@@ -71,6 +97,14 @@ class AllowAllPolicy(AccessPolicy):
         self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
     ) -> bool:
         return True
+
+    def explain_source_access(self, principal: Principal, source: str) -> ACLDecision:
+        return ACLDecision(allowed=True, reason_code="allowed")
+
+    def explain_wiki_access(
+        self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
+    ) -> ACLDecision:
+        return ACLDecision(allowed=True, reason_code="allowed")
 
 
 class PrefixACLPolicy(AccessPolicy):
@@ -98,31 +132,62 @@ class PrefixACLPolicy(AccessPolicy):
             return False
         return path == clean_p or path.startswith(clean_p + "/")
 
-    def can_access_source(self, principal: Principal, source: str) -> bool:
+    def explain_source_access(self, principal: Principal, source: str) -> ACLDecision:
         if "admin" in principal.groups or "all" in principal.groups:
-            return True
-        denies: list[str] = []
-        allows: list[str] = []
+            return ACLDecision(allowed=True, reason_code="admin_bypass", matched_rule="group:admin|all")
+        denies: list[tuple[str, str]] = []
+        allows: list[tuple[str, str]] = []
         for g in principal.groups:
             rule = self.group_rules.get(g) or {}
-            denies.extend(rule.get("deny") or ())
-            allows.extend(rule.get("allow") or ())
-        if any(self._match_prefix(source, d) for d in denies):
-            return False
-        return any(self._match_prefix(source, a) for a in allows)
+            for d in rule.get("deny") or ():
+                denies.append((g, str(d)))
+            for a in rule.get("allow") or ():
+                allows.append((g, str(a)))
+        for grp, pat in denies:
+            if self._match_prefix(source, pat):
+                return ACLDecision(allowed=False, reason_code="deny_prefix", matched_rule=f"{grp}:deny:{pat}")
+        for grp, pat in allows:
+            if self._match_prefix(source, pat):
+                return ACLDecision(allowed=True, reason_code="allowed", matched_rule=f"{grp}:allow:{pat}")
+        return ACLDecision(allowed=False, reason_code="outside_allowlist", matched_rule="")
 
-    def can_access_wiki(
+    def can_access_source(self, principal: Principal, source: str) -> bool:
+        return self.explain_source_access(principal, source).allowed
+
+    def explain_wiki_access(
         self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
-    ) -> bool:
+    ) -> ACLDecision:
         if "admin" in principal.groups or "all" in principal.groups:
-            return True
+            return ACLDecision(allowed=True, reason_code="admin_bypass", matched_rule="group:admin|all")
         valid_refs = [
             r for r in refs
             if isinstance(r, str) and (r.startswith("sources/") or r.startswith("史料/") or "/" in r)
         ]
         if not valid_refs:
-            return self.public_wiki_without_sources
-        return all(self.can_access_source(principal, r) for r in valid_refs)
+            if self.public_wiki_without_sources:
+                return ACLDecision(allowed=True, reason_code="allowed", matched_rule="public_wiki_no_refs")
+            return ACLDecision(allowed=False, reason_code="outside_allowlist", matched_rule="no_public_wiki")
+        blocked_refs: list[str] = []
+        first_rule = ""
+        for ref in valid_refs:
+            dec = self.explain_source_access(principal, ref)
+            if not dec.allowed:
+                blocked_refs.append(ref)
+                if not first_rule:
+                    first_rule = dec.matched_rule or dec.reason_code
+        if blocked_refs:
+            return ACLDecision(
+                allowed=False,
+                reason_code="wiki_provenance_blocked",
+                matched_rule=first_rule,
+                blocked_refs=tuple(blocked_refs),
+            )
+        return ACLDecision(allowed=True, reason_code="allowed", matched_rule="wiki_refs_ok")
+
+    def can_access_wiki(
+        self, principal: Principal, wiki_source: str, refs: list[str] | tuple[str, ...]
+    ) -> bool:
+        return self.explain_wiki_access(principal, wiki_source, refs).allowed
 
 
 def policy_for_vault(cfg: VaultConfig) -> AccessPolicy:
@@ -549,6 +614,7 @@ class ContextPackEngine:
         principal: Principal | None = None,
         resolve_mirror_fn: Callable[[str, str], Path | None] | None = None,
         exclude_patterns: tuple[str, ...] = (),
+        include_debug: bool = False,
     ) -> dict:
         t0 = time.perf_counter()
         q = (question or "").strip()
@@ -565,10 +631,28 @@ class ContextPackEngine:
         )
         index: BM25Index = snap.index
 
-        def allowed_l2(src: str) -> bool:
+        acl_blocked_l2_sources: set[str] = set()
+        acl_blocked_wiki_sources: set[str] = set()
+        acl_shadow_blocked: list[dict] = []
+        seen_shadow_keys: set[tuple[str, str]] = set()
+
+        def allowed_l2(src: str, *, hit: dict | None = None) -> bool:
             if not src or is_excluded_source(src, exclude_patterns):
                 return False
-            return self.policy.can_access_source(user, src)
+            dec = self.policy.explain_source_access(user, src)
+            if dec.allowed:
+                return True
+            acl_blocked_l2_sources.add(src)
+            if include_debug and ("l2", src) not in seen_shadow_keys:
+                seen_shadow_keys.add(("l2", src))
+                acl_shadow_blocked.append({
+                    "layer": "primary",
+                    "source": src,
+                    "heading": str((hit or {}).get("heading") or ""),
+                    "score": round(float((hit or {}).get("score") or 0.0), 4),
+                    **dec.to_dict(),
+                })
+            return False
 
         def allowed_wiki(w: dict) -> bool:
             wsrc = w.get("source") or ""
@@ -577,7 +661,20 @@ class ContextPackEngine:
                 return False
             if any(isinstance(r, str) and is_excluded_source(r, exclude_patterns) for r in refs):
                 return False
-            return self.policy.can_access_wiki(user, wsrc, refs)
+            dec = self.policy.explain_wiki_access(user, wsrc, refs)
+            if dec.allowed:
+                return True
+            acl_blocked_wiki_sources.add(wsrc)
+            if include_debug and ("wiki", wsrc) not in seen_shadow_keys:
+                seen_shadow_keys.add(("wiki", wsrc))
+                acl_shadow_blocked.append({
+                    "layer": "wiki",
+                    "source": wsrc,
+                    "heading": str(w.get("heading") or ""),
+                    "score": round(float(w.get("score") or 0.0), 4),
+                    **dec.to_dict(),
+                })
+            return False
 
         # Step 2: Parallel coarse retrieval
         wiki_max_k = 3 if plan.route_mode == "complex" or len(plan.facets) >= 2 else 2
@@ -585,7 +682,7 @@ class ContextPackEngine:
         wiki_candidates = [w for w in raw_wiki if allowed_wiki(w)]
 
         raw_l2 = index.search_weighted(plan.weighted_tokens, plan.groups, k=28, max_per_source=6)
-        l2_candidates = [h for h in raw_l2 if allowed_l2(h.get("source") or "")]
+        l2_candidates = [h for h in raw_l2 if allowed_l2(h.get("source") or "", hit=h)]
 
         if len(plan.facets) >= 2:
             wiki_candidates, l2_candidates = self._ensure_facet_candidates(
@@ -665,6 +762,9 @@ class ContextPackEngine:
 
         # Layer-4 Operational Memory & 1-hop Source-Anchored Errata Pins
         retrieved_src_set: set[str] = set()
+        for w_blk in formatted_wiki:
+            if w_blk.get("source"):
+                retrieved_src_set.add(w_blk["source"])  # wiki-anchored notes (e.g. 知识库/x.md)
         for s_blk in formatted_l2:
             retrieved_src_set.add(s_blk["source"])
             for twin in (s_blk.get("also_at") or ()):
@@ -729,7 +829,8 @@ class ContextPackEngine:
         )
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-        return {
+        acl_filtered_count = len(acl_blocked_l2_sources) + len(acl_blocked_wiki_sources)
+        out = {
             "vault": self.cfg.name,
             "generation_id": snap.generation_id,
             "route": plan.route_mode,
@@ -741,12 +842,26 @@ class ContextPackEngine:
             "wiki_count": len(formatted_wiki),
             "primary_count": len(formatted_l2),
             "memory_count": len(memory_blocks) + len(pinned_errata_texts),
+            "acl_filtered_count": acl_filtered_count,
             "elapsed_ms": elapsed_ms,
             "wiki_hits": formatted_wiki,
             "primary_hits": formatted_l2,
             "memory_hits": memory_blocks,
             "context_markdown": context_md,
         }
+        if include_debug:
+            out["plan_debug"] = {
+                "route_mode": plan.route_mode,
+                "route_reason": list(plan.route_reason),
+                "token_budget": plan.token_budget,
+                "char_budget": plan.char_budget,
+                "weighted_tokens": {k: round(float(v), 3) for k, v in sorted(plan.weighted_tokens.items(), key=lambda kv: -kv[1])[:40]},
+                "core_concepts": [[lbl, sorted(toks)] for lbl, toks in plan.core_concepts],
+                "facets": [[lbl, sorted(toks)] for lbl, toks in plan.facets],
+                "auto_synonyms": list(plan.auto_synonyms),
+            }
+            out["acl_shadow_blocked"] = acl_shadow_blocked
+        return out
 
     # -- Pipeline Helpers --------------------------------------------------- #
 

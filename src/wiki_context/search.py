@@ -24,10 +24,78 @@ from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
 
 from .config import VaultConfig
+from .state_lock import replace_with_retry
 
 
 class IndexUnavailableError(RuntimeError):
-    """Raised when a vault's index has not been built or is empty."""
+    """Raised when a vault's index has not been built, is empty, or is incompatible."""
+
+
+# On-disk index format produced by ``indexer.rebuild_index`` / ``build_fts_sqlite``.
+# ``indexer.SCHEMA_VERSION`` is bound to this constant so readers and writers stay in lockstep.
+INDEX_SCHEMA_VERSION = 1
+
+# Columns every reader query depends on. A generation written by a different indexer
+# (e.g. the legacy vault-local ``scripts/wiki_index.py``, schema 3) lacks some of these
+# and would otherwise fail later with ``sqlite3.OperationalError: no such column``.
+_REQUIRED_SQLITE_COLUMNS: dict[str, frozenset[str]] = {
+    "meta": frozenset({"key", "value"}),
+    "wiki_meta": frozenset({"key", "value"}),
+    "vocab": frozenset({"tok", "df_sources"}),
+    "wiki_vocab": frozenset({"tok", "df_sources"}),
+    "units": frozenset({
+        "id", "kind", "source", "heading", "table_header", "line_start", "line_end",
+        "page_num", "mirror", "dl", "tf_z", "body_toks_z", "text_z",
+    }),
+    "wiki_units": frozenset({
+        "id", "source", "title", "heading", "table_header", "line_start", "line_end",
+        "freshness", "sources_json", "dl", "tf_z", "text_z",
+    }),
+    "fts_units": frozenset({"head", "body"}),
+    "fts_wiki": frozenset({"tokens"}),
+}
+
+
+def _rebuild_hint(gen_dir: Path) -> str:
+    # gen_dir = <vault>/<mirrors>/.index[/gen-*]
+    root = gen_dir.parent if gen_dir.name.startswith("gen-") else gen_dir
+    vault = root.parent.parent
+    return f"rebuild with `wctx index --vault \"{vault}\"`"
+
+
+def check_index_compatibility(gen_dir: Path, con: sqlite3.Connection) -> None:
+    """Raise ``IndexUnavailableError`` if ``gen_dir`` was not written in the current format."""
+    sum_p = gen_dir / "summary.json"
+    if sum_p.is_file():
+        try:
+            summary = json.loads(sum_p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            summary = {}
+        ver = summary.get("schema_version") if isinstance(summary, dict) else None
+        if ver is not None and ver != INDEX_SCHEMA_VERSION:
+            raise IndexUnavailableError(
+                f"Index generation '{gen_dir.name}' has schema_version={ver}, expected "
+                f"{INDEX_SCHEMA_VERSION}; it was written by an incompatible indexer "
+                f"(e.g. legacy scripts/wiki_index.py or oxr_sync.py) — {_rebuild_hint(gen_dir)}"
+            )
+    problems: list[str] = []
+    for table, required in _REQUIRED_SQLITE_COLUMNS.items():
+        try:
+            cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        except sqlite3.Error as exc:
+            problems.append(f"{table}: {exc}")
+            continue
+        if not cols:
+            problems.append(f"missing table {table}")
+            continue
+        missing = sorted(required - cols)
+        if missing:
+            problems.append(f"{table} missing column(s) {', '.join(missing)}")
+    if problems:
+        raise IndexUnavailableError(
+            f"Index generation '{gen_dir.name}' has an incompatible SQLite schema "
+            f"({'; '.join(problems)}) — {_rebuild_hint(gen_dir)}"
+        )
 
 
 LATIN_NUM_RE = re.compile(r"[a-z0-9]+(?:[._\-/+][a-z0-9]+)*", re.I)
@@ -456,7 +524,7 @@ def build_fts_sqlite(db_path: Path, layer2_rows: list[dict], wiki_rows: list[dic
     finally:
         con.close()
 
-    tmp_db.replace(db_path)
+    replace_with_retry(tmp_db, db_path)
 
 
 # -- BM25Index (SQLite FTS5 + InMemory Fallback) ---------------------------- #
@@ -487,7 +555,7 @@ class BM25Index:
 
         self._sqlite_path: Path | None = None
         self._tls = threading.local()
-        self._open_cons: list[sqlite3.Connection] = []
+        self._open_cons: list[tuple[int, sqlite3.Connection]] = []
         self._con_lock = threading.Lock()
 
         # Memory backend fields
@@ -520,13 +588,28 @@ class BM25Index:
             uri = f"{self._sqlite_path.resolve().as_uri()}?mode=ro&immutable=1"
             con = sqlite3.connect(uri, uri=True, check_same_thread=False)
             self._tls.con = con
+            cur_tid = threading.get_ident()
+            alive_tids = {t.ident for t in threading.enumerate() if t.ident is not None}
+            stale_cons: list[sqlite3.Connection] = []
             with self._con_lock:
-                self._open_cons.append(con)
+                kept: list[tuple[int, sqlite3.Connection]] = []
+                for tid, old_c in self._open_cons:
+                    if tid not in alive_tids:
+                        stale_cons.append(old_c)
+                    else:
+                        kept.append((tid, old_c))
+                kept.append((cur_tid, con))
+                self._open_cons = kept
+            for sc in stale_cons:
+                try:
+                    sc.close()
+                except sqlite3.Error:
+                    pass
         return con
 
     def close(self) -> None:
         with self._con_lock:
-            cons = list(self._open_cons)
+            cons = [c for _, c in self._open_cons]
             self._open_cons.clear()
         self._tls = threading.local()
         for c in cons:
@@ -556,6 +639,11 @@ class BM25Index:
             self._sqlite_path = db_file
             con = self._con
             assert con is not None
+            try:
+                check_index_compatibility(gen_dir, con)
+            except IndexUnavailableError:
+                self.close()
+                raise
             meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
             n_u = int(meta_map.get("n_units", "0"))
             w_meta = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())

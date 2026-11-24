@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.14"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests (UTF-8)
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Windows GBK/cp936 stdio safety gate
+        if: matrix.os == 'windows-latest'
+        env:
+          PYTHONIOENCODING: gbk
+        run: python -m unittest tests/test_v04_phase1.py -v
+
+      - name: Verify PEP 517 wheel build
+        run: |
+          python -c "import tempfile, zipfile, _build_backend as bb; td=tempfile.mkdtemp(); w=bb.build_wheel(td); zf=zipfile.ZipFile(td+'/'+w); assert 'wiki_context/__init__.py' in zf.namelist(); print('Built', w)"

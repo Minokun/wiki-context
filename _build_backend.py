@@ -1,9 +1,9 @@
 """Zero-dependency PEP 517 / PEP 660 build backend for `wiki-context`.
 
 Builds standard `.whl` and editable `.whl` archives using only Python's
-standard library (`tomllib` / minimal fallback, `zipfile`, `hashlib`, `base64`),
-enabling instant offline `pip install .`, `pip install -e .`, and `uv tool install .`
-without downloading external build toolchains.
+standard library (`tomllib`, `zipfile`, `hashlib`, `base64`), enabling instant
+offline `pip install .`, `pip install -e .`, and `uv tool install .` including
+compiled `ui_dist/` static assets without external build toolchains.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _read_pyproject_meta() -> tuple[str, str]:
         m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
         if m:
             return m.group(1).strip(), DEFAULT_REQUIRES_PYTHON
-    return "0.3.1", DEFAULT_REQUIRES_PYTHON
+    return "0.4.0", DEFAULT_REQUIRES_PYTHON
 
 
 VERSION, REQUIRES_PYTHON = _read_pyproject_meta()
@@ -83,6 +83,20 @@ def _entry_points_bytes() -> bytes:
     ).encode("utf-8")
 
 
+def _iter_package_files(pkg_root: Path) -> list[Path]:
+    """Collect all Python source files and static `ui_dist/` assets inside `pkg_root`."""
+    files: list[Path] = []
+    for p in sorted(pkg_root.rglob("*")):
+        if not p.is_file():
+            continue
+        if "__pycache__" in p.parts or p.suffix in {".pyc", ".pyo", ".DS_Store"}:
+            continue
+        if p.name.startswith("."):
+            continue
+        files.append(p)
+    return files
+
+
 def _write_wheel(wheel_dir: str, *, editable: bool) -> str:
     whl_name = f"{DIST_NAME}-{VERSION}-py3-none-any.whl"
     out_path = Path(wheel_dir) / whl_name
@@ -99,9 +113,9 @@ def _write_wheel(wheel_dir: str, *, editable: bool) -> str:
             put(f"{DIST_NAME}.pth", (str(src_dir.resolve()) + "\n").encode("utf-8"))
         else:
             pkg_root = src_dir / DIST_NAME
-            for py in sorted(pkg_root.rglob("*.py")):
-                rel = py.relative_to(src_dir).as_posix()
-                put(rel, py.read_bytes())
+            for fpath in _iter_package_files(pkg_root):
+                rel = fpath.relative_to(src_dir).as_posix()
+                put(rel, fpath.read_bytes())
 
         if (ROOT / "LICENSE").is_file():
             put(f"{DIST_INFO}/LICENSE", (ROOT / "LICENSE").read_bytes())
@@ -117,6 +131,33 @@ def _write_wheel(wheel_dir: str, *, editable: bool) -> str:
         zf.writestr(f"{DIST_INFO}/RECORD", buf.getvalue().encode("utf-8"))
 
     return whl_name
+
+
+def get_requires_for_build_wheel(config_settings=None) -> list[str]:
+    return []
+
+
+def get_requires_for_build_editable(config_settings=None) -> list[str]:
+    return []
+
+
+def get_requires_for_build_sdist(config_settings=None) -> list[str]:
+    return []
+
+
+def prepare_metadata_for_build_wheel(metadata_directory: str, config_settings=None) -> str:
+    dest = Path(metadata_directory) / DIST_INFO
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "METADATA").write_bytes(_metadata_bytes())
+    (dest / "WHEEL").write_bytes(_wheel_bytes())
+    (dest / "entry_points.txt").write_bytes(_entry_points_bytes())
+    if (ROOT / "LICENSE").is_file():
+        (dest / "LICENSE").write_bytes((ROOT / "LICENSE").read_bytes())
+    return DIST_INFO
+
+
+def prepare_metadata_for_build_editable(metadata_directory: str, config_settings=None) -> str:
+    return prepare_metadata_for_build_wheel(metadata_directory, config_settings)
 
 
 def build_wheel(wheel_directory: str, config_settings=None, metadata_directory=None) -> str:

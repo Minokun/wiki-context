@@ -155,6 +155,11 @@ pip install -e .
 wctx doctor
 ```
 
+> **Let an AI Agent Install It for You**: Already using Claude Code, Cursor, or Codex CLI? Paste this prompt into your agent:
+> ```text
+> Clone and install wiki-context from https://github.com/Minokun/wiki-context.git (using pipx or a Python >= 3.14 environment), run wctx doctor to verify the setup, and launch wctx ui for me.
+> ```
+
 *(Zero third-party Python packages are downloaded or installed. Optional: install `poppler` (`brew install poppler` / `sudo apt install poppler-utils`) if you need native `pdftotext` PDF extraction and `pdftoppm` visual page rendering.)*
 
 ### 2. Run the Reproducible Benchmark
@@ -201,14 +206,249 @@ wctx ui
 
 ---
 
-## Built-In Web Control Console (`wctx ui`)
+## Deployment & Usage Scenarios (Personal / LAN / Team Server / Pure-MCP Client)
 
-Prefer a visual control plane over editing JSON/TOML/YAML files by hand? Run `wctx ui` (zero external dependencies, served locally at `http://127.0.0.1:8765` with CSRF & loopback protection) to manage your entire setup in one place:
+Pick the setup that matches your role — you do not need to deploy everything:
 
-1. **Folder Onboarding & Auto-Initialization**: Browse local directories, adopt existing raw document folders in-place (safely moving loose files into `sources/` / `史料/`, scaffolding the 4-layer layout, and building the FTS5 index), import external folders into existing vaults, run `lint`, and test `wiki_context` queries live.
-2. **Bearer Tokens & Multi-Level Permissions**: Issue SHA-256 hashed Bearer tokens (plaintext secret shown once), scope **which vaults (`allowed_vaults`)** each token can see, configure **role-based directory-prefix `allow`/`deny` rules** (with 100% Wiki & Memory provenance inheritance), and verify rules in the **ACL Sandbox Simulator** — all hot-reloaded with zero restarts.
-3. **One-Click AI Client MCP Sync**: Auto-detects **DeepSeek Harness (DSH)**, **Codex CLI**, **Claude Code**, **WorkBuddy**, **Cursor**, and **Antigravity (AGY)** on your machine, previews snippets (`stdio` or `streamable-http` gateway mode), and losslessly merges MCP configs with automatic `.wctx.bak` backups.
-4. **Layer-4 Memory & Errata Inspector**: Filter, search, create, edit, archive (`forget`), restore, or batch-import operational insights and source-anchored `📌 Errata Pins` across vaults.
+| Scenario | Recommended Setup | Client / Host Requirements | When to Use |
+| :--- | :--- | :--- | :--- |
+| **1. Personal Local Use** | **Desktop App** or **`wctx ui` (Web Console)** | Desktop App (or `wctx` CLI) locally | Drop folders in, auto-build indexes, auto-scan & connect 19 mainstream AI clients |
+| **2. Personal Multi-Device / LAN** | Desktop App / `wctx ui` LAN sharing | Desktop App or `wctx` on both machines | 5-minute single-use pairing code — zero manual IP or token copy-paste |
+| **3. Team Server (Admin)** | **`wctx gateway`** + **`wctx service install`** | Python 3.14+, `wctx` (optional `poppler`) on server | Multi-vault hosting, SHA-256 Bearer auth, folder ACLs; open `wctx ui` via SSH tunnel if needed |
+| **4. Pure-MCP Client (HTTP MCP)** | **Direct Streamable HTTP MCP** | **Zero install** (no Python, no `wctx`, no app) | Just put the server URL + Bearer token `wctx_...` into Claude Code / Cursor / VS Code / WorkBuddy |
+| **5. Pure-MCP Client (stdio-only / Auto-Sync)** | **`wctx remote add`** or **`wctx bridge`** | `wctx` CLI (or Desktop App) locally | Auto-discover & configure all local AI clients, or bridge stdio-only clients over HTTPS |
+
+---
+
+### Scenario 1: Personal Local Use (Desktop App or Web Console)
+
+- **Desktop App (Recommended)**  
+  Launch `wiki-context.app`, drag your local folders in (Markdown, PDF, DOCX, XLSX, PPTX), configure your LLM API key under **Model Settings** to enable automatic Wiki synthesis, and enable folder watching / tray mode. Open **Devices & Clients** to automatically scan installed tools across **19 mainstream AI agents** and connect/update/disconnect without disturbing existing MCP servers:
+  - **IDE Editors**: **Cursor, VS Code (Copilot), Windsurf, Trae, Kiro, Cline, Roo Code, Antigravity (AGY), Zed**
+  - **Terminal CLIs**: **Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kimi CLI, OpenCode**
+  - **Desktop Apps**: **Claude Desktop, WorkBuddy, LM Studio, DeepSeek Harness (DSH)**
+- **Built-in Web Console (`wctx ui`)**  
+  Prefer running without the Desktop wrapper? The exact same Web UI is already bundled inside the Python package (**zero Node.js or separate frontend build needed**):
+  ```bash
+  wctx ui                # Binds http://127.0.0.1:8765 and opens your browser
+  wctx ui --port 8765 --no-browser
+  ```
+- **Even if you close the Desktop App or Web UI**: local AI clients wired in direct `stdio` mode (`wctx serve`) continue querying the on-disk SQLite index on demand. Keep the app or `wctx service` running only when you want live folder watching, automatic AI synthesis, or LAN sharing.
+
+> **What is `poppler` and do I need it?**  
+> `wiki-context` extracts DOCX, PPTX, XLSX, CSV, and Markdown with zero third-party dependencies. Only **`.pdf` files** use the open-source **`poppler`** CLI utilities (`pdftotext` for layout-preserving text/table extraction and `pdftoppm` for visual page rendering in `wiki_inspect_visual`). Without `poppler`, the server still starts and serves all other formats normally (PDFs are simply skipped with a diagnostic note):
+> - macOS: `brew install poppler`
+> - Ubuntu / Debian: `sudo apt-get update && sudo apt-get install -y poppler-utils`
+
+---
+
+### Scenario 2: Multi-Device / LAN Sharing
+
+Want to query your workstation's vaults from a laptop or second computer?
+1. **Host machine**: Open the Desktop App or `wctx ui` → **Devices & Clients** → turn on **LAN Sharing** → choose the shared vaults and permission role → **Generate One-Time Pairing Code** (valid for 5 minutes, single-use).
+2. **Client machine**: Open the Desktop App or `wctx ui` → **Devices & Clients** → paste the pairing code and click **Connect**. It probes LAN and Tailscale endpoints concurrently, verifies the host fingerprint, and syncs the remote vaults into your local AI tools.
+
+---
+
+### Scenario 3: Team Server Deployment (Admin Guide)
+
+Host shared team vaults on a Linux or macOS server with centralized indexing, Bearer token auth, and directory-prefix RBAC.
+
+> [!IMPORTANT]
+> **Security Boundary (`wctx ui` vs `wctx gateway`)**:
+> - **`wctx ui` (default `:8765`)** is a **passwordless local admin console** (browses server folders, edits LLM keys, issues tokens, and modifies ACLs). It refuses non-loopback bindings unless `--allow-remote-admin` is passed — **never expose raw `wctx ui` to the public internet**.
+> - **`wctx gateway` (default `:8090`)** is the **production multi-user data server**. It exposes **no `/api/*` admin routes or Web UI** — only `/healthz`, `/mcp*`, and `/v1/*` — and requires a valid SHA-256 Bearer token on every query/read request.
+
+#### 1. Install & Verify on the Server
+
+```bash
+# Optional system PDF extractor (recommended if your vaults contain PDFs)
+sudo apt-get update && sudo apt-get install -y poppler-utils
+
+# Install wiki-context (requires Python >= 3.14, zero third-party Python dependencies)
+pipx install git+https://github.com/Minokun/wiki-context.git
+# Or from local checkout / wheel: python3.14 -m pip install .
+
+wctx doctor
+```
+
+#### 2. Initialize Vaults & Build Indexes
+
+```bash
+wctx init /srv/vaults/company --name "Engineering KB" --layout en
+# Drop documents into /srv/vaults/company/sources/, then sync & index:
+wctx sync --vault /srv/vaults/company
+
+# (Optional) Batch-compile AI synthesis pages & refresh index:
+export WCTX_BASE_URL="https://api.openai.com/v1"
+export WCTX_MODEL="gpt-4o-mini"
+export WCTX_API_KEY="sk-..."
+wctx compile --vault /srv/vaults/company --max-items 50
+```
+
+#### 3. Configure Tokens & Folder ACLs (`tokens.json`, Hot-Reloaded)
+
+Manage tokens and folder rules in `/etc/wiki-context/tokens.json` (or `~/.wiki-context/tokens.json`). Changes take effect on the very next request with **zero gateway restarts**:
+
+- **Option A (Recommended: Administer `wctx ui` safely over SSH tunnel)**:  
+  Keep `wctx ui` bound to `127.0.0.1:8765` on the server and forward it locally:
+  ```bash
+  # On your laptop:
+  ssh -L 8765:127.0.0.1:8765 user@your-server
+  # On the server:
+  wctx ui --no-browser --port 8765
+  ```
+  Open `http://127.0.0.1:8765` in your local browser to onboard vaults, configure folder ACLs, and issue tokens (or place Nginx HTTPS + HTTP Basic Auth / SSO in front of `127.0.0.1:8765`).
+- **Option B (CLI: Generate SHA-256 token entries manually)**:
+  ```bash
+  python3.14 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("Give to teammate:", t); print("Store token_sha256:", hashlib.sha256(t.encode()).hexdigest())'
+  ```
+  Write `/etc/wiki-context/tokens.json` (`chmod 600`):
+  ```json
+  {
+    "tokens": [
+      {
+        "uid": "alice",
+        "token_sha256": "<sha256_of_admin_token>",
+        "groups": ["admin"],
+        "allowed_vaults": ["*"]
+      },
+      {
+        "uid": "partner-01",
+        "token_sha256": "<sha256_of_partner_token>",
+        "groups": ["partner"],
+        "allowed_vaults": ["company"]
+      }
+    ],
+    "acl": {
+      "partner": {
+        "allow": ["sources/public/**"],
+        "deny": ["sources/finance/**", "sources/confidential/**"]
+      }
+    }
+  }
+  ```
+
+#### 4. Run as a Background Daemon, Auto-Sync & Expose
+
+```bash
+# Quick foreground smoke check (bind 127.0.0.1 behind Nginx, or 0.0.0.0 on trusted LAN/Tailscale)
+wctx gateway \
+  --vault company=/srv/vaults/company \
+  --token-file /etc/wiki-context/tokens.json \
+  --host 127.0.0.1 --port 8090
+
+# Install as a background daemon (systemd --user on Linux, launchd on macOS)
+wctx service install --target gateway \
+  --vault company=/srv/vaults/company \
+  --token-file /etc/wiki-context/tokens.json \
+  --host 127.0.0.1 --port 8090
+wctx service status --target gateway
+
+# On Linux servers, keep user systemd units alive after SSH logout:
+sudo loginctl enable-linger $USER
+```
+
+- **Exposing to teammates**: Front `127.0.0.1:8090` with Nginx HTTPS (`proxy_buffering off;` and forwarding `Authorization` — see [docs/gateway-and-acl.md](docs/gateway-and-acl.md)), or run over **Tailscale** on port `8090` with zero TLS setup.
+- **Health & auth verify**: `curl http://127.0.0.1:8090/healthz` and `curl -H "Authorization: Bearer wctx_..." http://127.0.0.1:8090/v1/vaults`.
+- **Scheduled incremental updates**: Index swaps are atomic and lock-free — add a cron entry to keep indexes fresh with zero downtime:
+  ```cron
+  */15 * * * * wctx sync --vault /srv/vaults/company >> ~/.wiki-context/sync.log 2>&1
+  ```
+
+---
+
+### Scenario 4: Teammates Connecting Purely via MCP (Zero Server Setup)
+
+Once `wctx gateway` is running on a server (e.g. `https://kb.example.com` or LAN `http://192.168.1.25:8090`), teammates only need the endpoint URL and their personal Bearer token (`wctx_...`):
+
+#### Option 4A: Zero-Install Direct Streamable HTTP MCP (Recommended)
+
+For clients with native Streamable HTTP MCP support (**Claude Code, WorkBuddy, Cursor, and HTTP-capable custom agents**), **teammates do not need Python, `wctx`, or the Desktop App installed locally**. Use `/mcp` for the default vault or `/mcp/<vault_id>` for a specific vault:
+
+- **Claude Code** (`claude mcp add` or `~/.claude.json`):
+  ```bash
+  claude mcp add --transport http company-kb https://kb.example.com/mcp/company \
+    --header "Authorization: Bearer wctx_YOUR_TOKEN"
+  ```
+  Equivalent `~/.claude.json`:
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "type": "http",
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_YOUR_TOKEN"
+        }
+      }
+    }
+  }
+  ```
+- **WorkBuddy**:
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "type": "streamable-http",
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_YOUR_TOKEN"
+        }
+      }
+    }
+  }
+  ```
+- **Cursor / Generic Streamable HTTP MCP Clients** (`~/.cursor/mcp.json` or client MCP settings):
+  ```json
+  {
+    "mcpServers": {
+      "company-kb": {
+        "url": "https://kb.example.com/mcp/company",
+        "headers": {
+          "Authorization": "Bearer wctx_YOUR_TOKEN"
+        }
+      }
+    }
+  }
+  ```
+- **Direct REST JSON Call** (scripts, CI, or custom agents):
+  ```bash
+  curl -X POST https://kb.example.com/v1/context \
+    -H "Authorization: Bearer wctx_YOUR_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"vault": "company", "question": "What are the API rate limits?"}'
+  ```
+
+#### Option 4B: Stdio-Only Clients or One-Command Multi-Client Sync
+
+If a client only speaks local `stdio` (e.g., **Codex CLI**, **DeepSeek Harness**), or you want all authorized remote vaults auto-configured across all local AI tools:
+
+- **One-command auto-setup** (install `wctx` CLI or use the Desktop App's **Devices & Clients → Manual Connect**):
+  ```bash
+  wctx remote add --url https://kb.example.com --token wctx_YOUR_TOKEN
+  ```
+  Probes all vaults your token can access and losslessly updates all detected local AI client configs.
+- **Manual `wctx bridge` config** (pass the token via `env.WCTX_TOKEN` so it stays out of process `argv`):
+  - **Codex CLI (`~/.codex/config.toml`)**:
+    ```toml
+    [mcp_servers.company-kb]
+    command = "wctx"
+    args = ["bridge", "--url", "https://kb.example.com/mcp/company"]
+    env = { WCTX_TOKEN = "wctx_YOUR_TOKEN", PYTHONUTF8 = "1" }
+    ```
+  - **Generic Stdio JSON**:
+    ```json
+    {
+      "mcpServers": {
+        "company-kb": {
+          "command": "wctx",
+          "args": ["bridge", "--url", "https://kb.example.com/mcp/company"],
+          "env": { "WCTX_TOKEN": "wctx_YOUR_TOKEN", "PYTHONUTF8": "1" }
+        }
+      }
+    }
+    ```
 
 ---
 
@@ -418,9 +658,9 @@ wctx gateway \
   --host 127.0.0.1 --port 8090
 ```
 
-- **Streamable HTTP MCP (`2025-03-26`)**: `POST http://127.0.0.1:8090/mcp` (default) or `POST http://127.0.0.1:8090/mcp/eng`, `/mcp/policy`
-- **REST JSON API**: `POST /v1/context`, `POST /v1/read`, `GET /v1/vaults`, `GET /v1/whoami`, `GET /healthz`
-- **Stdio-to-HTTP Bridge**: Clients that only speak local stdio can connect via `wctx bridge --url https://kb.example.com/mcp/eng --token <TOKEN>`.
+- **Streamable HTTP MCP (`2025-03-26`)**: `POST http://127.0.0.1:8090/mcp` (default) or `POST http://127.0.0.1:8090/mcp/eng`, `/mcp/policy` — supports zero-install direct client access with `Authorization: Bearer <token>`.
+- **REST JSON API**: `POST /v1/context`, `POST /v1/read`, `GET /v1/vaults`, `GET /v1/whoami`, `GET /healthz`.
+- **One-Command Sync & Stdio Bridge**: Teammates can run `wctx remote add --url https://kb.example.com --token <TOKEN>` to auto-configure all local AI clients, or bridge stdio-only clients via `wctx bridge --url https://kb.example.com/mcp/eng` with `WCTX_TOKEN` in `env`. See Scenarios 3 & 4 above and [docs/gateway-and-acl.md](docs/gateway-and-acl.md).
 
 ---
 

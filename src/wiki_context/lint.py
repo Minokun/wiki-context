@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 from .config import VaultConfig
-from .freshness import parse_wiki_frontmatter, split_frontmatter
+from .freshness import clean_source_ref, parse_wiki_frontmatter, split_frontmatter
 from .indexer import check_index
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
@@ -109,7 +109,7 @@ def lint_vault(vault: Path | str) -> dict:
             })
 
         for s in meta["sources"]:
-            clean = re.split(r"[（(]", s, maxsplit=1)[0].strip()
+            clean = clean_source_ref(s)
             if cfg.is_source_ref(clean):
                 norm = cfg.normalize_source_ref(clean)
                 if manifest_sources and norm not in manifest_sources:

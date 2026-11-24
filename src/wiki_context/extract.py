@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from .state_lock import resolve_external_tool
+
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024  # 64 MiB zip-bomb guard
 MIN_EMBEDDED_IMAGE_BYTES = 4096             # Skip <4 KiB bullet icons & 1x1 spacers
 MAX_EMBEDDED_ASSETS_PER_DOC = 24
@@ -1398,7 +1400,7 @@ def _reconstruct_pdf_layout_tables(page_text: str) -> str:
 
 
 def _extract_pdf(path: Path) -> ExtractedDocument:
-    pdftotext = shutil.which("pdftotext")
+    pdftotext = resolve_external_tool("pdftotext")
     if not pdftotext:
         return ExtractedDocument(
             method="native-pdf",

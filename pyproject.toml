@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "wiki-context"
-version = "0.3.1"
+version = "0.4.0"
 description = "Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + Zero-Hallucination MCP Gateway"
 readme = "README.md"
 license = "MIT"
@@ -43,9 +43,3 @@ Issues = "https://github.com/Minokun/wiki-context/issues"
 [project.scripts]
 wctx = "wiki_context.cli:main"
 wiki-context = "wiki_context.cli:main"
-
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]

@@ -172,6 +172,21 @@ class VaultConfig:
             return False
         return ref.startswith(self.source_prefix) or ref.startswith("sources/") or ref.startswith("史料/")
 
+    def is_wiki_ref(self, ref: str) -> bool:
+        if not isinstance(ref, str):
+            return False
+        s = ref.strip().replace("\\", "/")
+        return s.startswith(self.wiki_prefix) or s.startswith("wiki/") or s.startswith("知识库/")
+
+    def normalize_memory_ref(self, ref: str) -> str:
+        """Normalize a Layer-4 memory anchor: Layer-3 wiki pages stay wiki refs, all else is a source ref."""
+        s = ref.strip().replace("\\", "/")
+        if self.is_wiki_ref(s):
+            for pfx in (self.wiki_prefix, "wiki/", "知识库/"):
+                if s.startswith(pfx):
+                    return self.wiki_prefix + s[len(pfx):]
+        return self.normalize_source_ref(s)
+
     def normalize_source_ref(self, ref: str) -> str:
         s = ref.strip().replace("\\", "/")
         for pfx in (self.source_prefix, "sources/", "史料/"):

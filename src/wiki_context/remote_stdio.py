@@ -1,7 +1,8 @@
 """Zero-dependency local stdio -> remote Streamable HTTP MCP bridge (`wctx bridge`).
 
 Forwards newline-delimited JSON-RPC messages from a desktop MCP host over HTTPS/HTTP
-with Bearer token authentication to a remote `wiki-context` gateway.
+with Bearer token authentication to a remote `wiki-context` gateway using UTF-8 binary
+stdio streams (preventing `cp936`/`gbk` UnicodeEncodeError on Windows).
 """
 
 from __future__ import annotations
@@ -11,6 +12,17 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
+
+def _write_stdout_line(text: str) -> None:
+    data = (text.rstrip("\r\n") + "\n").encode("utf-8", errors="replace")
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(data)
+        buf.flush()
+    else:
+        sys.stdout.write(text.rstrip("\r\n") + "\n")
+        sys.stdout.flush()
 
 
 def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec: int = 30) -> int:
@@ -50,8 +62,7 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
                     continue
                 body = resp.read().decode("utf-8", errors="replace").strip()
                 if body:
-                    sys.stdout.write(body + "\n")
-                    sys.stdout.flush()
+                    _write_stdout_line(body)
         except urllib.error.HTTPError as exc:
             if has_id:
                 err_msg = {
@@ -59,8 +70,7 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
                     "id": req_id,
                     "error": {"code": -32000, "message": f"Gateway HTTP {exc.code}: {exc.reason}"},
                 }
-                sys.stdout.write(json.dumps(err_msg) + "\n")
-                sys.stdout.flush()
+                _write_stdout_line(json.dumps(err_msg, ensure_ascii=False))
         except OSError as exc:
             if has_id:
                 err_msg = {
@@ -68,6 +78,5 @@ def run_bridge(*, url: str | None = None, token: str | None = None, timeout_sec:
                     "id": req_id,
                     "error": {"code": -32000, "message": f"Gateway unreachable: {exc}"},
                 }
-                sys.stdout.write(json.dumps(err_msg) + "\n")
-                sys.stdout.flush()
+                _write_stdout_line(json.dumps(err_msg, ensure_ascii=False))
     return 0

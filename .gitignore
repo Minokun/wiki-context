@@ -32,3 +32,15 @@ examples/demo-vault/error_book.*
 
 # Local autoresearch workspace runs
 autoresearch/
+
+# Desktop & Web build artifacts
+node_modules/
+*.tsbuildinfo
+deploy/design-demos/
+deploy/dist/
+deploy/.build_venv/
+deploy/desktop/src-tauri/target/
+deploy/desktop/src-tauri/gen/
+deploy/desktop/src-tauri/resources/engine/*
+!deploy/desktop/src-tauri/resources/engine/.keep
+

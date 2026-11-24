@@ -1,0 +1,56 @@
+name: Release Desktop & Wheel
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build Web UI & Python Wheel
+        run: |
+          python deploy/scripts/build_web.py
+          mkdir -p dist
+          python -c "import _build_backend as bb; print(bb.build_wheel('dist'))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel
+          path: dist/*.whl
+
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundles: "app,dmg"
+          - os: windows-latest
+            bundles: "nsis,msi"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Build Desktop Installer (${{ matrix.os }})
+        run: python deploy/scripts/build_desktop.py --bundles "${{ matrix.bundles }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: deploy/dist/*
