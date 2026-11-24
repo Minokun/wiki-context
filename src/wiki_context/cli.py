@@ -11,7 +11,13 @@ from pathlib import Path
 
 from . import __version__
 from .compiler import compile_vault
-from .console import ConsoleState, load_console_vault_map, probe_remote_gateway, run_console
+from .console import (
+    ConsoleState,
+    build_standalone_gateway_context,
+    load_console_vault_map,
+    probe_remote_gateway,
+    run_console,
+)
 from .eval_harness import evaluate_vault
 from .freshness import check_vault_freshness, snapshot_wiki_hashes
 from .gateway import MultiVaultGateway, TokenRegistry, create_http_server, parse_vault_specs, selftest_gateway
@@ -403,7 +409,19 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
-            gw = MultiVaultGateway(vmap, tokens=reg)
+            gw_ctx = build_standalone_gateway_context(
+                args.config_dir,
+                token_file=tok_file,
+                registry=reg,
+            )
+            gw = MultiVaultGateway(
+                vmap,
+                tokens=reg,
+                telemetry=gw_ctx["telemetry"],
+                instance_id=gw_ctx["instance_id"],
+                fp=gw_ctx["fp"],
+                on_redeem_pairing=gw_ctx["on_redeem_pairing"],
+            )
             srv = create_http_server(gw, host=args.host, port=args.port, allow_zero_tokens=True)
             print(
                 f"wiki-context gateway listening on http://{args.host}:{args.port} "
@@ -418,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 srv.server_close()
                 gw.close()
+                gw_ctx["telemetry"].close()
             return 0
 
         if args.cmd == "bridge":

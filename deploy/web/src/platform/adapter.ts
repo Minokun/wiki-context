@@ -132,13 +132,42 @@ export async function openNativeDirectory(path: string): Promise<boolean> {
   }
 }
 
-export async function copyToClipboard(text: string): Promise<boolean> {
+function legacyCopy(text: string): boolean {
+  if (typeof document === "undefined" || !document.body) return false;
+  const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const field = document.createElement("textarea");
+  field.value = text;
+  field.setAttribute("readonly", "");
+  field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+  document.body.append(field);
+  field.select();
   try {
-    await navigator.clipboard.writeText(text);
-    return true;
+    field.setSelectionRange(0, text.length);
+  } catch {
+    // ignore on browsers without setSelectionRange
+  }
+  try {
+    return document.execCommand("copy");
   } catch {
     return false;
+  } finally {
+    field.remove();
+    previousFocus?.focus({ preventScroll: true });
   }
+}
+
+export async function copyToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return legacyCopy(text);
+    }
+  }
+  // Plain HTTP (non-localhost) lacks navigator.clipboard; run execCommand synchronously inside click gesture
+  return legacyCopy(text);
 }
 
 export interface AppUpdateInfo {

@@ -63,6 +63,7 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
   } | null>(null);
   const [remainSec, setRemainSec] = useState<number>(0);
   const [copiedCode, setCopiedCode] = useState(false);
+  const copyCodeTimerRef = useRef<number | null>(null);
 
   // OTP Pairing consumer (Client side)
   const [inputCode, setInputCode] = useState("");
@@ -152,6 +153,14 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
     const t = setInterval(update, 1000);
     return () => clearInterval(t);
   }, [generatedCode]);
+
+  useEffect(() => {
+    return () => {
+      if (copyCodeTimerRef.current !== null) {
+        window.clearTimeout(copyCodeTimerRef.current);
+      }
+    };
+  }, []);
 
   const scanNetwork = async (force = false) => {
     setScanning(true);
@@ -872,10 +881,20 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
                       <button
                         type="button"
                         onClick={() => {
+                          if (copyCodeTimerRef.current !== null) {
+                            window.clearTimeout(copyCodeTimerRef.current);
+                            copyCodeTimerRef.current = null;
+                          }
                           void copyToClipboard(generatedCode.code).then((ok) => {
                             if (ok) {
                               setCopiedCode(true);
-                              setTimeout(() => setCopiedCode(false), 1800);
+                              onToast("info", "已复制一次性配对码");
+                              copyCodeTimerRef.current = window.setTimeout(() => {
+                                setCopiedCode(false);
+                                copyCodeTimerRef.current = null;
+                              }, 1800);
+                            } else {
+                              onToast("error", "浏览器限制自动复制，请选中下方配对码手动复制");
                             }
                           });
                         }}
@@ -889,7 +908,7 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
                         {copiedCode ? "已复制" : "复制配对码"}
                       </button>
                     </div>
-                    <div className="mt-1.5 break-all rounded-md border border-[var(--border-default)] bg-[var(--bg-subtle)] p-2 font-mono text-xs text-emerald-700 dark:text-emerald-300">
+                    <div className="mt-1.5 select-all break-all rounded-md border border-[var(--border-default)] bg-[var(--bg-subtle)] p-2 font-mono text-xs text-emerald-700 dark:text-emerald-300">
                       {generatedCode.code}
                     </div>
                   </div>

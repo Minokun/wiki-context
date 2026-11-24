@@ -353,6 +353,152 @@ def load_console_vault_map(config_dir: Path | str | None = None) -> tuple[dict[s
     return vmap, tokens_file
 
 
+def _mint_token_into_file(
+    tok_path: Path,
+    lock_path: Path,
+    *,
+    uid: str,
+    label: str = "",
+    groups: list[str] | None = None,
+    allowed_vaults: list[str] | None = None,
+) -> dict[str, Any]:
+    """Atomically append a new SHA-256-hashed Bearer token to ``tokens.json`` under file lock."""
+    uid_clean = re.sub(r"[^\w\u4e00-\u9fff.@:-]+", "-", uid.strip()).strip("-")
+    if not uid_clean:
+        raise ValueError("令牌身份标识 (uid) 不能为空")
+    grp_clean = [str(g).strip() for g in (groups or ["all"]) if str(g).strip()] or ["all"]
+    av_clean = [str(v).strip() for v in (allowed_vaults or ["*"]) if str(v).strip()] or ["*"]
+
+    raw_secret = f"wctx_{secrets.token_urlsafe(24)}"
+    tok_id = f"tok_{secrets.token_hex(5)}"
+    preview = f"{raw_secret[:9]}…{raw_secret[-4:]}"
+    record = {
+        "id": tok_id,
+        "label": (label or uid_clean).strip()[:80],
+        "uid": uid_clean,
+        "token_sha256": _sha256_hex(raw_secret),
+        "token_preview": preview,
+        "groups": grp_clean,
+        "allowed_vaults": av_clean,
+        "disabled": False,
+        "created_at": _now_iso(),
+    }
+
+    tok_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock_path, blocking=True):
+        doc: dict[str, Any] = {"version": 2, "host_secret": "", "tokens": [], "acl": {}}
+        if tok_path.is_file():
+            try:
+                loaded = json.loads(tok_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    doc = loaded
+                    if not isinstance(doc.get("tokens"), list):
+                        doc["tokens"] = []
+                    if not isinstance(doc.get("acl"), dict):
+                        doc["acl"] = {}
+            except (OSError, ValueError):
+                pass
+        for i, r in enumerate(doc["tokens"]):
+            if isinstance(r, dict) and not r.get("id"):
+                r["id"] = f"tok_legacy_{i}"
+        doc["tokens"].append(record)
+        _atomic_write_json(tok_path, doc, private_mode=True)
+
+    return {
+        "token": raw_secret,
+        "record": {k: v for k, v in record.items() if k != "token_sha256"},
+    }
+
+
+def build_standalone_gateway_context(
+    config_dir: Path | str | None = None,
+    *,
+    token_file: Path | str | None = None,
+    registry: TokenRegistry | None = None,
+) -> dict[str, Any]:
+    """Load shared instance identity, telemetry, and cross-process OTP pairing redemption for `wctx gateway`."""
+    base = config_dir or os.environ.get("WCTX_HOME") or (Path.home() / ".wiki-context")
+    cfg_dir = Path(base).expanduser().resolve()
+    console_file = cfg_dir / "console.json"
+    tok_path = Path(token_file).expanduser().resolve() if token_file else (cfg_dir / "tokens.json")
+    lock_path = cfg_dir / ".state.lock"
+
+    instance_id = ""
+    if console_file.is_file():
+        try:
+            cdata = json.loads(console_file.read_text(encoding="utf-8"))
+            if isinstance(cdata, dict):
+                instance_id = str(cdata.get("instance_id") or "").strip()
+        except (OSError, ValueError):
+            pass
+
+    host_secret = ""
+    if tok_path.is_file():
+        try:
+            tdata = json.loads(tok_path.read_text(encoding="utf-8"))
+            if isinstance(tdata, dict):
+                host_secret = str(tdata.get("host_secret") or "").strip()
+        except (OSError, ValueError):
+            pass
+
+    fp = compute_host_fingerprint(instance_id, host_secret) if (instance_id and host_secret) else ""
+    pairing_mgr = PairingManager(storage_path=cfg_dir / "pairing_tickets.json")
+    telemetry = TelemetryStore(
+        db_path=cfg_dir / "telemetry.sqlite",
+        async_writer=True,
+        enabled=is_telemetry_enabled(),
+    )
+
+    def _redeem_fn(otp_id: str, otp_secret: str, client_label: str = "Paired Device") -> dict[str, Any]:
+        try:
+            grant = pairing_mgr.redeem_otp(otp_id, otp_secret)
+            clean_lbl = (client_label or "Paired Device").strip()[:48]
+            uid_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", clean_lbl.lower()).strip("-") or "peer"
+            tok_res = _mint_token_into_file(
+                tok_path,
+                lock_path,
+                uid=f"peer-{uid_slug}-{secrets.token_hex(2)}",
+                label=f"Paired: {clean_lbl}",
+                groups=grant["groups"],
+                allowed_vaults=grant["allowed_vaults"],
+            )
+            if registry is not None:
+                registry.force_reload()
+            return {
+                "token": tok_res["token"],
+                "record": tok_res["record"],
+                "instance_id": instance_id,
+                "fp": fp,
+            }
+        except ValueError as first_err:
+            # Fallback for live pre-upgrade `wctx ui` daemons holding OTP tickets only in RAM
+            if "invalid, already used, or expired" in str(first_err):
+                live = probe_live_daemon(cfg_dir)
+                if isinstance(live, dict) and int(live.get("port") or 0) > 0:
+                    resp = _http_json_request(
+                        f"http://127.0.0.1:{int(live['port'])}/v1/pair/exchange",
+                        method="POST",
+                        payload={
+                            "otp_id": otp_id,
+                            "otp_secret": otp_secret,
+                            "client_label": client_label,
+                        },
+                        timeout=3.0,
+                    )
+                    if registry is not None:
+                        registry.force_reload()
+                    if isinstance(resp, dict):
+                        return resp
+            raise first_err
+
+    return {
+        "instance_id": instance_id,
+        "fp": fp,
+        "on_redeem_pairing": _redeem_fn,
+        "telemetry": telemetry,
+    }
+
+
 class ConsoleState:
     """Thread-safe persistence & orchestration layer for the `wiki-context` Control Console."""
 
@@ -395,7 +541,7 @@ class ConsoleState:
         tok_data = self._load_tokens_doc()
         self.instance_id = str(init_data.get("instance_id") or "")
         self.fp = compute_host_fingerprint(self.instance_id, str(tok_data.get("host_secret") or ""))
-        self.pairing = PairingManager()
+        self.pairing = PairingManager(storage_path=self.config_dir / "pairing_tickets.json")
         self.telemetry = TelemetryStore(
             db_path=self.config_dir / "telemetry.sqlite",
             async_writer=True,
@@ -2577,39 +2723,17 @@ class ConsoleState:
         groups: list[str] | None = None,
         allowed_vaults: list[str] | None = None,
     ) -> dict[str, Any]:
-        uid_clean = re.sub(r"[^\w\u4e00-\u9fff.@:-]+", "-", uid.strip()).strip("-")
-        if not uid_clean:
-            raise ValueError("令牌身份标识 (uid) 不能为空")
-        grp_clean = [str(g).strip() for g in (groups or ["all"]) if str(g).strip()] or ["all"]
-        av_clean = [str(v).strip() for v in (allowed_vaults or ["*"]) if str(v).strip()] or ["*"]
-
-        raw_secret = f"wctx_{secrets.token_urlsafe(24)}"
-        tok_id = f"tok_{secrets.token_hex(5)}"
-        preview = f"{raw_secret[:9]}…{raw_secret[-4:]}"
-        record = {
-            "id": tok_id,
-            "label": (label or uid_clean).strip()[:80],
-            "uid": uid_clean,
-            "token_sha256": _sha256_hex(raw_secret),
-            "token_preview": preview,
-            "groups": grp_clean,
-            "allowed_vaults": av_clean,
-            "disabled": False,
-            "created_at": _now_iso(),
-        }
         with self._lock:
-            doc = self._load_tokens_doc()
-            # Ensure older entries also get stable `id`s
-            for i, r in enumerate(doc["tokens"]):
-                if isinstance(r, dict) and not r.get("id"):
-                    r["id"] = f"tok_legacy_{i}"
-            doc["tokens"].append(record)
-            self._save_tokens_doc(doc)
-
-        return {
-            "token": raw_secret,
-            "record": {k: v for k, v in record.items() if k != "token_sha256"},
-        }
+            res = _mint_token_into_file(
+                self.tokens_file,
+                self.state_lock_file,
+                uid=uid,
+                label=label,
+                groups=groups,
+                allowed_vaults=allowed_vaults,
+            )
+        self.token_registry.force_reload()
+        return res
 
     def update_token(
         self,

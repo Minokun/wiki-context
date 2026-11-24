@@ -18,8 +18,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from wiki_context import __version__  # noqa: E402
 from wiki_context.cli import main as cli_main  # noqa: E402
-from wiki_context.console import ConsoleState, create_console_server, load_console_vault_map  # noqa: E402
+from wiki_context.console import (  # noqa: E402
+    ConsoleState,
+    build_standalone_gateway_context,
+    create_console_server,
+    load_console_vault_map,
+)
+from wiki_context.discovery import PairingManager, probe_verified_pairing_endpoint  # noqa: E402
+from wiki_context.gateway import MultiVaultGateway, TokenRegistry, create_http_server  # noqa: E402
 from wiki_context.ops import install_service, render_service_definition, run_doctor, uninstall_service  # noqa: E402
+from wiki_context.scaffold import init_vault  # noqa: E402
+from wiki_context.state_lock import write_daemon_info  # noqa: E402
+from wiki_context.sync import sync_vault  # noqa: E402
 
 
 class TestConsoleAndClients(unittest.TestCase):
@@ -910,6 +920,124 @@ class TestConsoleAndClients(unittest.TestCase):
         self.assertTrue((archived / "知识库" / "策略精选.md").is_file())
         self.assertFalse((archived / "史料_md").exists())
         self.assertTrue((moved_dir / "因子库" / "动量策略.md").is_file())
+
+    def test_split_process_standalone_gateway_pairing_and_daemon_fallback(self):
+        v_dir = self.root / "split-vault"
+        init_vault(v_dir, name="SplitKB", layout="zh")
+        (v_dir / "史料" / "readme.md").write_text("# 联调规范\n\n共享网关端口 8090。\n", encoding="utf-8")
+        sync_vault(v_dir)
+        ob = self._api("/api/vaults/onboard", {"path": str(v_dir), "vault_id": "wiki-split", "name": "SplitKB"})
+        self.assertEqual(ob["vault_id"], "wiki-split")
+
+        vmap, default_tok_file = load_console_vault_map(self.cfg_dir)
+        reg = TokenRegistry(token_file=default_tok_file)
+        gw_ctx = build_standalone_gateway_context(self.cfg_dir, token_file=default_tok_file, registry=reg)
+        gw = MultiVaultGateway(
+            vmap,
+            tokens=reg,
+            telemetry=gw_ctx["telemetry"],
+            instance_id=gw_ctx["instance_id"],
+            fp=gw_ctx["fp"],
+            on_redeem_pairing=gw_ctx["on_redeem_pairing"],
+        )
+        gw_srv = create_http_server(gw, host="127.0.0.1", port=0, allow_zero_tokens=True)
+        gw_port = gw_srv.server_address[1]
+        gw_thread = threading.Thread(target=gw_srv.serve_forever, daemon=True)
+        gw_thread.start()
+
+        consumer_cfg = self.root / "consumer-home"
+        consumer_home = self.root / "consumer-user-home"
+        consumer_home.mkdir()
+        consumer_state = ConsoleState(config_dir=consumer_cfg, client_home=consumer_home, enable_watcher=False)
+        try:
+            # 1. Standalone gateway /healthz exposes shared instance_id + fp
+            with urllib.request.urlopen(f"http://127.0.0.1:{gw_port}/healthz", timeout=3) as resp:
+                hz = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(hz.get("instance_id"), self.state.instance_id)
+            self.assertEqual(hz.get("fp"), self.state.fp)
+
+            # 2. Ticket created in UI ConsoleState is stored in pairing_tickets.json and redeemed by standalone gateway
+            ticket1 = self.state.pairing.create_pairing_code(
+                host_label="split-host",
+                instance_id=self.state.instance_id,
+                fp=self.state.fp,
+                urls=[f"http://127.0.0.1:{gw_port}"],
+                allowed_vaults=["wiki-split"],
+                groups=["reader"],
+                allow_loopback=True,
+            )
+            best_url, _ = probe_verified_pairing_endpoint(
+                [f"http://127.0.0.1:{gw_port}"],
+                expected_instance_id=self.state.instance_id,
+                expected_fp=self.state.fp,
+            )
+            self.assertEqual(best_url, f"http://127.0.0.1:{gw_port}")
+
+            conn1 = consumer_state.connect_with_pairing_code(
+                code=ticket1["code"],
+                client_label="MacBook Test",
+                allow_loopback=True,
+            )
+            self.assertEqual(conn1["instance_id"], self.state.instance_id)
+            self.assertEqual(len(conn1["connected_vaults"]), 1)
+
+            # Single-use: replaying the same pairing code must fail
+            with self.assertRaises(ValueError):
+                consumer_state.connect_with_pairing_code(code=ticket1["code"], allow_loopback=True)
+
+            # 3. Live-daemon fallback: if a pre-upgrade `wctx ui` daemon holds a ticket only in RAM,
+            # standalone gateway forwards `/v1/pair/exchange` to `daemon.json` loopback port and reloads tokens
+            write_daemon_info(
+                self.cfg_dir,
+                port=self.port,
+                mode="console",
+                gateway_port=gw_port,
+                instance_id=self.state.instance_id,
+            )
+            orig_pairing = self.state.pairing
+            try:
+                self.state.pairing = PairingManager()  # memory-only simulation
+                ticket2 = self.state.pairing.create_pairing_code(
+                    host_label="split-host",
+                    instance_id=self.state.instance_id,
+                    fp=self.state.fp,
+                    urls=[f"http://127.0.0.1:{gw_port}"],
+                    allowed_vaults=["wiki-split"],
+                    groups=["reader"],
+                    allow_loopback=True,
+                )
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{gw_port}/v1/pair/exchange",
+                    data=json.dumps({
+                        "otp_id": ticket2["otp_id"],
+                        "otp_secret": json.loads(
+                            __import__("base64").urlsafe_b64decode(
+                                ticket2["code"][len("wctx1_"):] + "=" * (-len(ticket2["code"][len("wctx1_"):]) % 4)
+                            ).decode("utf-8")
+                        )["otp_secret"],
+                        "client_label": "Daemon Fallback Client",
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=4) as r_ex:
+                    ex_data = json.loads(r_ex.read().decode("utf-8"))
+                self.assertTrue(ex_data["token"].startswith("wctx_"))
+                req_who = urllib.request.Request(
+                    f"http://127.0.0.1:{gw_port}/v1/whoami",
+                    headers={"Authorization": f"Bearer {ex_data['token']}"},
+                )
+                with urllib.request.urlopen(req_who, timeout=3) as r_who:
+                    who_data = json.loads(r_who.read().decode("utf-8"))
+                self.assertIn("daemon-fallback-client", who_data["uid"])
+            finally:
+                self.state.pairing = orig_pairing
+        finally:
+            consumer_state.close()
+            gw_srv.shutdown()
+            gw_srv.server_close()
+            gw.close()
+            gw_ctx["telemetry"].close()
 
 
 if __name__ == "__main__":

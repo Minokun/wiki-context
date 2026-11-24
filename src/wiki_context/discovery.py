@@ -25,12 +25,13 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from . import __version__
 from .net import ssl_context
-from .state_lock import resolve_external_tool
+from .state_lock import atomic_write_json, file_lock, resolve_external_tool
 
 UDP_DISCOVERY_PORT = 48765
 UDP_DISCOVERY_MAGIC = b"WCTX_DISCOVER_V1"
@@ -137,17 +138,44 @@ def decode_pairing_code(code: str, *, allow_loopback: bool = False) -> dict[str,
 
 
 class PairingManager:
-    """In-memory single-use OTP pairing ticket registry."""
+    """Single-use OTP pairing ticket registry (in-memory + optional file-backed cross-process store)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, storage_path: Path | str | None = None) -> None:
         self._lock = threading.Lock()
         self._tickets: dict[str, dict[str, Any]] = {}
+        self._storage_path = Path(storage_path).expanduser().resolve() if storage_path else None
+        self._lock_path = (self._storage_path.parent / ".state.lock") if self._storage_path else None
 
-    def _purge_expired_locked(self, now: float | None = None) -> None:
+    def _purge_expired_map(self, tickets: dict[str, dict[str, Any]], now: float | None = None) -> bool:
         cur = now if now is not None else time.time()
-        dead = [k for k, v in self._tickets.items() if float(v.get("exp", 0)) <= cur]
+        dead = [
+            k for k, v in tickets.items()
+            if not isinstance(v, dict) or float(v.get("exp", 0)) <= cur
+        ]
         for k in dead:
-            self._tickets.pop(k, None)
+            tickets.pop(k, None)
+        return bool(dead)
+
+    def _load_file_tickets_locked(self) -> dict[str, dict[str, Any]]:
+        if self._storage_path is None or not self._storage_path.is_file():
+            return {}
+        try:
+            raw = json.loads(self._storage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        tickets = raw.get("tickets") if isinstance(raw, dict) else None
+        if not isinstance(tickets, dict):
+            return {}
+        return {str(k): dict(v) for k, v in tickets.items() if isinstance(v, dict)}
+
+    def _save_file_tickets_locked(self, tickets: dict[str, dict[str, Any]]) -> None:
+        assert self._storage_path is not None
+        self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            self._storage_path,
+            {"version": 1, "tickets": tickets},
+            private_mode=True,
+        )
 
     def create_pairing_code(
         self,
@@ -166,16 +194,32 @@ class PairingManager:
         otp_id = f"otp_{secrets.token_hex(4)}"
         otp_secret = secrets.token_urlsafe(18)
         exp = int(time.time()) + ttl
+        allowed_list = list(allowed_vaults) or ["*"]
+        groups_list = list(groups) or ["reader"]
 
         with self._lock:
-            self._purge_expired_locked()
-            self._tickets[otp_id] = {
-                "otp_secret": otp_secret,
-                "exp": exp,
-                "allowed_vaults": list(allowed_vaults) or ["*"],
-                "groups": list(groups) or ["reader"],
-                "attempts": 0,
-            }
+            if self._storage_path is not None and self._lock_path is not None:
+                self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+                with file_lock(self._lock_path, blocking=True):
+                    tickets = self._load_file_tickets_locked()
+                    self._purge_expired_map(tickets)
+                    tickets[otp_id] = {
+                        "otp_secret_sha256": hashlib.sha256(otp_secret.encode("utf-8")).hexdigest(),
+                        "exp": exp,
+                        "allowed_vaults": allowed_list,
+                        "groups": groups_list,
+                        "attempts": 0,
+                    }
+                    self._save_file_tickets_locked(tickets)
+            else:
+                self._purge_expired_map(self._tickets)
+                self._tickets[otp_id] = {
+                    "otp_secret": otp_secret,
+                    "exp": exp,
+                    "allowed_vaults": allowed_list,
+                    "groups": groups_list,
+                    "attempts": 0,
+                }
 
         payload = {
             "v": 1,
@@ -205,24 +249,53 @@ class PairingManager:
             raise ValueError("Missing otp_id or otp_secret")
 
         with self._lock:
-            self._purge_expired_locked()
-            rec = self._tickets.get(clean_id)
-            if rec is None:
-                raise ValueError("Pairing ticket invalid, already used, or expired")
-            if float(rec.get("exp", 0)) <= time.time():
-                self._tickets.pop(clean_id, None)
-                raise ValueError("Pairing ticket expired")
-            if not hmac.compare_digest(clean_sec, str(rec.get("otp_secret") or "")):
-                rec["attempts"] = int(rec.get("attempts") or 0) + 1
-                if rec["attempts"] >= 3:
+            # Prefer in-memory entry first if present (e.g. legacy instance or unit test)
+            self._purge_expired_map(self._tickets)
+            mem_rec = self._tickets.get(clean_id)
+            if mem_rec is not None or self._storage_path is None or self._lock_path is None:
+                if mem_rec is None:
+                    raise ValueError("Pairing ticket invalid, already used, or expired")
+                if float(mem_rec.get("exp", 0)) <= time.time():
                     self._tickets.pop(clean_id, None)
-                raise ValueError("Invalid pairing secret")
-            # Single-use: burn ticket immediately upon match
-            self._tickets.pop(clean_id, None)
-            return {
-                "allowed_vaults": list(rec["allowed_vaults"]),
-                "groups": list(rec["groups"]),
-            }
+                    raise ValueError("Pairing ticket expired")
+                if not hmac.compare_digest(clean_sec, str(mem_rec.get("otp_secret") or "")):
+                    mem_rec["attempts"] = int(mem_rec.get("attempts") or 0) + 1
+                    if mem_rec["attempts"] >= 3:
+                        self._tickets.pop(clean_id, None)
+                    raise ValueError("Invalid pairing secret")
+                self._tickets.pop(clean_id, None)
+                return {
+                    "allowed_vaults": list(mem_rec["allowed_vaults"]),
+                    "groups": list(mem_rec["groups"]),
+                }
+
+            self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with file_lock(self._lock_path, blocking=True):
+                tickets = self._load_file_tickets_locked()
+                purged = self._purge_expired_map(tickets)
+                rec = tickets.get(clean_id)
+                if rec is None:
+                    if purged:
+                        self._save_file_tickets_locked(tickets)
+                    raise ValueError("Pairing ticket invalid, already used, or expired")
+                if float(rec.get("exp", 0)) <= time.time():
+                    tickets.pop(clean_id, None)
+                    self._save_file_tickets_locked(tickets)
+                    raise ValueError("Pairing ticket expired")
+                cand_hash = hashlib.sha256(clean_sec.encode("utf-8")).hexdigest()
+                if not hmac.compare_digest(cand_hash, str(rec.get("otp_secret_sha256") or "")):
+                    rec["attempts"] = int(rec.get("attempts") or 0) + 1
+                    if rec["attempts"] >= 3:
+                        tickets.pop(clean_id, None)
+                    self._save_file_tickets_locked(tickets)
+                    raise ValueError("Invalid pairing secret")
+                # Single-use: burn ticket immediately upon match across processes
+                tickets.pop(clean_id, None)
+                self._save_file_tickets_locked(tickets)
+                return {
+                    "allowed_vaults": list(rec.get("allowed_vaults") or ["*"]),
+                    "groups": list(rec.get("groups") or ["reader"]),
+                }
 
 
 def probe_verified_pairing_endpoint(
