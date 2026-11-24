@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -130,7 +130,7 @@ def test_llm_connection(
         api_key=api_key,
         protocol=protocol,
         timeout_sec=timeout_sec,
-        max_tokens=32,
+        max_tokens=256,
         disable_thinking=disable_thinking,
         retries=0,
     )
@@ -365,6 +365,61 @@ def post_llm_json(
     return body
 
 
+def _extract_openai_message_text(msg: Any) -> str:
+    """Extract plain text content from an OpenAI-compatible choice message."""
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                itype = str(item.get("type") or "").strip().lower()
+                if itype in {"", "text", "output_text"} and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _inspect_openai_response(body: dict[str, Any]) -> dict[str, Any]:
+    """Parse choices, text, finish_reason, and reasoning token usage from an OpenAI response."""
+    raw_choices = body.get("choices")
+    choices = raw_choices if isinstance(raw_choices, list) else []
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    comp_details = (
+        usage.get("completion_tokens_details")
+        if isinstance(usage.get("completion_tokens_details"), dict)
+        else {}
+    )
+    try:
+        comp_tokens = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        comp_tokens = 0
+    try:
+        reasoning_tokens = int(comp_details.get("reasoning_tokens") or 0)
+    except (TypeError, ValueError):
+        reasoning_tokens = 0
+
+    first = choices[0] if choices and isinstance(choices[0], dict) else {}
+    finish_reason = str(first.get("finish_reason") or "").strip().lower()
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    text = _extract_openai_message_text(msg)
+    has_reasoning = bool(reasoning_tokens > 0 or msg.get("reasoning_content") or msg.get("reasoning"))
+    return {
+        "has_choices": bool(choices),
+        "finish_reason": finish_reason,
+        "text": text,
+        "comp_tokens": comp_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "has_reasoning": has_reasoning,
+        "model": str(body.get("model") or ""),
+    }
+
+
 def build_http_llm_caller(
     *,
     model: str | None = None,
@@ -384,7 +439,9 @@ def build_http_llm_caller(
         mdl = model or os.environ.get("WCTX_MODEL") or "claude-sonnet-4-20250514"
         if not key and not is_local_llm_url(url):
             raise ValueError("Missing API key: set WCTX_API_KEY or ANTHROPIC_API_KEY")
-        eff_max_tok = int(max_tokens) if (max_tokens is not None and max_tokens > 0) else 2048
+        eff_max_tok = int(max_tokens) if (max_tokens is not None and max_tokens > 0) else 4096
+        anth_budget_lock = threading.Lock()
+        anth_budget = {"min_max_tokens": eff_max_tok}
 
         def _call_anthropic(sys_prompt: str, usr_prompt: str) -> str:
             def _send_anth(tok_limit: int) -> dict[str, Any]:
@@ -409,19 +466,31 @@ def build_http_llm_caller(
                     retries=retries,
                 )
 
-            used_tok = eff_max_tok
+            with anth_budget_lock:
+                used_tok = anth_budget["min_max_tokens"]
             body = _send_anth(used_tok)
-            if str(body.get("stop_reason") or "").strip().lower() == "max_tokens":
-                boosted = min(8192, max(used_tok * 2, 3200))
+            blocks = body.get("content") or []
+            text = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+            stop_reason = str(body.get("stop_reason") or "").strip().lower()
+            has_thinking = any(isinstance(b, dict) and b.get("type") == "thinking" for b in blocks)
+            if stop_reason == "max_tokens" or (has_thinking and not text.strip()):
+                boosted = min(16384, max(used_tok * (4 if has_thinking else 2), 8192 if has_thinking else 4096))
                 if boosted > used_tok:
                     used_tok = boosted
                     body = _send_anth(used_tok)
-                if str(body.get("stop_reason") or "").strip().lower() == "max_tokens":
+                    blocks = body.get("content") or []
+                    text = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                    stop_reason = str(body.get("stop_reason") or "").strip().lower()
+                if stop_reason == "max_tokens":
                     raise RuntimeError(
                         f"LLM output truncated at max_tokens={used_tok} (stop_reason=max_tokens); increase max_tokens"
                     )
-            blocks = body.get("content") or []
-            return "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                if text.strip():
+                    with anth_budget_lock:
+                        anth_budget["min_max_tokens"] = max(anth_budget["min_max_tokens"], used_tok)
+            if not text.strip():
+                raise RuntimeError(f"大模型返回了空正文（stop_reason={stop_reason or 'unknown'}, model={mdl}）")
+            return text
 
         return _call_anthropic
 
@@ -439,6 +508,12 @@ def build_http_llm_caller(
 
     thinking_lock = threading.Lock()
     thinking_state = {"kwarg_supported": bool(disable_thinking)}
+    budget_lock = threading.Lock()
+    initial_tok = int(max_tokens) if (max_tokens is not None and max_tokens > 0) else None
+    budget_state: dict[str, Any] = {
+        "min_max_tokens": initial_tok,
+        "omit_max_tokens": False,
+    }
 
     def _call_openai(sys_prompt: str, usr_prompt: str) -> str:
         with thinking_lock:
@@ -479,30 +554,97 @@ def build_http_llm_caller(
                         thinking_state["kwarg_supported"] = False
                     use_kwarg = False
                     return _send(False, tok_limit)
+                if tok_limit is None and isinstance(cause, urllib.error.HTTPError) and cause.code in {400, 422}:
+                    return _send(use_kwarg, 16384)
                 raise
 
-        used_tok = int(max_tokens) if (max_tokens is not None and max_tokens > 0) else None
-        body = _send_with_thinking_fallback(used_tok)
-        choices = body.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"LLM response contained no choices: {body}")
+        with budget_lock:
+            used_tok: int | None = None if budget_state["omit_max_tokens"] else budget_state["min_max_tokens"]
 
-        finish_reason = str(choices[0].get("finish_reason") or "").strip().lower()
-        if finish_reason == "length":
-            if used_tok is not None:
-                boosted = min(8192, max(used_tok * 2, 3200))
+        escalated = False
+        body: dict[str, Any] = {}
+        info: dict[str, Any] = {}
+        reasoning_exhausted = False
+
+        for attempt in range(3):
+            body = _send_with_thinking_fallback(used_tok)
+            info = _inspect_openai_response(body)
+            text = info["text"]
+            finish_reason = info["finish_reason"]
+
+            if info["has_choices"] and finish_reason != "length" and text.strip():
+                if escalated:
+                    with budget_lock:
+                        if used_tok is None:
+                            budget_state["omit_max_tokens"] = True
+                        elif budget_state["min_max_tokens"] is None or used_tok > budget_state["min_max_tokens"]:
+                            budget_state["min_max_tokens"] = used_tok
+                return text
+
+            reasoning_exhausted = bool(
+                info["has_reasoning"]
+                and (not info["has_choices"] or not text.strip() or finish_reason == "length")
+            )
+            cap_exhausted = bool(
+                finish_reason == "length"
+                or (
+                    used_tok is not None
+                    and used_tok > 0
+                    and info["comp_tokens"] >= int(used_tok * 0.95)
+                    and (not info["has_choices"] or not text.strip())
+                )
+            )
+
+            if reasoning_exhausted and attempt < 2:
+                if used_tok is not None and used_tok < 8192:
+                    used_tok = min(16384, max(used_tok * 4, 8192))
+                    escalated = True
+                    continue
+                if used_tok is not None and used_tok < 16384:
+                    used_tok = 16384
+                    escalated = True
+                    continue
+                if used_tok is not None:
+                    used_tok = None
+                    escalated = True
+                    continue
+                break
+
+            if cap_exhausted and attempt == 0 and used_tok is not None:
+                boosted = min(16384, max(used_tok * 2, 4096))
                 if boosted > used_tok:
                     used_tok = boosted
-                    body = _send_with_thinking_fallback(used_tok)
-                    choices = body.get("choices") or []
-                    if not choices:
-                        raise RuntimeError(f"LLM response contained no choices: {body}")
-                    finish_reason = str(choices[0].get("finish_reason") or "").strip().lower()
-            if finish_reason == "length":
-                raise RuntimeError(
-                    f"LLM output truncated at max_tokens={used_tok or 'default'} (finish_reason=length); increase max_tokens"
-                )
-        return str((choices[0].get("message") or {}).get("content") or "")
+                    escalated = True
+                    continue
+                break
+
+            if (not info["has_choices"] or not text.strip()) and attempt == 0 and retries > 0:
+                time.sleep(0.6)
+                continue
+
+            break
+
+        if reasoning_exhausted:
+            raise RuntimeError(
+                f"模型思考链消耗了全部输出额度（max_tokens={used_tok or 'default'}, "
+                f"completion_tokens={info.get('comp_tokens', 0)}, "
+                f"reasoning_tokens={info.get('reasoning_tokens', 0)}），未能生成正文；"
+                "请在「整理模型设置」中调大单页输出上限或开启「关闭模型思考链」"
+            )
+        if info.get("finish_reason") == "length":
+            raise RuntimeError(
+                f"LLM output truncated at max_tokens={used_tok or 'default'} (finish_reason=length); increase max_tokens"
+            )
+        if not info.get("has_choices"):
+            compact = json.dumps(body, ensure_ascii=False)[:300]
+            raise RuntimeError(
+                f"大模型未返回任何候选内容（choices 为空，model={info.get('model') or mdl}，"
+                f"可能触发内容过滤或上游代理异常）：{compact}"
+            )
+        raise RuntimeError(
+            f"大模型返回了空正文（finish_reason={info.get('finish_reason') or 'unknown'}, "
+            f"model={info.get('model') or mdl}）"
+        )
 
     return _call_openai
 
@@ -1162,7 +1304,7 @@ def compile_vault(
     base_url: str | None = None,
     api_key: str | None = None,
     protocol: str = "openai",
-    max_items: int = 10,
+    max_items: int | None = None,
     dry_run: bool = False,
     include_images: bool = False,
     cluster_topics: bool = True,
@@ -1174,13 +1316,19 @@ def compile_vault(
     project_rollup: bool | None = None,
     skip_csv: bool | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
-    """Compile unindexed primary mirrors (with auto-triage, clustering & concurrency) and refresh stale Wiki pages."""
+    """Compile unindexed primary mirrors (with auto-triage, clustering & concurrency) and refresh stale Wiki pages.
+
+    Passing ``max_items=None`` or ``max_items<=0`` compiles all pending sources and eligible stale pages in one run.
+    """
     cfg = VaultConfig.load(vault)
     eff_skip_csv = cfg.compile_skip_csv if skip_csv is None else bool(skip_csv)
     eff_rollup = cfg.compile_project_rollup if project_rollup is None else bool(project_rollup)
-    eff_max_tokens = cfg.compile_max_tokens if max_tokens is None else max(256, min(8192, int(max_tokens)))
+    eff_max_tokens = cfg.compile_max_tokens if max_tokens is None else max(256, min(16384, int(max_tokens)))
     eff_disable_thinking = cfg.compile_disable_thinking if disable_thinking is None else bool(disable_thinking)
+    unlimited = max_items is None or int(max_items) <= 0
+    eff_max_items = 0 if unlimited else int(max_items)
     eff_workers = (
         max(1, min(16, int(workers)))
         if workers is not None
@@ -1198,6 +1346,7 @@ def compile_vault(
         is_zh=is_zh,
     )
     if dry_run:
+        top_units = units_all if unlimited else units_all[:eff_max_items]
         return {
             "vault": cfg.name,
             "dry_run": True,
@@ -1214,7 +1363,7 @@ def compile_vault(
                     "source_count": len(u["items"]),
                     "sources": [it["source"] for it in u["items"]],
                 }
-                for u in units_all[:max_items]
+                for u in top_units
             ],
         }
 
@@ -1231,18 +1380,19 @@ def compile_vault(
                 continue
         eligible_stale_all.append(s_item)
 
-    compile_units = units_all[:max_items]
-    remaining_budget = max(0, max_items - len(compile_units))
-    stale_items = eligible_stale_all[:remaining_budget]
+    if unlimited:
+        compile_units = list(units_all)
+        stale_items = list(eligible_stale_all)
+    else:
+        compile_units = units_all[:eff_max_items]
+        remaining_budget = max(0, eff_max_items - len(compile_units))
+        stale_items = eligible_stale_all[:remaining_budget]
     active_notes = plan["_active_notes"]
     pending_total = (
         len(plan["_uncompiled_items"])
         + len(eligible_stale_all)
         + (1 if active_notes else 0)
     )
-    covered_by_batch = sum(len(u["items"]) for u in compile_units)
-    remaining_uncompiled = max(0, len(plan["_uncompiled_items"]) - covered_by_batch)
-    remaining_stale = max(0, len(eligible_stale_all) - len(stale_items))
 
     if not compile_units and not stale_items and not active_notes:
         return {
@@ -1255,7 +1405,8 @@ def compile_vault(
             "duplicate_sources_skipped": plan.get("duplicate_sources_skipped", 0),
             "remaining_uncompiled": 0,
             "remaining_stale": 0,
-            "batch_limit": max_items,
+            "batch_limit": eff_max_items,
+            "cancelled": False,
             "noop": True,
         }
 
@@ -1271,15 +1422,17 @@ def compile_vault(
     today = dt.date.today().isoformat()
     now_hm = dt.datetime.now().strftime("%H:%M")
 
-    overview_link = "[[知识库总览]]" if is_zh else "[[Overview]]"
+    overview_filename = "知识库总览.md" if is_zh else "Overview.md"
+    has_overview_page = (cfg.wiki_root / overview_filename).is_file()
+    overview_link = ("[[知识库总览]]" if is_zh else "[[Overview]]") if has_overview_page else ""
     existing_stems_display: list[str] = []
     valid_wikilink_targets: set[str] = {
-        "overview",
-        "知识库总览",
         Path(cfg.catalog_file).stem.lower(),
         Path(cfg.log_file).stem.lower(),
         "agents",
     }
+    if has_overview_page:
+        valid_wikilink_targets.add(Path(overview_filename).stem.lower())
     existing_titles_lower: set[str] = set()
     if cfg.wiki_root.is_dir():
         for wp_ex in sorted(cfg.wiki_root.glob("*.md")):
@@ -1311,6 +1464,36 @@ def compile_vault(
     failed_units: list[dict[str, Any]] = []
     total_steps = len(compile_units) + len(stale_items) + (1 if active_notes else 0)
     done_steps = 0
+    live_compiled_count = 0
+    live_refreshed_count = 0
+    compiled_source_count = 0
+    stale_refreshed_count = 0
+    was_cancelled = False
+    snapshotted_pages: set[str] = set()
+    checkpoint_catalog_buffer: list[tuple[str, str]] = []
+    checkpoint_pages_buffer: list[str] = []
+
+    def _is_cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _flush_checkpoint(force: bool = False) -> None:
+        if not force and len(checkpoint_pages_buffer) < 10:
+            return
+        if checkpoint_catalog_buffer and cfg.catalog_path.is_file():
+            cat_txt = cfg.catalog_path.read_text(encoding="utf-8", errors="replace").rstrip()
+            new_lines = [
+                f"- [[{stem}]] — {desc}"
+                for stem, desc in checkpoint_catalog_buffer
+                if f"[[{stem}]]" not in cat_txt
+            ]
+            if new_lines:
+                cfg.catalog_path.write_text(cat_txt + "\n" + "\n".join(new_lines) + "\n", encoding="utf-8")
+        checkpoint_catalog_buffer.clear()
+        for pname in checkpoint_pages_buffer:
+            if pname not in snapshotted_pages:
+                snapshot_wiki_hashes(cfg.root, page=pname)
+                snapshotted_pages.add(pname)
+        checkpoint_pages_buffer.clear()
 
     def _emit(phase: str, current: str = "") -> None:
         if on_progress is not None:
@@ -1321,10 +1504,11 @@ def compile_vault(
                         "done": done_steps,
                         "total": total_steps,
                         "pending_total": pending_total,
-                        "batch_limit": max_items,
+                        "batch_limit": eff_max_items,
                         "current": current,
-                        "compiled_count": len(compiled_pages),
-                        "refreshed_count": len(refreshed_pages),
+                        "compiled_count": live_compiled_count,
+                        "refreshed_count": live_refreshed_count,
+                        "failed_count": len(failed_units),
                     }
                 on_progress(snap_prog)
             except Exception:
@@ -1358,6 +1542,8 @@ def compile_vault(
         valid_wikilink_targets.add(p_info["stem_title"].lower())
 
     def _compile_one_unit(p_info: dict[str, Any]) -> dict[str, Any]:
+        if _is_cancelled():
+            return {"cancelled": True}
         unit = p_info["unit"]
         unit_items: list[dict] = unit["items"]
         prompt_items: list[dict] = unit.get("prompt_items") or unit_items
@@ -1371,7 +1557,8 @@ def compile_vault(
         _emit("compiling_new", progress_label)
 
         allowed_pool = [s for s in all_planned_stems if s != stem_title][:25]
-        allowed_links = ", ".join(f"[[{s}]]" for s in (allowed_pool or [overview_link.strip("[]")]))
+        fallback_links = [overview_link.strip("[]")] if overview_link else [Path(cfg.catalog_file).stem]
+        allowed_links = ", ".join(f"[[{s}]]" for s in (allowed_pool or fallback_links))
         srcs_yaml_block = "\n".join(f"  - {s}" for s in unit_srcs)
         srcs_md_list = "\n".join(f"- {s}" for s in unit_srcs[:30])
         if len(unit_srcs) > 30:
@@ -1464,6 +1651,8 @@ def compile_vault(
                 )
 
         generated = _strip_outer_markdown_fence(caller(sys_prompt, usr_prompt))
+        if not generated.strip():
+            raise RuntimeError(f"LLM returned empty content while compiling {stem_title}")
         fm_gen, _ = split_frontmatter(generated)
         gen_title_low = (parse_wiki_frontmatter(fm_gen)["title"] or "").strip().lower()
         with state_lock:
@@ -1477,7 +1666,7 @@ def compile_vault(
             today=today,
             force_title=force_unique_title,
         )
-        if overview_link not in generated:
+        if overview_link and overview_link not in generated:
             generated = generated.rstrip() + f"\n\n## {'关联页面' if is_zh else 'Related Pages'}\n\n{overview_link}\n"
 
         generated = _sanitize_dangling_wikilinks(generated, targets_snap)
@@ -1495,18 +1684,30 @@ def compile_vault(
             "stem": target_wp.stem,
             "cat_desc": cat_desc,
             "progress_label": progress_label,
+            "source_count": len(unit_srcs),
         }
 
     # 1) Compile newly added uncompiled sources (parallel when eff_workers > 1, deterministic order when == 1)
     if eff_workers <= 1 or len(prepared_units) <= 1:
         for p_info in prepared_units:
+            if _is_cancelled():
+                was_cancelled = True
+                break
             try:
                 res_u = _compile_one_unit(p_info)
+                if res_u.get("cancelled"):
+                    was_cancelled = True
+                    break
                 with state_lock:
                     existing_titles_lower.add(res_u["stem"].lower())
                     compiled_pages.append(res_u["page_filename"])
                     catalog_additions.append((res_u["stem"], res_u["cat_desc"]))
+                    live_compiled_count += 1
+                    compiled_source_count += int(res_u.get("source_count") or 1)
                     done_steps += 1
+                checkpoint_catalog_buffer.append((res_u["stem"], res_u["cat_desc"]))
+                checkpoint_pages_buffer.append(res_u["page_filename"])
+                _flush_checkpoint(force=False)
                 _emit("compiling_new", res_u["progress_label"])
             except Exception as exc:
                 with state_lock:
@@ -1524,13 +1725,27 @@ def compile_vault(
             for fut in as_completed(fut_map):
                 idx = fut_map[fut]
                 p_info = prepared_units[idx]
+                if _is_cancelled():
+                    was_cancelled = True
+                    for pending_f in fut_map:
+                        pending_f.cancel()
                 try:
                     res_u = fut.result()
+                    if res_u.get("cancelled"):
+                        was_cancelled = True
+                        continue
                     ordered_results[idx] = res_u
                     with state_lock:
                         existing_titles_lower.add(res_u["stem"].lower())
+                        live_compiled_count += 1
+                        compiled_source_count += int(res_u.get("source_count") or 1)
                         done_steps += 1
+                    checkpoint_catalog_buffer.append((res_u["stem"], res_u["cat_desc"]))
+                    checkpoint_pages_buffer.append(res_u["page_filename"])
+                    _flush_checkpoint(force=False)
                     _emit("compiling_new", res_u["progress_label"])
+                except CancelledError:
+                    was_cancelled = True
                 except Exception as exc:
                     with state_lock:
                         failed_units.append({
@@ -1545,15 +1760,15 @@ def compile_vault(
             compiled_pages.append(res_u["page_filename"])
             catalog_additions.append((res_u["stem"], res_u["cat_desc"]))
 
-    # If any pre-allocated sibling failed, strip links to uncreated pages so lint stays 0-error
-    if failed_units and compiled_pages:
+    # If any pre-allocated sibling failed or was cancelled, strip links to uncreated pages so lint stays 0-error
+    if (failed_units or was_cancelled) and compiled_pages:
         actual_targets = {
-            "overview",
-            "知识库总览",
             Path(cfg.catalog_file).stem.lower(),
             Path(cfg.log_file).stem.lower(),
             "agents",
         }
+        if has_overview_page:
+            actual_targets.add(Path(overview_filename).stem.lower())
         for wp_now in cfg.wiki_root.glob("*.md"):
             if not wp_now.is_symlink():
                 actual_targets.add(wp_now.stem.lower())
@@ -1568,6 +1783,8 @@ def compile_vault(
 
     # 2) Refresh stale Wiki pages (concurrent when eff_workers > 1)
     def _refresh_one_stale(s_item: dict[str, Any]) -> str | None:
+        if _is_cancelled():
+            return None
         wp = cfg.wiki_root / s_item["page"]
         _emit("refreshing_stale", s_item["page"])
         if not wp.is_file():
@@ -1608,15 +1825,26 @@ def compile_vault(
         wp.write_text(updated_md.rstrip() + "\n", encoding="utf-8")
         return wp.name
 
-    if stale_items:
+    if stale_items and not was_cancelled:
         if eff_workers <= 1 or len(stale_items) <= 1:
             for s_item in stale_items:
+                if _is_cancelled():
+                    was_cancelled = True
+                    break
                 try:
                     ref_name = _refresh_one_stale(s_item)
+                    if _is_cancelled() and ref_name is None:
+                        was_cancelled = True
+                        break
                     with state_lock:
                         if ref_name:
                             refreshed_pages.append(ref_name)
+                            live_refreshed_count += 1
+                            stale_refreshed_count += 1
                         done_steps += 1
+                    if ref_name:
+                        checkpoint_pages_buffer.append(ref_name)
+                        _flush_checkpoint(force=False)
                     _emit("refreshing_stale", s_item["page"])
                 except Exception as exc:
                     with state_lock:
@@ -1630,13 +1858,29 @@ def compile_vault(
                 for fut in as_completed(fut_map):
                     idx = fut_map[fut]
                     s_item = stale_items[idx]
+                    if _is_cancelled():
+                        was_cancelled = True
+                        for pending_f in fut_map:
+                            pending_f.cancel()
                     try:
                         ref_name = fut.result()
                         if ref_name:
                             ref_ordered[idx] = ref_name
-                        with state_lock:
-                            done_steps += 1
+                            with state_lock:
+                                live_refreshed_count += 1
+                                stale_refreshed_count += 1
+                                done_steps += 1
+                            checkpoint_pages_buffer.append(ref_name)
+                            _flush_checkpoint(force=False)
+                        elif _is_cancelled():
+                            was_cancelled = True
+                            continue
+                        else:
+                            with state_lock:
+                                done_steps += 1
                         _emit("refreshing_stale", s_item["page"])
+                    except CancelledError:
+                        was_cancelled = True
                     except Exception as exc:
                         with state_lock:
                             failed_units.append({"title": s_item["page"], "sources": s_item.get("sources", []), "error": str(exc)})
@@ -1647,14 +1891,15 @@ def compile_vault(
 
     # 2.5) Consolidate Layer-4 Operational Memory (`notes/` / `记忆/`) into Compiled Wiki
     consolidated_notes: list[str] = []
-    if active_notes:
+    if active_notes and not was_cancelled and not _is_cancelled():
         mem_store = MemoryStore(cfg.root)
         notes_title = "实战经验与勘误汇总" if is_zh else "Operational-Notes-and-Errata"
+        _emit("consolidating_notes", notes_title)
         notes_wp = cfg.wiki_root / f"{notes_title}.md"
         existing_notes_wiki = notes_wp.read_text(encoding="utf-8", errors="replace") if notes_wp.is_file() else ""
         all_note_srcs: list[str] = []
         note_blobs: list[str] = []
-        for n in active_notes[:20]:
+        for n in active_notes[:50]:
             for rs in n.related_sources:
                 if rs not in all_note_srcs:
                     all_note_srcs.append(rs)
@@ -1666,20 +1911,22 @@ def compile_vault(
             f"titled `{notes_title}`.\n"
             f"Start with YAML frontmatter:\n---\ntitle: \"{notes_title}\"\ntype: synthesis\nstatus: draft\n"
             f"updated: {today}\nsources:{srcs_yaml}\n---\n\n"
-            f"Include `{overview_link}` under Related Pages.\n\n"
+            + (f"Include `{overview_link}` under Related Pages.\n\n" if overview_link else "")
             + (f"=== Previous Page ===\n{existing_notes_wiki[:4000]}\n\n" if existing_notes_wiki else "")
             + "=== Pending Operational Notes ===\n"
             + "\n".join(note_blobs)
         )
         try:
             gen_notes_md = _strip_outer_markdown_fence(caller(sys_prompt, note_prompt))
+            if not gen_notes_md.strip():
+                raise RuntimeError(f"LLM returned empty content while consolidating notes into {notes_title}")
             if not gen_notes_md.startswith("---"):
                 gen_notes_md = (
                     f'---\ntitle: "{notes_title}"\ntype: synthesis\nstatus: draft\nupdated: {today}\n'
                     f"sources:{srcs_yaml}\n---\n\n{gen_notes_md}\n"
                 )
             gen_notes_md = _enforce_draft_status(gen_notes_md)
-            if overview_link not in gen_notes_md:
+            if overview_link and overview_link not in gen_notes_md:
                 gen_notes_md = gen_notes_md.rstrip() + f"\n\n## {'关联页面' if is_zh else 'Related Pages'}\n\n{overview_link}\n"
             valid_wikilink_targets.add(notes_title.lower())
             gen_notes_md = _sanitize_dangling_wikilinks(gen_notes_md, valid_wikilink_targets)
@@ -1688,27 +1935,57 @@ def compile_vault(
             if was_existing:
                 if notes_wp.name not in refreshed_pages:
                     refreshed_pages.append(notes_wp.name)
+                    with state_lock:
+                        live_refreshed_count += 1
             else:
                 compiled_pages.append(notes_wp.name)
+                with state_lock:
+                    live_compiled_count += 1
                 notes_desc = _extract_catalog_summary(
                     gen_notes_md,
                     fallback=("实战经验与原件勘误汇总" if is_zh else "Consolidated operational notes & field errata"),
                 )
                 catalog_additions.append((notes_wp.stem, notes_desc))
 
-            for n in active_notes[:20]:
+            for n in active_notes[:50]:
                 if n.kind != "errata":
                     # Keep `errata` active so 1-hop Errata Pins remain pinned onto read-only primary chunks!
                     mem_store.update_status(n.note_id, "consolidated", consolidated_into=f"{cfg.wiki_prefix}{notes_wp.name}")
                 consolidated_notes.append(n.note_id)
         except Exception as exc:
             failed_units.append({"title": notes_title, "sources": all_note_srcs, "error": str(exc)})
+        with state_lock:
+            done_steps += 1
+        _emit("consolidating_notes", notes_title)
+    elif active_notes and _is_cancelled():
+        was_cancelled = True
+
+    remaining_uncompiled = max(0, len(plan["_uncompiled_items"]) - compiled_source_count)
+    remaining_stale = max(0, len(eligible_stale_all) - stale_refreshed_count)
+
+    # If cancelled before completing any page, return cleanly without error
+    if was_cancelled and not compiled_pages and not refreshed_pages and not consolidated_notes:
+        return {
+            "vault": cfg.name,
+            "compiled_pages": [],
+            "refreshed_pages": [],
+            "consolidated_notes": [],
+            "skipped_reviewed_pages": skipped_reviewed_pages,
+            "failed_units": failed_units,
+            "duplicate_sources_skipped": plan.get("duplicate_sources_skipped", 0),
+            "remaining_uncompiled": remaining_uncompiled,
+            "remaining_stale": remaining_stale,
+            "batch_limit": eff_max_items,
+            "cancelled": True,
+            "noop": True,
+        }
 
     # If the entire batch failed with zero completed pages, surface the root error immediately
     if failed_units and not compiled_pages and not refreshed_pages and not consolidated_notes:
         raise RuntimeError(failed_units[0]["error"])
 
     # 3) Update catalog (`index.md` / `目录.md`) and append `log.md` / `日志.md`
+    _flush_checkpoint(force=True)
     if catalog_additions and cfg.catalog_path.is_file():
         cat_txt = cfg.catalog_path.read_text(encoding="utf-8", errors="replace").rstrip()
         new_lines = [f"- [[{stem}]] — {desc}" for stem, desc in catalog_additions if f"[[{stem}]]" not in cat_txt]
@@ -1719,7 +1996,8 @@ def compile_vault(
         log_txt = cfg.log_path.read_text(encoding="utf-8", errors="replace").rstrip()
         header = f"## {today}"
         touched = ", ".join([*compiled_pages, *refreshed_pages])
-        row = f"| {now_hm} | compile | {touched} | Compiled {len(compiled_pages)} new, refreshed {len(refreshed_pages)} stale |"
+        suffix_note = " (cancelled early)" if was_cancelled else ""
+        row = f"| {now_hm} | compile | {touched} | Compiled {len(compiled_pages)} new, refreshed {len(refreshed_pages)} stale{suffix_note} |"
         if header in log_txt:
             cfg.log_path.write_text(log_txt + "\n" + row + "\n", encoding="utf-8")
         else:
@@ -1733,7 +2011,9 @@ def compile_vault(
     # 4) Snapshot verified hashes, rebuild FTS5 index, then lint
     _emit("rebuilding_index", cfg.name)
     for pname in (*compiled_pages, *refreshed_pages):
-        snapshot_wiki_hashes(cfg.root, page=pname)
+        if pname not in snapshotted_pages:
+            snapshot_wiki_hashes(cfg.root, page=pname)
+            snapshotted_pages.add(pname)
 
     idx_summary = rebuild_index(cfg.root)
     lint_report = lint_vault(cfg.root)
@@ -1748,7 +2028,8 @@ def compile_vault(
         "duplicate_sources_skipped": plan.get("duplicate_sources_skipped", 0),
         "remaining_uncompiled": remaining_uncompiled,
         "remaining_stale": remaining_stale,
-        "batch_limit": max_items,
+        "batch_limit": eff_max_items,
+        "cancelled": was_cancelled,
         "lint": lint_report,
         "index": idx_summary,
     }

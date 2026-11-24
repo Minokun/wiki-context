@@ -550,6 +550,40 @@ class TestV04Phase1(unittest.TestCase):
             b_srv.shutdown()
             b_srv.server_close()
 
+    def test_console_unlimited_migration_and_cancel_job(self) -> None:
+        cfg_dir = self.root / "legacy-llm-cfg"
+        cfg_dir.mkdir()
+        # Simulate legacy console.json where old UI implicitly saved max_items_per_run=15
+        (cfg_dir / "console.json").write_text(
+            json.dumps({
+                "vaults": {},
+                "llm_compiler": {
+                    "provider": "deepseek",
+                    "protocol": "openai",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "model": "deepseek-v4.1-flash",
+                    "max_items_per_run": 15,
+                },
+            }),
+            encoding="utf-8",
+        )
+        state = ConsoleState(config_dir=cfg_dir, client_home=self.root / "fake-home-mig", enable_watcher=False)
+        try:
+            st = state.get_llm_compiler_status()
+            self.assertEqual(st["max_items_per_run"], 0)
+            self.assertEqual(st["max_tokens"], 4096)
+
+            # Explicitly choosing 15 persists max_items_explicit and honors 15
+            saved15 = state.save_llm_compiler_config({"max_items_per_run": 15})
+            self.assertEqual(saved15["max_items_per_run"], 15)
+
+            # Explicitly switching back to 0 (all pending) honors 0 and max_tokens up to 16384
+            saved0 = state.save_llm_compiler_config({"max_items_per_run": 0, "max_tokens": 16384})
+            self.assertEqual(saved0["max_items_per_run"], 0)
+            self.assertEqual(saved0["max_tokens"], 16384)
+        finally:
+            state.close()
+
 
 if __name__ == "__main__":
     unittest.main()

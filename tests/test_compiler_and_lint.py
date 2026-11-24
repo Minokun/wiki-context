@@ -573,6 +573,185 @@ class TestCompilerAndLint(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_reasoning_model_empty_choices_escalates_and_remembers_budget(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json as _json
+        import threading as _threading
+
+        seen_limits: list[int | None] = []
+        scenario = {"min_needed": 8192, "mode": "empty_choices"}
+
+        class _ReasoningHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                n = int(self.headers.get("Content-Length") or "0")
+                body = _json.loads(self.rfile.read(n).decode("utf-8"))
+                mt = body.get("max_tokens")
+                seen_limits.append(mt)
+                need = scenario["min_needed"]
+                exhausted = (mt is not None and mt < need) if need is not None else (mt is not None)
+                if exhausted:
+                    if scenario["mode"] == "empty_choices":
+                        resp = {
+                            "id": "resp_test_reasoning",
+                            "choices": [],
+                            "object": "chat.completion",
+                            "model": "deepseek-v4.1-flash",
+                            "usage": {
+                                "prompt_tokens": 4794,
+                                "completion_tokens": mt or 1800,
+                                "completion_tokens_details": {"reasoning_tokens": mt or 1800},
+                                "total_tokens": 4794 + (mt or 1800),
+                            },
+                        }
+                    else:
+                        resp = {
+                            "choices": [{
+                                "finish_reason": "stop",
+                                "message": {"content": "", "reasoning_content": "thinking..."},
+                            }],
+                            "model": "deepseek-v4.1-flash",
+                            "usage": {
+                                "completion_tokens": mt or 1800,
+                                "completion_tokens_details": {"reasoning_tokens": mt or 1800},
+                            },
+                        }
+                else:
+                    resp = {
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": {"content": "COMPILED OK"},
+                        }],
+                        "model": "deepseek-v4.1-flash",
+                    }
+                raw = _json.dumps(resp).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = HTTPServer(("127.0.0.1", 0), _ReasoningHandler)
+        port = srv.server_address[1]
+        _threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            caller = build_http_llm_caller(
+                model="deepseek-v4.1-flash",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                api_key="",
+                protocol="openai",
+                max_tokens=1800,
+                retries=0,
+            )
+            # First call exhausts 1800 with choices=[] & reasoning_tokens=1800, escalates to 8192 and succeeds
+            self.assertEqual(caller("sys", "usr"), "COMPILED OK")
+            self.assertEqual(seen_limits, [1800, 8192])
+
+            # Second call reuses learned 8192 floor directly without wasting a 1800-token call
+            self.assertEqual(caller("sys", "usr"), "COMPILED OK")
+            self.assertEqual(seen_limits, [1800, 8192, 8192])
+
+            # Empty visible content with reasoning_content also escalates up to omitting max_tokens
+            seen_limits.clear()
+            scenario["mode"] = "empty_content"
+            scenario["min_needed"] = None  # Only succeeds when max_tokens is omitted
+            self.assertEqual(caller("sys", "usr"), "COMPILED OK")
+            self.assertEqual(seen_limits, [8192, 16384, None])
+
+            # If even omitting max_tokens fails with reasoning exhaustion, raise readable Chinese guidance
+            caller_fail = build_http_llm_caller(
+                model="deepseek-v4.1-flash",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                api_key="",
+                protocol="openai",
+                max_tokens=1800,
+                retries=0,
+            )
+            scenario["mode"] = "empty_choices"
+            scenario["min_needed"] = 999999
+            with self.assertRaises(RuntimeError) as ctx:
+                caller_fail("sys", "usr")
+            self.assertIn("reasoning_tokens", str(ctx.exception))
+            self.assertIn("模型思考链", str(ctx.exception))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_unlimited_compile_all_and_midrun_cancellation(self) -> None:
+        import re
+        import threading as _threading
+
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "vault-all"
+            init_vault(v, layout="en", name="AllDocs")
+            for i in range(22):
+                (v / "sources" / f"doc-{i:02d}.md").write_text(
+                    f"# Doc {i}\nFact value = {i * 10}.\n", encoding="utf-8"
+                )
+            sync_vault(v)
+
+            def fake_llm(sys_p: str, usr_p: str) -> str:
+                m = re.search(r"titled '([^']+)'", usr_p)
+                title = m.group(1) if m else "page"
+                sm = re.search(r"- (sources/[^\s\n]+)", usr_p)
+                src = sm.group(1) if sm else "sources/doc-00.md"
+                return (
+                    f'---\ntitle: "{title}"\ntype: source\nstatus: draft\nupdated: 2026-11-24\n'
+                    f"sources:\n  - {src}\n---\n\n# {title}\n\n## Overview\nSummary for {title}.\n\n"
+                    f"## Related Pages\n\n[[Overview]]\n\n## Sources\n- {src}\n"
+                )
+
+            # Default max_items=None (and 0) compiles ALL 22 docs in one run instead of stopping at 10/15
+            res_all = compile_vault(v, llm_fn=fake_llm, cluster_topics=False, workers=4)
+            self.assertEqual(len(res_all["compiled_pages"]), 22)
+            self.assertEqual(res_all["remaining_uncompiled"], 0)
+            self.assertEqual(res_all["batch_limit"], 0)
+            self.assertFalse(res_all["cancelled"])
+            self.assertTrue(res_all["lint"]["ok"])
+            self.assertEqual(plan_compilation(v)["uncompiled_sources"], [])
+
+        # Mid-run cancellation saves already-completed pages cleanly with 0 lint errors
+        with tempfile.TemporaryDirectory() as td:
+            v2 = Path(td) / "vault-cancel"
+            init_vault(v2, layout="en", name="CancelDocs")
+            for i in range(10):
+                (v2 / "sources" / f"item-{i:02d}.md").write_text(
+                    f"# Item {i}\nDetail {i}.\n", encoding="utf-8"
+                )
+            sync_vault(v2)
+            cancel_ev = _threading.Event()
+            done_count = {"n": 0}
+
+            def cancelling_llm(sys_p: str, usr_p: str) -> str:
+                done_count["n"] += 1
+                if done_count["n"] >= 3:
+                    cancel_ev.set()
+                m = re.search(r"titled '([^']+)'", usr_p)
+                title = m.group(1) if m else "item"
+                sm = re.search(r"- (sources/[^\s\n]+)", usr_p)
+                src = sm.group(1) if sm else "sources/item-00.md"
+                return (
+                    f'---\ntitle: "{title}"\ntype: source\nstatus: draft\nupdated: 2026-11-24\n'
+                    f"sources:\n  - {src}\n---\n\n# {title}\n\n## Overview\nBody.\n\n"
+                    f"## Related Pages\n\n[[Overview]]\n\n## Sources\n- {src}\n"
+                )
+
+            res_c = compile_vault(
+                v2,
+                llm_fn=cancelling_llm,
+                max_items=0,
+                cluster_topics=False,
+                workers=1,
+                cancel_event=cancel_ev,
+            )
+            self.assertTrue(res_c["cancelled"])
+            self.assertEqual(len(res_c["compiled_pages"]), 3)
+            self.assertEqual(res_c["remaining_uncompiled"], 7)
+            self.assertTrue(res_c["lint"]["ok"])
+            self.assertEqual(len(plan_compilation(v2)["uncompiled_sources"]), 7)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,30 +199,46 @@ const AppInner: React.FC = () => {
           });
 
           const vaultName = vaultsRef.current.find((v) => v.id === vid)?.name || vid;
-          if (st.status === "done") {
+          if (st.status === "done" || st.status === "cancelled") {
             const resObj = (st.result || {}) as {
               compiled_pages?: string[];
               refreshed_pages?: string[];
+              failed_units?: { title?: string; error?: string }[];
               remaining_uncompiled?: number;
               remaining_stale?: number;
               batch_limit?: number;
+              cancelled?: boolean;
               noop?: boolean;
             };
             const cCnt = (resObj.compiled_pages || []).length;
             const rCnt = (resObj.refreshed_pages || []).length;
+            const fUnits = resObj.failed_units || [];
             const rem = (resObj.remaining_uncompiled || 0) + (resObj.remaining_stale || 0);
-            const batchLimit = resObj.batch_limit || 15;
-            if (resObj.noop) {
+            const batchLimit = resObj.batch_limit ?? 0;
+            if (st.status === "cancelled" || resObj.cancelled) {
+              pushToast(
+                "info",
+                cCnt + rCnt > 0
+                  ? `「${vaultName}」已停止整理：已保存 ${cCnt + rCnt} 篇并更新索引${rem > 0 ? `，剩余 ${rem} 篇下次可继续` : ""}`
+                  : `「${vaultName}」已停止整理`,
+              );
+            } else if (resObj.noop) {
               pushToast("info", `「${vaultName}」所有文档都已整理完成，无需重复处理`);
-            } else if (rem > 0) {
+            } else if (rem > 0 && batchLimit > 0) {
               pushToast(
                 "success",
-                `「${vaultName}」本批已整理 ${cCnt + rCnt} 篇（单次上限 ${batchLimit} 篇），还剩 ${rem} 篇待整理，可继续点击整理或在顶部模型设置调大单次篇数`,
+                `「${vaultName}」本批已整理 ${cCnt + rCnt} 篇（单次上限 ${batchLimit} 篇），还剩 ${rem} 篇待整理，可在顶部模型设置切换为「全部跑完」`,
+              );
+            } else if (fUnits.length > 0) {
+              const firstErr = fUnits[0]?.error ? `（首个错误：${fUnits[0].error.slice(0, 80)}）` : "";
+              pushToast(
+                "info",
+                `「${vaultName}」整理完成：新增 ${cCnt} 篇、更新 ${rCnt} 篇，另有 ${fUnits.length} 篇失败${firstErr}`,
               );
             } else {
               pushToast(
                 "success",
-                `「${vaultName}」整理完成：新增 ${cCnt} 篇、更新 ${rCnt} 篇，搜索索引已更新`,
+                `「${vaultName}」已全部整理完成：新增 ${cCnt} 篇、更新 ${rCnt} 篇，搜索索引已更新`,
               );
             }
             void refresh();
@@ -316,7 +332,7 @@ const AppInner: React.FC = () => {
         });
         setUpdateModalOpen(true);
       } else {
-        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.0"})`);
+        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.1"})`);
       }
     } catch {
       pushToast("info", "暂未检测到线上新版本（请确认网络或已发布 GitHub Release）");

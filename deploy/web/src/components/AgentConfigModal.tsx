@@ -83,9 +83,9 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const [model, setModel] = useState(llmCompiler?.model || "deepseek-chat");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [autoSync, setAutoSync] = useState(llmCompiler?.auto_compile_on_sync ?? false);
-  const [maxItems, setMaxItems] = useState(llmCompiler?.max_items_per_run ?? 15);
+  const [maxItems, setMaxItems] = useState(llmCompiler?.max_items_per_run ?? 0);
   const [workers, setWorkers] = useState(llmCompiler?.workers ?? 4);
-  const [maxTokens, setMaxTokens] = useState(llmCompiler?.max_tokens ?? 1800);
+  const [maxTokens, setMaxTokens] = useState(llmCompiler?.max_tokens ?? 4096);
   const [disableThinking, setDisableThinking] = useState(llmCompiler?.disable_thinking ?? false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -100,9 +100,9 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setBaseUrl(llmCompiler.base_url || "https://api.deepseek.com/v1");
     setModel(llmCompiler.model || "deepseek-chat");
     setAutoSync(llmCompiler.auto_compile_on_sync ?? false);
-    setMaxItems(llmCompiler.max_items_per_run ?? 15);
+    setMaxItems(llmCompiler.max_items_per_run ?? 0);
     setWorkers(llmCompiler.workers ?? 4);
-    setMaxTokens(llmCompiler.max_tokens ?? 1800);
+    setMaxTokens(llmCompiler.max_tokens ?? 4096);
     setDisableThinking(llmCompiler.disable_thinking ?? llmCompiler.provider === "local");
     setApiKeyInput("");
     setTestResult(null);
@@ -398,20 +398,20 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
             <div className="grid grid-cols-1 gap-2.5 border-t border-[var(--border-subtle)] pt-2.5 sm:grid-cols-3">
               <div>
                 <label className="mb-1 block font-medium text-[var(--ink-secondary)]">
-                  单次最多整理篇数
+                  单次整理范围
                 </label>
                 <select
                   value={maxItems}
                   onChange={(e) => setMaxItems(Number(e.target.value))}
                   className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--ink-primary)]"
                 >
-                  <option value={5}>每次 5 篇</option>
-                  <option value={15}>每次 15 篇（推荐）</option>
-                  <option value={30}>每次 30 篇</option>
-                  <option value={60}>每次 60 篇</option>
-                  <option value={100}>每次 100 篇</option>
-                  <option value={300}>每次 300 篇</option>
-                  <option value={500}>每次 500 篇</option>
+                  <option value={0}>全部跑完（不限，推荐）</option>
+                  <option value={15}>每次最多 15 篇</option>
+                  <option value={30}>每次最多 30 篇</option>
+                  <option value={60}>每次最多 60 篇</option>
+                  <option value={100}>每次最多 100 篇</option>
+                  <option value={300}>每次最多 300 篇</option>
+                  <option value={500}>每次最多 500 篇</option>
                 </select>
               </div>
               <div>
@@ -439,10 +439,14 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                   onChange={(e) => setMaxTokens(Number(e.target.value))}
                   className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--ink-primary)]"
                 >
-                  <option value={1200}>1200 tokens（极简）</option>
-                  <option value={1800}>1800 tokens（推荐）</option>
+                  {![1800, 3000, 4096, 8192, 16384].includes(maxTokens) && (
+                    <option value={maxTokens}>{maxTokens} tokens（当前）</option>
+                  )}
+                  <option value={1800}>1800 tokens（极简）</option>
                   <option value={3000}>3000 tokens（详尽）</option>
-                  <option value={4096}>4096 tokens（长文）</option>
+                  <option value={4096}>4096 tokens（推荐）</option>
+                  <option value={8192}>8192 tokens（思考模型）</option>
+                  <option value={16384}>16384 tokens（超长推理）</option>
                 </select>
               </div>
             </div>

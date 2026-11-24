@@ -71,13 +71,14 @@ export interface CompileJobProgress {
   current: string;
   compiled_count: number;
   refreshed_count: number;
+  failed_count?: number;
 }
 
 export interface AsyncJobRecord {
   job_id: string;
   kind?: "sync" | "compile" | string;
   vault_id: string;
-  status: "running" | "done" | "failed" | "skipped";
+  status: "running" | "done" | "failed" | "skipped" | "cancelled";
   progress?: CompileJobProgress;
   result?: Record<string, unknown>;
   error?: string;

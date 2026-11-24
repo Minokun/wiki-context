@@ -137,7 +137,7 @@ export const api = {
   compileVaultAsync: (vault_id: string, max_items?: number) =>
     requestJson<AsyncJobRecord>("/api/vaults/compile", {
       vault_id,
-      ...(max_items ? { max_items } : {}),
+      ...(max_items !== undefined ? { max_items } : {}),
     }),
   getCompilePlan: (vault_id: string) =>
     requestJson<{
@@ -150,6 +150,8 @@ export const api = {
     }>(`/api/vaults/compile-plan?vault_id=${encodeURIComponent(vault_id)}`),
   getJob: (job_id: string) =>
     requestJson<AsyncJobRecord>(`/api/jobs/${encodeURIComponent(job_id)}`),
+  cancelJob: (job_id: string) =>
+    requestJson<AsyncJobRecord>(`/api/jobs/${encodeURIComponent(job_id)}/cancel`, {}),
 
   // Built-in AI Compiler Agent & LLM Credentials
   getLlmConfig: () => requestJson<LlmCompilerStatus>("/api/llm/config"),

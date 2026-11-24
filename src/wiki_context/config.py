@@ -68,7 +68,7 @@ class VaultConfig:
     compile_skip_csv: bool = False
     compile_project_rollup: bool = False
     compile_workers: int = 4
-    compile_max_tokens: int = 1800
+    compile_max_tokens: int = 4096
     compile_disable_thinking: bool = False
     ocr_image_dirs: frozenset[str] = field(default_factory=frozenset)
     anchor_terms: tuple[str, ...] = ()
@@ -128,7 +128,7 @@ class VaultConfig:
         compile_skip_csv = bool(raw_cfg.get("compile_skip_csv") is True)
         compile_project_rollup = bool(raw_cfg.get("compile_project_rollup") is True)
         compile_workers = max(1, min(16, int(raw_cfg.get("compile_workers") or 4)))
-        compile_max_tokens = max(256, min(8192, int(raw_cfg.get("compile_max_tokens") or 1800)))
+        compile_max_tokens = max(256, min(16384, int(raw_cfg.get("compile_max_tokens") or 4096)))
         compile_disable_thinking = bool(raw_cfg.get("compile_disable_thinking") is True)
 
         ocr_dirs_raw = raw_cfg.get("ocr_image_dirs") or ()

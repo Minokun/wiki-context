@@ -383,6 +383,7 @@ class ConsoleState:
         self._remote_probe_cache: dict[tuple[str, str], tuple[float, dict[str, Any] | None, str]] = {}
         self._jobs: dict[str, dict[str, Any]] = {}
         self._active_compile_jobs: dict[str, str] = {}
+        self._job_cancel_events: dict[str, threading.Event] = {}
         self._compile_finished_ts: dict[str, float] = {}
         self._compile_plan_cache: dict[str, tuple[tuple[str, int], dict[str, int]]] = {}
         self._job_lock = threading.Lock()
@@ -723,9 +724,17 @@ class ConsoleState:
         base_url = str(cfg.get("base_url") or preset["base_url"] or "https://api.deepseek.com/v1").strip().rstrip("/")
         model = str(cfg.get("model") or preset["model"] or "deepseek-chat").strip()
         auto_compile = bool(cfg.get("auto_compile_on_sync", False))
-        max_items = max(1, min(500, int(cfg.get("max_items_per_run") or 15)))
+        raw_max_items = cfg.get("max_items_per_run")
+        if raw_max_items is None:
+            max_items = 0
+        else:
+            parsed_max = int(raw_max_items)
+            if parsed_max == 15 and not cfg.get("max_items_explicit"):
+                max_items = 0
+            else:
+                max_items = max(0, min(10000, parsed_max))
         workers = max(1, min(16, int(cfg.get("workers") or 4)))
-        max_tokens = max(256, min(8192, int(cfg.get("max_tokens") or 1800)))
+        max_tokens = max(256, min(16384, int(cfg.get("max_tokens") or 4096)))
         disable_thinking = bool(cfg.get("disable_thinking", provider == "local"))
 
         env_key = (
@@ -787,9 +796,18 @@ class ConsoleState:
                 if "auto_compile_on_sync" in payload
                 else prev.get("auto_compile_on_sync", False)
             )
-            max_items = max(1, min(500, int(payload.get("max_items_per_run") or prev.get("max_items_per_run") or 15)))
+            if "max_items_per_run" in payload and payload.get("max_items_per_run") is not None:
+                max_items = max(0, min(10000, int(payload["max_items_per_run"])))
+                max_items_explicit = True
+            elif prev.get("max_items_per_run") is not None:
+                prev_max = int(prev["max_items_per_run"])
+                max_items_explicit = bool(prev.get("max_items_explicit"))
+                max_items = 0 if (prev_max == 15 and not max_items_explicit) else max(0, min(10000, prev_max))
+            else:
+                max_items = 0
+                max_items_explicit = False
             workers = max(1, min(16, int(payload.get("workers") or prev.get("workers") or 4)))
-            max_tokens = max(256, min(8192, int(payload.get("max_tokens") or prev.get("max_tokens") or 1800)))
+            max_tokens = max(256, min(16384, int(payload.get("max_tokens") or prev.get("max_tokens") or 4096)))
             disable_thinking = bool(
                 payload["disable_thinking"]
                 if "disable_thinking" in payload
@@ -803,6 +821,7 @@ class ConsoleState:
                 "model": model,
                 "auto_compile_on_sync": auto_compile,
                 "max_items_per_run": max_items,
+                "max_items_explicit": max_items_explicit,
                 "workers": workers,
                 "max_tokens": max_tokens,
                 "disable_thinking": disable_thinking,
@@ -1939,8 +1958,13 @@ class ConsoleState:
                 "result": {"compiled_pages": [], "refreshed_pages": [], "consolidated_notes": [], "noop": True},
             }
 
-        eff_max = max(1, min(500, int(max_items or rt["max_items_per_run"] or 15)))
+        if max_items is not None:
+            eff_max = max(0, min(10000, int(max_items)))
+        else:
+            eff_max = max(0, min(10000, int(rt["max_items_per_run"])))
         job_id = f"job_cmp_{secrets.token_hex(5)}"
+        cancel_ev = threading.Event()
+        init_total = pending_total if eff_max <= 0 else min(pending_total, eff_max + 1)
         job_rec: dict[str, Any] = {
             "job_id": job_id,
             "kind": "compile",
@@ -1952,12 +1976,13 @@ class ConsoleState:
             "progress": {
                 "phase": "planning",
                 "done": 0,
-                "total": min(pending_total, eff_max + 1),
+                "total": init_total,
                 "pending_total": pending_total,
                 "batch_limit": eff_max,
                 "current": "",
                 "compiled_count": 0,
                 "refreshed_count": 0,
+                "failed_count": 0,
             },
             "result": None,
             "error": "",
@@ -1968,8 +1993,10 @@ class ConsoleState:
                 for k in oldest:
                     if self._jobs[k]["status"] != "running":
                         self._jobs.pop(k, None)
+                        self._job_cancel_events.pop(k, None)
             self._jobs[job_id] = job_rec
             self._active_compile_jobs[vault_id] = job_id
+            self._job_cancel_events[job_id] = cancel_ev
 
         def _on_progress(prog: dict[str, Any]) -> None:
             with self._job_lock:
@@ -1988,16 +2015,18 @@ class ConsoleState:
                     max_tokens=rt["max_tokens"],
                     disable_thinking=rt["disable_thinking"],
                     on_progress=_on_progress,
+                    cancel_event=cancel_ev,
                 )
                 self._compile_finished_ts[vault_id] = time.monotonic()
                 self.gateway.upsert_vault(vault_id, vpath)
                 self._compile_plan_cache.pop(vault_id, None)
                 with self._job_lock:
-                    job_rec["status"] = "done"
+                    job_rec["status"] = "cancelled" if res.get("cancelled") else "done"
                     job_rec["result"] = res
                     job_rec["finished_at"] = _now_iso()
                     if self._active_compile_jobs.get(vault_id) == job_id:
                         self._active_compile_jobs.pop(vault_id, None)
+                    self._job_cancel_events.pop(job_id, None)
             except Exception as exc:
                 self._compile_finished_ts[vault_id] = time.monotonic()
                 with self._job_lock:
@@ -2006,6 +2035,7 @@ class ConsoleState:
                     job_rec["finished_at"] = _now_iso()
                     if self._active_compile_jobs.get(vault_id) == job_id:
                         self._active_compile_jobs.pop(vault_id, None)
+                    self._job_cancel_events.pop(job_id, None)
 
         threading.Thread(target=_worker, name=f"wctx-compile-{vault_id}", daemon=True).start()
         return dict(job_rec)
@@ -2077,6 +2107,19 @@ class ConsoleState:
             rec = self._jobs.get(job_id)
             if rec is None:
                 raise KeyError(f"Unknown job_id '{job_id}'")
+            return dict(rec)
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        with self._job_lock:
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                raise KeyError(f"Unknown job_id '{job_id}'")
+            ev = self._job_cancel_events.get(job_id)
+            if ev is not None and rec.get("status") == "running":
+                ev.set()
+                prog = rec.get("progress")
+                if isinstance(prog, dict):
+                    prog["phase"] = "cancelling"
             return dict(rec)
 
     def set_vault_watch(self, vault_id: str, *, enabled: bool) -> dict[str, Any]:
@@ -3415,6 +3458,11 @@ def create_console_server(
                     max_items = int(body["max_items"]) if body.get("max_items") is not None else None
                     job = state.start_compile_job(vid, max_items=max_items, trigger="manual")
                     self._send_json(202, job)
+                    return
+
+                if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                    jid = path[len("/api/jobs/"):-len("/cancel")].strip("/")
+                    self._send_json(200, state.cancel_job(jid))
                     return
 
                 if path == "/api/llm/config":

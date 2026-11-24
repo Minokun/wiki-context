@@ -19,6 +19,7 @@ import {
   RefreshCw,
   ShieldAlert,
   Sparkles,
+  Square,
   Trash2,
   Unlink,
   X,
@@ -69,6 +70,8 @@ function formatCompilePhase(phase?: string): string {
       return "正在更新变更内容";
     case "consolidating_notes":
       return "正在合并补充说明";
+    case "cancelling":
+      return "正在安全停止并保存已完成内容";
     case "rebuilding_index":
       return "正在更新搜索索引";
     default:
@@ -208,6 +211,8 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     };
   }, [activeVault?.id, activeVault?.generation_id, activePendingCount]);
 
+  const [cancellingJobId, setCancellingJobId] = useState("");
+
   const handleStartCompile = async (vid: string) => {
     if (!llmCompiler?.ready) {
       onOpenAgentConfig();
@@ -218,13 +223,26 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
       const job = await api.compileVaultAsync(vid);
       if (job.job_id && job.status === "running") {
         onTrackCompileJob(vid, job);
-        onToast("info", "已开始用 AI 整理新增文档，完成后会自动更新索引");
+        onToast("info", "已开始用 AI 整理全部待处理文档，完成后会自动更新索引");
       } else {
         onToast("info", "当前没有需要整理的新增或变更文档");
         onRefresh();
       }
     } catch (e) {
       onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleCancelCompile = async (jobId: string) => {
+    if (!jobId || cancellingJobId === jobId) return;
+    setCancellingJobId(jobId);
+    try {
+      await api.cancelJob(jobId);
+      onToast("info", "已请求停止整理，正在保存当前已完成页面并更新索引...");
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancellingJobId("");
     }
   };
 
@@ -742,21 +760,44 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                         ? ` (${activeCompileJob.progress.current})`
                         : ""}
                     </span>
-                    <span className="font-mono font-semibold text-[var(--ink-secondary)]">
-                      {activeCompileJob.progress?.done ?? 0} /{" "}
-                      {Math.max(1, activeCompileJob.progress?.total ?? 1)}
-                      {(activeCompileJob.progress?.pending_total ?? activePendingCount) >
-                        (activeCompileJob.progress?.total ?? 0) && (
-                        <span className="ml-2 font-sans font-normal text-[var(--ink-muted)]">
-                          本批上限{" "}
-                          {activeCompileJob.progress?.batch_limit ||
-                            llmCompiler?.max_items_per_run ||
-                            15}{" "}
-                          篇 · 共 {activeCompileJob.progress?.pending_total ?? activePendingCount}{" "}
-                          篇待整理
-                        </span>
-                      )}
-                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-semibold text-[var(--ink-secondary)]">
+                        {activeCompileJob.progress?.done ?? 0} /{" "}
+                        {Math.max(1, activeCompileJob.progress?.total ?? 1)}
+                        {(activeCompileJob.progress?.failed_count ?? 0) > 0 && (
+                          <span className="ml-2 font-sans font-normal text-rose-600 dark:text-rose-400">
+                            失败 {activeCompileJob.progress?.failed_count}
+                          </span>
+                        )}
+                        {(activeCompileJob.progress?.batch_limit ?? 0) > 0 &&
+                          (activeCompileJob.progress?.pending_total ?? activePendingCount) >
+                            (activeCompileJob.progress?.total ?? 0) && (
+                            <span className="ml-2 font-sans font-normal text-[var(--ink-muted)]">
+                              本批上限 {activeCompileJob.progress?.batch_limit} 篇 · 共{" "}
+                              {activeCompileJob.progress?.pending_total ?? activePendingCount} 篇待整理
+                            </span>
+                          )}
+                        {(activeCompileJob.progress?.batch_limit ?? 0) === 0 &&
+                          (activeCompileJob.progress?.pending_total ?? 0) >
+                            (activeCompileJob.progress?.total ?? 0) && (
+                            <span className="ml-2 font-sans font-normal text-[var(--ink-muted)]">
+                              已归并覆盖 {activeCompileJob.progress?.pending_total} 篇待整理文档
+                            </span>
+                          )}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={
+                          cancellingJobId === activeCompileJob.job_id ||
+                          activeCompileJob.progress?.phase === "cancelling"
+                        }
+                        onClick={() => void handleCancelCompile(activeCompileJob.job_id)}
+                        className="inline-flex items-center gap-1 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2 py-0.5 text-[11px] font-medium text-[var(--ink-secondary)] hover:border-rose-400 hover:text-rose-600 disabled:opacity-50 dark:hover:text-rose-400"
+                      >
+                        <Square className="h-2.5 w-2.5 fill-current" />
+                        {activeCompileJob.progress?.phase === "cancelling" ? "正在停止" : "停止"}
+                      </button>
+                    </div>
                   </div>
                   <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-muted)]">
                     <div
@@ -1646,9 +1687,10 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                   </button>
 
                   {activeCompileJob?.status !== "running" &&
-                    activePendingCount > (llmCompiler?.max_items_per_run || 15) && (
+                    (llmCompiler?.max_items_per_run ?? 0) > 0 &&
+                    activePendingCount > (llmCompiler?.max_items_per_run ?? 0) && (
                       <p className="text-[11px] leading-relaxed text-[var(--ink-muted)]">
-                        每次最多整理 {llmCompiler?.max_items_per_run || 15} 篇，可在顶部「整理模型设置」调大单次篇数
+                        当前限制每次最多整理 {llmCompiler?.max_items_per_run} 篇，可在顶部「整理模型设置」切换为「全部跑完」
                       </p>
                     )}
 
