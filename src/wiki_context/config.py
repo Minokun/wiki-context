@@ -48,6 +48,7 @@ class VaultConfig:
     max_doc_bytes: int = DEFAULT_MAX_DOC_BYTES
     sensitive: bool = False
     exclude_patterns: tuple[str, ...] = ()
+    compile_exclude_patterns: tuple[str, ...] = ()
     ocr_image_dirs: frozenset[str] = field(default_factory=frozenset)
     anchor_terms: tuple[str, ...] = ()
     acl_rules: dict[str, dict[str, list[str]]] = field(default_factory=dict)
@@ -92,6 +93,11 @@ class VaultConfig:
             str(x).strip() for x in excl_raw if isinstance(x, str) and str(x).strip()
         )
 
+        cmp_excl_raw = raw_cfg.get("compile_exclude_patterns") or ()
+        compile_exclude_patterns = tuple(
+            str(x).strip() for x in cmp_excl_raw if isinstance(x, str) and str(x).strip()
+        )
+
         ocr_dirs_raw = raw_cfg.get("ocr_image_dirs") or ()
         ocr_image_dirs = frozenset(
             str(x).strip().strip("/") for x in ocr_dirs_raw if isinstance(x, str) and str(x).strip()
@@ -118,6 +124,7 @@ class VaultConfig:
             max_doc_bytes=max_bytes,
             sensitive=sensitive,
             exclude_patterns=exclude_patterns,
+            compile_exclude_patterns=compile_exclude_patterns,
             ocr_image_dirs=ocr_image_dirs,
             anchor_terms=anchor_terms,
             acl_rules=acl_rules,

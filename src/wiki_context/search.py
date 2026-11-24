@@ -16,11 +16,14 @@ import heapq
 import json
 import math
 import os
+import queue
 import re
 import sqlite3
 import threading
 import zlib
 from collections import Counter, defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from .config import VaultConfig
@@ -537,6 +540,7 @@ class BM25Index:
     FILENAME_BOOST = 1.6
     COVERAGE_ALPHA = 1.6
     COVERAGE_IDF_RATIO = 0.45
+    MAX_READ_POOL_SIZE = 16
 
     def __init__(
         self,
@@ -554,9 +558,10 @@ class BM25Index:
         self.backend_name = "memory"
 
         self._sqlite_path: Path | None = None
-        self._tls = threading.local()
-        self._open_cons: list[tuple[int, sqlite3.Connection]] = []
+        self._con_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=self.MAX_READ_POOL_SIZE)
+        self._all_cons: set[sqlite3.Connection] = set()
         self._con_lock = threading.Lock()
+        self._closed = False
 
         # Memory backend fields
         self.units: list[dict] = []
@@ -579,39 +584,57 @@ class BM25Index:
     def _excluded(self, source: str) -> bool:
         return is_excluded_source(source, self.exclude_patterns)
 
-    @property
-    def _con(self) -> sqlite3.Connection | None:
-        if self._sqlite_path is None:
-            return None
-        con = getattr(self._tls, "con", None)
-        if con is None:
-            uri = f"{self._sqlite_path.resolve().as_uri()}?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True, check_same_thread=False)
-            self._tls.con = con
-            cur_tid = threading.get_ident()
-            alive_tids = {t.ident for t in threading.enumerate() if t.ident is not None}
-            stale_cons: list[sqlite3.Connection] = []
+    def _open_sqlite_con(self) -> sqlite3.Connection:
+        assert self._sqlite_path is not None
+        uri = f"{self._sqlite_path.resolve().as_uri()}?mode=ro&immutable=1"
+        return sqlite3.connect(uri, uri=True, check_same_thread=False)
+
+    @contextmanager
+    def _borrow_con(self) -> Iterator[sqlite3.Connection]:
+        if self._sqlite_path is None or self._closed:
+            raise IndexUnavailableError("SQLite index is closed or unavailable")
+        try:
+            con = self._con_pool.get_nowait()
+        except queue.Empty:
+            con = self._open_sqlite_con()
             with self._con_lock:
-                kept: list[tuple[int, sqlite3.Connection]] = []
-                for tid, old_c in self._open_cons:
-                    if tid not in alive_tids:
-                        stale_cons.append(old_c)
-                    else:
-                        kept.append((tid, old_c))
-                kept.append((cur_tid, con))
-                self._open_cons = kept
-            for sc in stale_cons:
+                if self._closed:
+                    try:
+                        con.close()
+                    except sqlite3.Error:
+                        pass
+                    raise IndexUnavailableError("SQLite index has been closed")
+                self._all_cons.add(con)
+        try:
+            yield con
+        finally:
+            should_close = False
+            with self._con_lock:
+                if self._closed:
+                    self._all_cons.discard(con)
+                    should_close = True
+                else:
+                    try:
+                        self._con_pool.put_nowait(con)
+                    except queue.Full:
+                        self._all_cons.discard(con)
+                        should_close = True
+            if should_close:
                 try:
-                    sc.close()
+                    con.close()
                 except sqlite3.Error:
                     pass
-        return con
 
     def close(self) -> None:
         with self._con_lock:
-            cons = [c for _, c in self._open_cons]
-            self._open_cons.clear()
-        self._tls = threading.local()
+            self._closed = True
+            cons = list(self._all_cons)
+            self._all_cons.clear()
+        while True:
+            try:
+                self._con_pool.get_nowait()
+            except queue.Empty:
+                break
         for c in cons:
             try:
                 c.close()
@@ -637,17 +660,16 @@ class BM25Index:
         db_file = gen_dir / "bm25.sqlite"
         if self._backend_pref in {"auto", "sqlite"} and db_file.is_file():
             self._sqlite_path = db_file
-            con = self._con
-            assert con is not None
             try:
-                check_index_compatibility(gen_dir, con)
+                with self._borrow_con() as con:
+                    check_index_compatibility(gen_dir, con)
+                    meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
+                    n_u = int(meta_map.get("n_units", "0"))
+                    w_meta = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
+                    n_w = int(w_meta.get("n_units", "0"))
             except IndexUnavailableError:
                 self.close()
                 raise
-            meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
-            n_u = int(meta_map.get("n_units", "0"))
-            w_meta = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
-            n_w = int(w_meta.get("n_units", "0"))
             if n_u <= 0 and n_w <= 0:
                 self.close()
                 raise IndexUnavailableError("Index is empty; run `wctx sync` or `wctx index` first")
@@ -863,131 +885,130 @@ class BM25Index:
         kind: str | None,
         max_per_source: int,
     ) -> list[dict]:
-        con = self._con
-        assert con is not None
-        meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
-        n_units = int(meta_map.get("n_units", "0"))
-        if n_units <= 0:
-            return []
-        n = int(meta_map.get("n_sources", "0")) or n_units
-        avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
+        with self._borrow_con() as con:
+            meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
+            n_units = int(meta_map.get("n_units", "0"))
+            if n_units <= 0:
+                return []
+            n = int(meta_map.get("n_sources", "0")) or n_units
+            avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
 
-        unique_q = list(q_counts)
-        ph = ",".join("?" for _ in unique_q)
-        rows = con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", unique_q).fetchall()
-        if not rows:
-            return []
+            unique_q = list(q_counts)
+            ph = ",".join("?" for _ in unique_q)
+            rows = con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", unique_q).fetchall()
+            if not rows:
+                return []
 
-        q_idf: dict[str, float] = {}
-        q_df: dict[str, int] = {}
-        for tok, df in rows:
-            if df > 0:
-                q_df[tok] = df
-                q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
-        if not q_idf:
-            return []
+            q_idf: dict[str, float] = {}
+            q_df: dict[str, int] = {}
+            for tok, df in rows:
+                if df > 0:
+                    q_df[tok] = df
+                    q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            if not q_idf:
+                return []
 
-        dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
-        probe_toks = list(dist_tokens) if dist_tokens else list(q_idf)
-        or_expr = " OR ".join(encode_fts_token(t) for t in probe_toks)
-        cand_set: set[int] = {
-            rid for (rid,) in con.execute(
-                "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 800",
-                (or_expr,),
-            )
-        }
-        if len(dist_groups) >= 2:
-            and_clauses = ["(" + " OR ".join(encode_fts_token(t) for t in g if t in q_idf) + ")" for g in dist_groups]
-            and_clauses = [c for c in and_clauses if c != "()"]
-            if len(and_clauses) >= 2:
-                and_expr = " AND ".join(and_clauses)
+            dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
+            probe_toks = list(dist_tokens) if dist_tokens else list(q_idf)
+            or_expr = " OR ".join(encode_fts_token(t) for t in probe_toks)
+            cand_set: set[int] = {
+                rid for (rid,) in con.execute(
+                    "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 800",
+                    (or_expr,),
+                )
+            }
+            if len(dist_groups) >= 2:
+                and_clauses = ["(" + " OR ".join(encode_fts_token(t) for t in g if t in q_idf) + ")" for g in dist_groups]
+                and_clauses = [c for c in and_clauses if c != "()"]
+                if len(and_clauses) >= 2:
+                    and_expr = " AND ".join(and_clauses)
+                    cand_set.update(
+                        rid for (rid,) in con.execute(
+                            "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 400",
+                            (and_expr,),
+                        )
+                    )
+            if not cand_set:
+                all_or = " OR ".join(encode_fts_token(t) for t in q_idf)
                 cand_set.update(
                     rid for (rid,) in con.execute(
-                        "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 400",
-                        (and_expr,),
+                        "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 500",
+                        (all_or,),
                     )
                 )
-        if not cand_set:
-            all_or = " OR ".join(encode_fts_token(t) for t in q_idf)
-            cand_set.update(
-                rid for (rid,) in con.execute(
-                    "SELECT rowid FROM fts_units WHERE fts_units MATCH ? ORDER BY bm25(fts_units, 3.0, 1.0) LIMIT 500",
-                    (all_or,),
-                )
-            )
-        if not cand_set:
-            return []
+            if not cand_set:
+                return []
 
-        c_ids = list(cand_set)
-        c_ph = ",".join("?" for _ in c_ids)
-        u_rows = con.execute(
-            f"SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z "
-            f"FROM units WHERE id IN ({c_ph})",
-            c_ids,
-        ).fetchall()
+            c_ids = list(cand_set)
+            c_ph = ",".join("?" for _ in c_ids)
+            u_rows = con.execute(
+                f"SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z "
+                f"FROM units WHERE id IN ({c_ph})",
+                c_ids,
+            ).fetchall()
 
-        scored_meta: list[tuple[int, float, dict]] = []
-        matched_map: dict[int, list[str]] = {}
-        for uid, ukind, source, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z in u_rows:
-            if kind and ukind != kind:
-                continue
-            if self._excluded(source):
-                continue
-            tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
-            body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
-            sc = 0.0
-            cov_toks: set[str] = set()
-            matched_toks: list[str] = []
-            norm_base = self.K1 * (1 - self.B + self.B * (dl or 1) / avg_len)
-            for tok, qw in q_counts.items():
-                tf = tf_map.get(tok)
-                if not tf:
+            scored_meta: list[tuple[int, float, dict]] = []
+            matched_map: dict[int, list[str]] = {}
+            for uid, ukind, source, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z in u_rows:
+                if kind and ukind != kind:
                     continue
-                idf = q_idf.get(tok)
-                if idf is None:
+                if self._excluded(source):
                     continue
-                sc += qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
-                matched_toks.append(tok)
-                if tok in dist_tokens and tok in body_set:
-                    cov_toks.add(tok)
-            if sc <= 0.0:
-                continue
-            if dist_groups and cov_toks:
-                hit_g = sum(1 for g in dist_groups if g & cov_toks)
-                if hit_g:
-                    sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
-            scored_meta.append((uid, sc, {
-                "kind": ukind,
-                "source": source,
-                "heading": heading,
-                "table_header": table_header or "",
-                "line_start": ls,
-                "line_end": le,
-                "page_num": pnum,
-                "mirror": mirror,
-            }))
-            matched_map[uid] = sorted(matched_toks)[:12]
+                tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
+                body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
+                sc = 0.0
+                cov_toks: set[str] = set()
+                matched_toks: list[str] = []
+                norm_base = self.K1 * (1 - self.B + self.B * (dl or 1) / avg_len)
+                for tok, qw in q_counts.items():
+                    tf = tf_map.get(tok)
+                    if not tf:
+                        continue
+                    idf = q_idf.get(tok)
+                    if idf is None:
+                        continue
+                    sc += qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
+                    matched_toks.append(tok)
+                    if tok in dist_tokens and tok in body_set:
+                        cov_toks.add(tok)
+                if sc <= 0.0:
+                    continue
+                if dist_groups and cov_toks:
+                    hit_g = sum(1 for g in dist_groups if g & cov_toks)
+                    if hit_g:
+                        sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
+                scored_meta.append((uid, sc, {
+                    "kind": ukind,
+                    "source": source,
+                    "heading": heading,
+                    "table_header": table_header or "",
+                    "line_start": ls,
+                    "line_end": le,
+                    "page_num": pnum,
+                    "mirror": mirror,
+                }))
+                matched_map[uid] = sorted(matched_toks)[:12]
 
-        scored_meta.sort(key=lambda x: x[1], reverse=True)
-        picked = _dedup_per_source(scored_meta, k=k, max_per_source=max_per_source)
-        if not picked:
-            return []
+            scored_meta.sort(key=lambda x: x[1], reverse=True)
+            picked = _dedup_per_source(scored_meta, k=k, max_per_source=max_per_source)
+            if not picked:
+                return []
 
-        win_ids = [uid for uid, _, _ in picked]
-        w_ph = ",".join("?" for _ in win_ids)
-        text_map = {
-            uid: zlib.decompress(tz).decode("utf-8")
-            for uid, tz in con.execute(f"SELECT id, text_z FROM units WHERE id IN ({w_ph})", win_ids)
-        }
-        out: list[dict] = []
-        for uid, sc, meta in picked:
-            u = dict(meta)
-            u["text"] = text_map.get(uid, "")
-            u["score"] = round(sc, 4)
-            u["matched"] = matched_map.get(uid, [])
-            u["_q_idf"] = q_idf
-            out.append(u)
-        return out
+            win_ids = [uid for uid, _, _ in picked]
+            w_ph = ",".join("?" for _ in win_ids)
+            text_map = {
+                uid: zlib.decompress(tz).decode("utf-8")
+                for uid, tz in con.execute(f"SELECT id, text_z FROM units WHERE id IN ({w_ph})", win_ids)
+            }
+            out: list[dict] = []
+            for uid, sc, meta in picked:
+                u = dict(meta)
+                u["text"] = text_map.get(uid, "")
+                u["score"] = round(sc, 4)
+                u["matched"] = matched_map.get(uid, [])
+                u["_q_idf"] = q_idf
+                out.append(u)
+            return out
 
     # -- Layer-3 Wiki Search ------------------------------------------------ #
 
@@ -1070,112 +1091,152 @@ class BM25Index:
     def _search_wiki_sqlite(
         self, q_counts: dict[str, float], groups: list[set[str]], *, k: int, max_per_source: int
     ) -> list[dict]:
-        con = self._con
-        assert con is not None
-        meta_map = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
-        n_units = int(meta_map.get("n_units", "0"))
-        if n_units <= 0:
-            return []
-        n = int(meta_map.get("n_sources", "0")) or n_units
-        avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
+        with self._borrow_con() as con:
+            meta_map = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
+            n_units = int(meta_map.get("n_units", "0"))
+            if n_units <= 0:
+                return []
+            n = int(meta_map.get("n_sources", "0")) or n_units
+            avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
 
-        unique_q = list(q_counts)
-        ph = ",".join("?" for _ in unique_q)
-        rows = con.execute(f"SELECT tok, df_sources FROM wiki_vocab WHERE tok IN ({ph})", unique_q).fetchall()
-        if not rows:
-            return []
+            unique_q = list(q_counts)
+            ph = ",".join("?" for _ in unique_q)
+            rows = con.execute(f"SELECT tok, df_sources FROM wiki_vocab WHERE tok IN ({ph})", unique_q).fetchall()
+            if not rows:
+                return []
 
-        q_idf: dict[str, float] = {}
-        q_df: dict[str, int] = {}
-        for tok, df in rows:
-            if df > 0:
-                q_df[tok] = df
-                q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
-        if not q_idf:
-            return []
+            q_idf: dict[str, float] = {}
+            q_df: dict[str, int] = {}
+            for tok, df in rows:
+                if df > 0:
+                    q_df[tok] = df
+                    q_idf[tok] = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            if not q_idf:
+                return []
 
-        dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
-        or_expr = " OR ".join(encode_fts_token(t) for t in q_idf)
-        cand_ids = [
-            rid for (rid,) in con.execute(
-                "SELECT rowid FROM fts_wiki WHERE fts_wiki MATCH ? ORDER BY bm25(fts_wiki) LIMIT 200",
-                (or_expr,),
-            )
+            dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
+            or_expr = " OR ".join(encode_fts_token(t) for t in q_idf)
+            cand_ids = [
+                rid for (rid,) in con.execute(
+                    "SELECT rowid FROM fts_wiki WHERE fts_wiki MATCH ? ORDER BY bm25(fts_wiki) LIMIT 200",
+                    (or_expr,),
+                )
+            ]
+            if not cand_ids:
+                return []
+
+            c_ph = ",".join("?" for _ in cand_ids)
+            w_rows = con.execute(
+                f"SELECT id, source, title, heading, table_header, line_start, line_end, freshness, sources_json, dl, tf_z "
+                f"FROM wiki_units WHERE id IN ({c_ph})",
+                cand_ids,
+            ).fetchall()
+
+            scored_meta: list[tuple[int, float, dict]] = []
+            matched_map: dict[int, list[str]] = {}
+            for uid, source, title, heading, table_header, ls, le, freshness, sources_json, dl, tf_z in w_rows:
+                srcs = json.loads(sources_json) if sources_json else []
+                if self._excluded(source) or any(self._excluded(s) for s in srcs if isinstance(s, str)):
+                    continue
+                tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
+                sc = 0.0
+                cov_toks: set[str] = set()
+                matched_toks: list[str] = []
+                norm_base = self.K1 * (1 - self.B + self.B * (dl or 1) / avg_len)
+                for tok, qw in q_counts.items():
+                    tf = tf_map.get(tok)
+                    if not tf:
+                        continue
+                    idf = q_idf.get(tok)
+                    if idf is None:
+                        continue
+                    sc += qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
+                    matched_toks.append(tok)
+                    if tok in dist_tokens:
+                        cov_toks.add(tok)
+                if sc <= 0.0:
+                    continue
+                if dist_groups and cov_toks:
+                    hit_g = sum(1 for g in dist_groups if g & cov_toks)
+                    if hit_g:
+                        sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
+                if freshness in {"stale", "missing"}:
+                    sc *= 0.5
+                if _is_wiki_footer_heading(heading or ""):
+                    sc *= 0.30
+                scored_meta.append((uid, sc, {
+                    "kind": "wiki",
+                    "source": source,
+                    "title": title,
+                    "heading": heading,
+                    "table_header": table_header or "",
+                    "line_start": ls,
+                    "line_end": le,
+                    "freshness": freshness,
+                    "sources": [s for s in srcs if isinstance(s, str)],
+                }))
+                matched_map[uid] = sorted(matched_toks)[:12]
+
+            scored_meta.sort(key=lambda x: x[1], reverse=True)
+            picked = _dedup_per_source(scored_meta, k=k, max_per_source=max_per_source)
+            if not picked:
+                return []
+            win_ids = [uid for uid, _, _ in picked]
+            w_ph = ",".join("?" for _ in win_ids)
+            text_map = {
+                uid: zlib.decompress(tz).decode("utf-8")
+                for uid, tz in con.execute(f"SELECT id, text_z FROM wiki_units WHERE id IN ({w_ph})", win_ids)
+            }
+            out: list[dict] = []
+            for uid, sc, meta in picked:
+                u = dict(meta)
+                u["text"] = text_map.get(uid, "")
+                u["score"] = round(sc, 4)
+                u["matched"] = matched_map.get(uid, [])
+                u["_q_idf"] = q_idf
+                out.append(u)
+            return out
+
+    def get_wiki_sources(self, wiki_source: str) -> list[str]:
+        """Return declared primary ``sources`` for a compiled Wiki page."""
+        if self.backend_name == "sqlite":
+            with self._borrow_con() as con:
+                row = con.execute(
+                    "SELECT sources_json FROM wiki_units WHERE source = ? LIMIT 1",
+                    (wiki_source,),
+                ).fetchone()
+            if row and row[0]:
+                try:
+                    raw = json.loads(row[0])
+                    if isinstance(raw, list):
+                        return [s for s in raw if isinstance(s, str)]
+                except ValueError:
+                    return []
+            return []
+        for wu in self.wiki_units:
+            if wu.get("source") == wiki_source:
+                return [s for s in (wu.get("sources") or ()) if isinstance(s, str)]
+        return []
+
+    def sample_units(self, limit: int = 60) -> list[dict]:
+        """Return up to ``limit`` primary units for automated smoke evaluation."""
+        lim = max(1, int(limit))
+        if self.backend_name != "sqlite":
+            return list(self.units[:lim])
+        with self._borrow_con() as con:
+            rows = con.execute(
+                "SELECT source, heading, table_header, text_z FROM units LIMIT ?",
+                (lim,),
+            ).fetchall()
+        return [
+            {
+                "source": src,
+                "heading": h,
+                "table_header": th,
+                "text": zlib.decompress(tz).decode("utf-8"),
+            }
+            for src, h, th, tz in rows
         ]
-        if not cand_ids:
-            return []
-
-        c_ph = ",".join("?" for _ in cand_ids)
-        w_rows = con.execute(
-            f"SELECT id, source, title, heading, table_header, line_start, line_end, freshness, sources_json, dl, tf_z "
-            f"FROM wiki_units WHERE id IN ({c_ph})",
-            cand_ids,
-        ).fetchall()
-
-        scored_meta: list[tuple[int, float, dict]] = []
-        matched_map: dict[int, list[str]] = {}
-        for uid, source, title, heading, table_header, ls, le, freshness, sources_json, dl, tf_z in w_rows:
-            srcs = json.loads(sources_json) if sources_json else []
-            if self._excluded(source) or any(self._excluded(s) for s in srcs if isinstance(s, str)):
-                continue
-            tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
-            sc = 0.0
-            cov_toks: set[str] = set()
-            matched_toks: list[str] = []
-            norm_base = self.K1 * (1 - self.B + self.B * (dl or 1) / avg_len)
-            for tok, qw in q_counts.items():
-                tf = tf_map.get(tok)
-                if not tf:
-                    continue
-                idf = q_idf.get(tok)
-                if idf is None:
-                    continue
-                sc += qw * idf * (tf * (self.K1 + 1)) / (tf + norm_base)
-                matched_toks.append(tok)
-                if tok in dist_tokens:
-                    cov_toks.add(tok)
-            if sc <= 0.0:
-                continue
-            if dist_groups and cov_toks:
-                hit_g = sum(1 for g in dist_groups if g & cov_toks)
-                if hit_g:
-                    sc *= 1 + self.COVERAGE_ALPHA * (hit_g / len(dist_groups))
-            if freshness in {"stale", "missing"}:
-                sc *= 0.5
-            if _is_wiki_footer_heading(heading or ""):
-                sc *= 0.30
-            scored_meta.append((uid, sc, {
-                "kind": "wiki",
-                "source": source,
-                "title": title,
-                "heading": heading,
-                "table_header": table_header or "",
-                "line_start": ls,
-                "line_end": le,
-                "freshness": freshness,
-                "sources": [s for s in srcs if isinstance(s, str)],
-            }))
-            matched_map[uid] = sorted(matched_toks)[:12]
-
-        scored_meta.sort(key=lambda x: x[1], reverse=True)
-        picked = _dedup_per_source(scored_meta, k=k, max_per_source=max_per_source)
-        if not picked:
-            return []
-        win_ids = [uid for uid, _, _ in picked]
-        w_ph = ",".join("?" for _ in win_ids)
-        text_map = {
-            uid: zlib.decompress(tz).decode("utf-8")
-            for uid, tz in con.execute(f"SELECT id, text_z FROM wiki_units WHERE id IN ({w_ph})", win_ids)
-        }
-        out: list[dict] = []
-        for uid, sc, meta in picked:
-            u = dict(meta)
-            u["text"] = text_map.get(uid, "")
-            u["score"] = round(sc, 4)
-            u["matched"] = matched_map.get(uid, [])
-            u["_q_idf"] = q_idf
-            out.append(u)
-        return out
 
     def score_source_units(
         self,
@@ -1189,24 +1250,23 @@ class BM25Index:
         if not source or not q_counts or self._excluded(source):
             return []
         if self.backend_name == "sqlite":
-            con = self._con
-            assert con is not None
-            meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
-            n = int(meta_map.get("n_sources", "0")) or 1
-            avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
-            unique_q = list(q_counts)
-            ph = ",".join("?" for _ in unique_q)
-            v_rows = con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", unique_q).fetchall()
-            q_idf = {t: math.log(1 + (n - df + 0.5) / (df + 0.5)) for t, df in v_rows if df > 0}
-            q_df = {t: df for t, df in v_rows if df > 0}
-            if not q_idf:
-                return []
-            dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
-            u_rows = con.execute(
-                "SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z, text_z "
-                "FROM units WHERE source = ?",
-                (source,),
-            ).fetchall()
+            with self._borrow_con() as con:
+                meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
+                n = int(meta_map.get("n_sources", "0")) or 1
+                avg_len = float(meta_map.get("avg_len", "1.0")) or 1.0
+                unique_q = list(q_counts)
+                ph = ",".join("?" for _ in unique_q)
+                v_rows = con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", unique_q).fetchall()
+                q_idf = {t: math.log(1 + (n - df + 0.5) / (df + 0.5)) for t, df in v_rows if df > 0}
+                q_df = {t: df for t, df in v_rows if df > 0}
+                if not q_idf:
+                    return []
+                dist_groups, dist_tokens = _compute_distinctive_groups(groups, q_idf, q_df, n, self.COVERAGE_IDF_RATIO)
+                u_rows = con.execute(
+                    "SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z, text_z "
+                    "FROM units WHERE source = ?",
+                    (source,),
+                ).fetchall()
             candidates: list[tuple[float, dict]] = []
             for uid, ukind, src, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z, text_z in u_rows:
                 tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))

@@ -221,7 +221,7 @@ fn fetch_daemon_bootstrap(port: u16) -> Option<BootstrapConfig> {
     let ver = boot
         .get("version")
         .and_then(|x| x.as_str())
-        .unwrap_or("0.4.0")
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
         .to_string();
 
     Some(BootstrapConfig {

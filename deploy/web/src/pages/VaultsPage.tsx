@@ -109,7 +109,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
   const [vaultIdInput, setVaultIdInput] = useState("");
   const [vaultNameInput, setVaultNameInput] = useState("");
   const [layoutInput, setLayoutInput] = useState("zh");
-  const [onboardAutoCompile, setOnboardAutoCompile] = useState(true);
+  const [onboardAutoCompile, setOnboardAutoCompile] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
 
   // Sync, Plan Preview, Lint & Rename state

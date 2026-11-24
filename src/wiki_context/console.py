@@ -82,7 +82,7 @@ from .state_lock import (
     write_daemon_info,
 )
 from .sync import sync_vault
-from .telemetry import TelemetryStore
+from .telemetry import TelemetryStore, is_telemetry_enabled
 from .ui_assets import render_console_html
 from .watcher import VaultWatcherManager
 
@@ -384,7 +384,11 @@ class ConsoleState:
         self.instance_id = str(init_data.get("instance_id") or "")
         self.fp = compute_host_fingerprint(self.instance_id, str(tok_data.get("host_secret") or ""))
         self.pairing = PairingManager()
-        self.telemetry = TelemetryStore(db_path=self.config_dir / "telemetry.sqlite", async_writer=True)
+        self.telemetry = TelemetryStore(
+            db_path=self.config_dir / "telemetry.sqlite",
+            async_writer=True,
+            enabled=is_telemetry_enabled(),
+        )
         self.token_registry = TokenRegistry(token_file=self.tokens_file)
 
         local_specs: list[tuple[str, str]] = []
@@ -696,7 +700,7 @@ class ConsoleState:
         protocol = str(cfg.get("protocol") or preset["protocol"] or "openai").strip().lower()
         base_url = str(cfg.get("base_url") or preset["base_url"] or "https://api.deepseek.com/v1").strip().rstrip("/")
         model = str(cfg.get("model") or preset["model"] or "deepseek-chat").strip()
-        auto_compile = bool(cfg.get("auto_compile_on_sync", True))
+        auto_compile = bool(cfg.get("auto_compile_on_sync", False))
         max_items = max(1, min(100, int(cfg.get("max_items_per_run") or 15)))
 
         env_key = (
@@ -750,7 +754,7 @@ class ConsoleState:
             auto_compile = bool(
                 payload["auto_compile_on_sync"]
                 if "auto_compile_on_sync" in payload
-                else prev.get("auto_compile_on_sync", True)
+                else prev.get("auto_compile_on_sync", False)
             )
             max_items = max(1, min(100, int(payload.get("max_items_per_run") or prev.get("max_items_per_run") or 15)))
 
@@ -1951,13 +1955,15 @@ class ConsoleState:
                 include_debug=True,
             )
 
+        omit_q = bool(svc.cfg.sensitive)
         self.telemetry.record({
             "client": "playground",
             "mode": "playground",
             "principal_uid": target_principal.uid,
             "vault_id": vault_id,
             "tool": "wiki_context",
-            "query": q,
+            "query": "" if omit_q else q,
+            "omit_query": omit_q,
             "route": str(target_out.get("route") or ""),
             "elapsed_ms": float(target_out.get("elapsed_ms") or 0.0),
             "wiki_count": int(target_out.get("wiki_count") or 0),

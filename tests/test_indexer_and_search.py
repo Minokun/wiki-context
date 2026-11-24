@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,49 @@ class TestIndexerAndSearch(unittest.TestCase):
         self.assertEqual(route("What is the default timeout?")["mode"], "fact")
         self.assertEqual(route("Compare architecture A versus B and list all trade-offs")["mode"], "complex")
         self.assertEqual(route("请大致讲解一下系统整体方案")["mode"], "complex")
+
+    def test_sqlite_read_pool_bounded_under_thread_reuse_and_concurrency(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = Path(td) / "pool-vault"
+            init_vault(v)
+            (v / "sources" / "net.md").write_text(
+                "# Network Timeout\n\nKeepalive idle timeout is 75 seconds under RFC-9110.\n",
+                encoding="utf-8",
+            )
+            sync_vault(v)
+
+            idx = BM25Index(v, backend="sqlite")
+            try:
+                # 40 sequential short-lived threads: pooled connection is reused instead of leaking per-ident handles
+                for _ in range(40):
+                    t = threading.Thread(target=lambda: idx.search("RFC-9110 keepalive", k=3))
+                    t.start()
+                    t.join()
+                self.assertEqual(len(idx._all_cons), 1)
+
+                # 24 concurrent threads: total created connections must remain bounded by MAX_READ_POOL_SIZE
+                barrier = threading.Barrier(24)
+                errs: list[BaseException] = []
+
+                def worker() -> None:
+                    try:
+                        barrier.wait(timeout=5.0)
+                        hits = idx.search("RFC-9110 keepalive", k=3)
+                        assert hits and hits[0]["source"] == "sources/net.md"
+                    except BaseException as exc:  # pragma: no cover
+                        errs.append(exc)
+
+                threads = [threading.Thread(target=worker) for _ in range(24)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                self.assertFalse(errs, errs)
+                self.assertGreaterEqual(len(idx._all_cons), 1)
+                self.assertLessEqual(len(idx._all_cons), BM25Index.MAX_READ_POOL_SIZE)
+            finally:
+                idx.close()
+            self.assertEqual(len(idx._all_cons), 0)
 
 
 if __name__ == "__main__":

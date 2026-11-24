@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DIST_NAME = "wiki_context"
-DEFAULT_REQUIRES_PYTHON = ">=3.14"
+DEFAULT_REQUIRES_PYTHON = ">=3.11"
 
 
 def _read_pyproject_meta() -> tuple[str, str]:
@@ -38,7 +38,7 @@ def _read_pyproject_meta() -> tuple[str, str]:
         m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
         if m:
             return m.group(1).strip(), DEFAULT_REQUIRES_PYTHON
-    return "0.4.0", DEFAULT_REQUIRES_PYTHON
+    return "0.4.1", DEFAULT_REQUIRES_PYTHON
 
 
 VERSION, REQUIRES_PYTHON = _read_pyproject_meta()

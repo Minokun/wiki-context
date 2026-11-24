@@ -26,6 +26,7 @@ NATIVE_OOXML_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
 LEGACY_OFFICE_EXTS = frozenset({".doc", ".ppt", ".xls"})
 PDF_EXTS = frozenset({".pdf"})
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
+OCR_CONVERTERS = frozenset({"vlm-caption", "cmd-ocr", "visual-asset"})
 AUDIO_VIDEO_EXTS = frozenset({".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm"})
 
 READABLE_EXTS = (
@@ -198,7 +199,7 @@ def mirror_skip_reason(
     if orig_ext in IMAGE_EXTS:
         ocr_dirs = cfg.ocr_image_dirs if cfg is not None else frozenset()
         conv = str((manifest_entry or {}).get("converter") or "").strip()
-        has_ocr_converter = bool(conv) and conv not in {"plain-text-copy", "unsupported", "ocr-required"}
+        has_ocr_converter = conv in OCR_CONVERTERS
         if not (explicit or has_ocr_converter or _in_ocr_image_dir(rel[:-3], ocr_dirs)):
             if manifest_entry is None:
                 pass

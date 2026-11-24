@@ -71,7 +71,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   );
   const [model, setModel] = useState(llmCompiler?.model || "deepseek-chat");
   const [apiKeyInput, setApiKeyInput] = useState("");
-  const [autoSync, setAutoSync] = useState(llmCompiler?.auto_compile_on_sync ?? true);
+  const [autoSync, setAutoSync] = useState(llmCompiler?.auto_compile_on_sync ?? false);
   const [maxItems, setMaxItems] = useState(llmCompiler?.max_items_per_run ?? 15);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -83,7 +83,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setProtocol(llmCompiler.protocol || "openai");
     setBaseUrl(llmCompiler.base_url || "https://api.deepseek.com/v1");
     setModel(llmCompiler.model || "deepseek-chat");
-    setAutoSync(llmCompiler.auto_compile_on_sync ?? true);
+    setAutoSync(llmCompiler.auto_compile_on_sync ?? false);
     setMaxItems(llmCompiler.max_items_per_run ?? 15);
     setApiKeyInput("");
     setTestResult(null);

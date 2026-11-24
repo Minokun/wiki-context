@@ -5,11 +5,11 @@ backend-path = ["."]
 
 [project]
 name = "wiki-context"
-version = "0.4.0"
+version = "0.4.1"
 description = "Deterministic Context Engine for AI Agents — Compiled Wiki + Table-Aware SQLite FTS5 + Zero-Hallucination MCP Gateway"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 authors = [
   { name = "wiki-context contributors" }
 ]
@@ -28,6 +28,9 @@ classifiers = [
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Programming Language :: Python :: 3.15",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",

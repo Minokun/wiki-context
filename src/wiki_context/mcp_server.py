@@ -40,105 +40,12 @@ from .search import (
 if TYPE_CHECKING:
     from .telemetry import TelemetryStore
 
+from .telemetry import apply_secret_scrub, is_telemetry_enabled
+
 MAX_READ_LINES = 400
 MAX_STDIN_BYTES = 4 * 1024 * 1024
 SNAPSHOT_DRAIN_SECONDS = 30.0
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-
-_SECRET_PATTERNS = (
-    (
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"),
-        "[REDACTED_PRIVATE_KEY]",
-    ),
-    (
-        re.compile(r"\bwctx1_[A-Za-z0-9_-]{12,}\b"),
-        "[REDACTED_PAIR_CODE]",
-    ),
-    (
-        re.compile(r"\bwctx_[A-Za-z0-9_-]{8,}\b"),
-        "[REDACTED_WCTX_TOKEN]",
-    ),
-    (
-        re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}\b"),
-        "[REDACTED_API_KEY]",
-    ),
-    (
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-        "[REDACTED_AWS_KEY]",
-    ),
-    (
-        re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+|bearer\s+)[A-Za-z0-9._\-]{16,}\b"),
-        r"\1[REDACTED_TOKEN]",
-    ),
-    (
-        re.compile(r"(?i)\b(cookie\s*:\s*)[^\r\n]{8,}"),
-        r"\1[REDACTED_COOKIE]",
-    ),
-    (
-        # Aliyun AccessKey ID
-        re.compile(r"\bLTAI[A-Za-z0-9]{12,30}\b"),
-        "[REDACTED_ACCESS_KEY_ID]",
-    ),
-    (
-        # Labeled credentials: `密码：xxx`, `AccessKey Secret: xxx`, `password=xxx`, `token: xxx` ...
-        re.compile(
-            r"(?i)((?:登录密码|密码|口令|私钥|助记词|password|passwd|pwd|passphrase|"
-            r"access\s*key\s*secret|secret\s*(?:access\s*)?key|client[_\s-]*secret|app[_\s-]*secret|"
-            r"api[_\s-]*key|auth[_\s-]*key|access[_\s-]*token|refresh[_\s-]*token|token)"
-            r"[\s*_`]*[:：=][\s*_`]*)([^\s|`*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Host credential pair: `1.2.3.4：ubuntu / p@ss`, `host.example.com: root/p@ss`
-        re.compile(
-            r"((?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\.[a-z]{2,})"
-            r"[\]\)]?[^\n|]{0,40}?[:：]\s*`?[A-Za-z_][\w.@-]{0,31}`?\s*/\s*)(?!\s)([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Chinese label separated only by whitespace: `密码 abcd1234`, `口令 p@ss`
-        re.compile(r"((?:登录密码|密码|口令)[ \t]+)([!-~]{4,})"),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Unlabeled but strongly password-shaped value after a colon: `sats量化： ^1234Qwer$`
-        re.compile(
-            r"([:：][ \t]*)"
-            r"(?=[^\s]*[A-Za-z])(?=[^\s]*\d)(?=[^\s]*[!@#$%^~])"
-            r"([^\s|`./:&=*+\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef()\[\]{}<>\"',;]{8,64})(?=\s|$)"
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Env-style labels: `API_V3_KEY: xxx`, `DB_PASSWORD=xxx`, `GITHUB_TOKEN=xxx`
-        re.compile(
-            r"(\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD)\b\s*[:：=]\s*)"
-            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})",
-            re.I,
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Whitespace host credential triple: `1.2.3.4 root p@ss`, `[1.2.3.4](http://…) ubuntu p@ss`
-        re.compile(
-            r"(\b(?:\d{1,3}\.){3}\d{1,3}\S*\s+(?:root|ubuntu|admin|administrator|user|pi|ec2-user|centos|debian|oracle)\s+)"
-            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-    (
-        # Account + password-shaped token: `13800000000 p@ss1234`, `[a@b.com](mailto:a@b.com) Pass1234`
-        re.compile(
-            r"((?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\)?)[ \t]+)"
-            r"(?![^\s]*@[\w-]+\.[A-Za-z])(?![A-Za-z][\w+.-]*://)"
-            r"(?=[^\s]*(?:[!@#$%^&*~+=?]|\d[^\s]*[A-Za-z]|[A-Za-z][^\s]*\d))"
-            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{6,})"
-        ),
-        r"\1[REDACTED_SECRET]",
-    ),
-)
 
 
 def scrub_secrets(text: str) -> str:
@@ -146,10 +53,7 @@ def scrub_secrets(text: str) -> str:
         return ""
     if os.environ.get("WCTX_SCRUB_SECRETS", "1").strip() in {"0", "false", "no"}:
         return text
-    out = text
-    for pat, repl in _SECRET_PATTERNS:
-        out = pat.sub(repl, out)
-    return out
+    return apply_secret_scrub(text)
 
 
 def make_snippet(
@@ -827,17 +731,7 @@ class KBService:
                     return {"error": f"Wiki page not found: {raw_src}"}
                 # Enforce Wiki ACL via indexed provenance
                 w_norm = f"{self.cfg.wiki_prefix}{w_rel}"
-                w_refs: list[str] = []
-                for wu in snap.index.wiki_units:
-                    if wu.get("source") == w_norm:
-                        w_refs = wu.get("sources") or []
-                        break
-                if snap.index.backend_name == "sqlite" and not w_refs:
-                    con = snap.index._con
-                    if con is not None:
-                        row = con.execute("SELECT sources_json FROM wiki_units WHERE source = ? LIMIT 1", (w_norm,)).fetchone()
-                        if row and row[0]:
-                            w_refs = json.loads(row[0])
+                w_refs = snap.index.get_wiki_sources(w_norm)
                 if not self.policy.can_access_wiki(user, w_norm, w_refs):
                     return {"error": f"Access denied (无权访问): {raw_src}"}
                 lines, total = self._read_lines_no_symlink(wpath, start, end, max_b)
@@ -1179,7 +1073,8 @@ class KBService:
     ) -> None:
         if self.telemetry is None:
             return
-        query_str = str(args.get("question") or args.get("query") or args.get("source") or args.get("filter") or "")
+        omit_q = bool(self.cfg.sensitive)
+        query_str = "" if omit_q else str(args.get("question") or args.get("query") or args.get("source") or args.get("filter") or "")
         hit_sources: list[str] = []
         if isinstance(out, dict):
             for h in (out.get("wiki_hits") or ()):
@@ -1200,6 +1095,7 @@ class KBService:
             "vault_id": self.telemetry_vault_id,
             "tool": tool,
             "query": query_str,
+            "omit_query": omit_q,
             "route": str(out.get("route") or "") if isinstance(out, dict) else "",
             "elapsed_ms": elapsed_ms,
             "wiki_count": int(out.get("wiki_count") or len(out.get("wiki_hits") or ())) if isinstance(out, dict) else 0,
@@ -1323,7 +1219,7 @@ def _write_stdout_json(obj: dict) -> None:
 
 def run_stdio_server(vault: Path | str) -> int:
     tel = None
-    if os.environ.get("WCTX_TELEMETRY", "1").strip().lower() not in {"0", "false", "no"}:
+    if is_telemetry_enabled():
         try:
             from .telemetry import TelemetryStore
             db_override = os.environ.get("WCTX_TELEMETRY_DB") or None

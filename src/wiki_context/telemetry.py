@@ -29,24 +29,121 @@ QUEUE_MAX_SIZE = 4096
 BATCH_FLUSH_SIZE = 32
 BATCH_FLUSH_INTERVAL_SEC = 0.10
 
-_TOKEN_SCRUB_PATTERNS = (
-    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"), "[REDACTED_PRIVATE_KEY]"),
-    (re.compile(r"\bwctx1_[A-Za-z0-9_-]{12,}\b"), "[REDACTED_PAIR_CODE]"),
-    (re.compile(r"\bwctx_[A-Za-z0-9_-]{8,}\b"), "[REDACTED_WCTX_TOKEN]"),
-    (re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}\b"), "[REDACTED_API_KEY]"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_KEY]"),
-    (re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+|bearer\s+)[A-Za-z0-9._\-]{12,}\b"), r"\1[REDACTED_TOKEN]"),
-    (re.compile(r"(?i)\b(cookie\s*:\s*)[^\r\n]{8,}"), r"\1[REDACTED_COOKIE]"),
+SECRET_PATTERNS = (
+    (
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"),
+        "[REDACTED_PRIVATE_KEY]",
+    ),
+    (
+        re.compile(r"\bwctx1_[A-Za-z0-9_-]{12,}\b"),
+        "[REDACTED_PAIR_CODE]",
+    ),
+    (
+        re.compile(r"\bwctx_[A-Za-z0-9_-]{8,}\b"),
+        "[REDACTED_WCTX_TOKEN]",
+    ),
+    (
+        re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}\b"),
+        "[REDACTED_API_KEY]",
+    ),
+    (
+        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+        "[REDACTED_AWS_KEY]",
+    ),
+    (
+        re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+|bearer\s+)[A-Za-z0-9._\-]{12,}\b"),
+        r"\1[REDACTED_TOKEN]",
+    ),
+    (
+        re.compile(r"(?i)\b(cookie\s*:\s*)[^\r\n]{8,}"),
+        r"\1[REDACTED_COOKIE]",
+    ),
+    (
+        # Aliyun AccessKey ID
+        re.compile(r"\bLTAI[A-Za-z0-9]{12,30}\b"),
+        "[REDACTED_ACCESS_KEY_ID]",
+    ),
+    (
+        # Labeled credentials: `密码：xxx`, `AccessKey Secret: xxx`, `password=xxx`, `token: xxx` ...
+        re.compile(
+            r"(?i)((?:登录密码|密码|口令|私钥|助记词|password|passwd|pwd|passphrase|"
+            r"access\s*key\s*secret|secret\s*(?:access\s*)?key|client[_\s-]*secret|app[_\s-]*secret|"
+            r"api[_\s-]*key|auth[_\s-]*key|access[_\s-]*token|refresh[_\s-]*token|token)"
+            r"[\s*_`]*[:：=][\s*_`]*)([^\s|`*\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Host credential pair: `1.2.3.4：ubuntu / p@ss`, `host.example.com: root/p@ss`
+        re.compile(
+            r"((?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\.[a-z]{2,})"
+            r"[\]\)]?[^\n|]{0,40}?[:：]\s*`?[A-Za-z_][\w.@-]{0,31}`?\s*/\s*)(?!\s)([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Chinese label separated only by whitespace: `密码 abcd1234`, `口令 p@ss`
+        re.compile(r"((?:登录密码|密码|口令)[ \t]+)([!-~]{4,})"),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Unlabeled but strongly password-shaped value after a colon: `sats量化： ^1234Qwer$`
+        re.compile(
+            r"([:：][ \t]*)"
+            r"(?=[^\s]*[A-Za-z])(?=[^\s]*\d)(?=[^\s]*[!@#$%^~])"
+            r"([^\s|`./:&=*+\\\u3000-\u303f\u4e00-\u9fff\uff00-\uffef()\[\]{}<>\"',;]{8,64})(?=\s|$)"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Env-style labels: `API_V3_KEY: xxx`, `DB_PASSWORD=xxx`, `GITHUB_TOKEN=xxx`
+        re.compile(
+            r"(\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD)\b\s*[:：=]\s*)"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})",
+            re.I,
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Whitespace host credential triple: `1.2.3.4 root p@ss`, `[1.2.3.4](http://…) ubuntu p@ss`
+        re.compile(
+            r"(\b(?:\d{1,3}\.){3}\d{1,3}\S*\s+(?:root|ubuntu|admin|administrator|user|pi|ec2-user|centos|debian|oracle)\s+)"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{4,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
+    (
+        # Account + password-shaped token: `13800000000 p@ss1234`, `[a@b.com](mailto:a@b.com) Pass1234`
+        re.compile(
+            r"((?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\)?)[ \t]+)"
+            r"(?![^\s]*@[\w-]+\.[A-Za-z])(?![A-Za-z][\w+.-]*://)"
+            r"(?=[^\s]*(?:[!@#$%^&*~+=?]|\d[^\s]*[A-Za-z]|[A-Za-z][^\s]*\d))"
+            r"([^\s|`\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]{6,})"
+        ),
+        r"\1[REDACTED_SECRET]",
+    ),
 )
 
 
-def scrub_telemetry_text(text: str) -> str:
+def apply_secret_scrub(text: str) -> str:
     if not text:
         return ""
     out = str(text)
-    for pat, repl in _TOKEN_SCRUB_PATTERNS:
+    for pat, repl in SECRET_PATTERNS:
         out = pat.sub(repl, out)
     return out
+
+
+def scrub_telemetry_text(text: str) -> str:
+    return apply_secret_scrub(text)
+
+
+def is_telemetry_enabled() -> bool:
+    return os.environ.get("WCTX_TELEMETRY", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def is_telemetry_query_logging_enabled() -> bool:
+    return os.environ.get("WCTX_TELEMETRY_LOG_QUERIES", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def default_telemetry_db_path(config_dir: Path | str | None = None) -> Path:
@@ -125,7 +222,14 @@ INSERT INTO mcp_invocations (
 class TelemetryStore:
     """SQLite WAL invocation telemetry store supporting async single-writer queue or direct append."""
 
-    def __init__(self, db_path: Path | str | None = None, *, async_writer: bool = False):
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        async_writer: bool = False,
+        enabled: bool = True,
+    ):
+        self.enabled = bool(enabled)
         self.db_path = Path(db_path).expanduser().resolve() if db_path else default_telemetry_db_path()
         self.async_writer = async_writer
         self._closed = False
@@ -134,6 +238,9 @@ class TelemetryStore:
         self._direct_con: sqlite3.Connection | None = None
         self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._writer_thread: threading.Thread | None = None
+
+        if not self.enabled:
+            return
 
         # Ensure schema exists upfront
         init_con = _open_wal_connection(self.db_path)
@@ -156,7 +263,10 @@ class TelemetryStore:
         principal_uid = str(event.get("principal_uid") or "local")[:64]
         vault_id = str(event.get("vault_id") or "")[:64]
         tool = str(event.get("tool") or "wiki_context")[:48]
-        query_redacted = scrub_telemetry_text(str(event.get("query") or ""))[:400]
+        if event.get("omit_query") or not is_telemetry_query_logging_enabled():
+            query_redacted = ""
+        else:
+            query_redacted = scrub_telemetry_text(str(event.get("query") or ""))[:400]
         route = str(event.get("route") or "")[:24]
         elapsed_ms = round(float(event.get("elapsed_ms") or 0.0), 2)
         wiki_count = int(event.get("wiki_count") or 0)
@@ -189,7 +299,7 @@ class TelemetryStore:
         )
 
     def record(self, event: dict[str, Any]) -> None:
-        if self._closed:
+        if not self.enabled or self._closed:
             return
         try:
             row = self._build_row(event)
@@ -296,7 +406,7 @@ class TelemetryStore:
                     pass
 
     def flush(self, timeout: float = 1.5) -> None:
-        if not self.async_writer or self._closed:
+        if not self.enabled or not self.async_writer or self._closed:
             return
         ev = threading.Event()
         self._queue.put(ev)
@@ -306,6 +416,8 @@ class TelemetryStore:
         if self._closed:
             return
         self._closed = True
+        if not self.enabled:
+            return
         if self.async_writer and self._writer_thread is not None:
             self._queue.put(None)
             self._writer_thread.join(timeout=1.5)
@@ -367,6 +479,8 @@ class TelemetryStore:
         min_elapsed_ms: float = 0.0,
         query: str = "",
     ) -> dict[str, Any]:
+        if not self.enabled:
+            return {"items": [], "latest_id": 0, "next_before_id": None}
         lim = max(1, min(int(limit), 500))
         clauses = ["1=1"]
         params: list[Any] = []
@@ -412,6 +526,8 @@ class TelemetryStore:
         return {"items": rows, "latest_id": latest_id, "next_before_id": next_cursor}
 
     def tail_after(self, after_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
         con = self._open_ro()
         try:
             rows = con.execute(
@@ -426,6 +542,8 @@ class TelemetryStore:
             con.close()
 
     def latest_id(self) -> int:
+        if not self.enabled:
+            return 0
         con = self._open_ro()
         try:
             row = con.execute("SELECT COALESCE(MAX(id), 0) FROM mcp_invocations").fetchone()
@@ -436,16 +554,19 @@ class TelemetryStore:
     def stats(self, *, hours: int = 24) -> dict[str, Any]:
         hrs = max(1, min(int(hours), 24 * 30))
         since = time.time() - hrs * 3600.0
-        con = self._open_ro()
-        try:
-            rows = con.execute(
-                "SELECT ts_epoch, client, mode, vault_id, tool, elapsed_ms, wiki_count, primary_count, "
-                "acl_filtered_count, missing_concepts_json, is_error "
-                "FROM mcp_invocations WHERE ts_epoch >= ? ORDER BY id DESC",
-                (since,),
-            ).fetchall()
-        finally:
-            con.close()
+        if not self.enabled:
+            rows = []
+        else:
+            con = self._open_ro()
+            try:
+                rows = con.execute(
+                    "SELECT ts_epoch, client, mode, vault_id, tool, elapsed_ms, wiki_count, primary_count, "
+                    "acl_filtered_count, missing_concepts_json, is_error "
+                    "FROM mcp_invocations WHERE ts_epoch >= ? ORDER BY id DESC",
+                    (since,),
+                ).fetchall()
+            finally:
+                con.close()
 
         total = len(rows)
         errors = 0
@@ -546,6 +667,8 @@ class TelemetryStore:
         }
 
     def clear(self) -> int:
+        if not self.enabled:
+            return 0
         with self._write_lock:
             con = sqlite3.connect(str(self.db_path), timeout=3.0, check_same_thread=False)
             try:

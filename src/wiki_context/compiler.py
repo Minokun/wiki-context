@@ -34,7 +34,8 @@ from .freshness import (
 from .indexer import rebuild_index
 from .lint import lint_vault
 from .memory import MemoryStore
-from .policy import mirror_skip_reason
+from .policy import IMAGE_EXTS, mirror_skip_reason
+from .search import is_excluded_source
 
 LLMCallable = Callable[[str, str], str]
 
@@ -218,16 +219,92 @@ def _strip_outer_markdown_fence(text: str) -> str:
     return s
 
 
-def plan_compilation(vault: Path | str) -> dict:
+_OPERATIONAL_DIR_KEYWORDS = ("发票", "报销", "invoice", "receipt")
+_OPERATIONAL_FILE_PREFIXES = ("dzfp_", "inv20")
+_BODY_SOURCES_HEADING_RE = re.compile(r"^##\s+(?:来源|sources)\s*$", re.IGNORECASE)
+
+
+def _extract_body_source_refs(body: str, cfg: VaultConfig) -> list[str]:
+    """Extract primary source references listed under ``## 来源`` or ``## Sources``."""
+    refs: list[str] = []
+    in_sources_section = False
+    for raw_line in body.splitlines():
+        stripped = raw_line.strip()
+        if not in_sources_section:
+            if _BODY_SOURCES_HEADING_RE.match(stripped):
+                in_sources_section = True
+            continue
+        if stripped.startswith("## ") or stripped.startswith("# "):
+            break
+        if not stripped:
+            continue
+        if stripped.startswith(("- ", "* ")):
+            item = stripped[2:].strip().strip("`").strip()
+            clean = clean_source_ref(item)
+            if cfg.is_source_ref(clean):
+                refs.append(clean)
+    return refs
+
+
+def _compile_skip_reason(
+    src_rel: str,
+    cfg: VaultConfig,
+    *,
+    include_images: bool = False,
+) -> str | None:
+    """Return a skip reason when an indexed mirror should not auto-compile into a standalone Wiki page."""
+    rel = src_rel.replace("\\", "/").lstrip("/")
+    p = PurePosixPath(rel)
+    src_ref = f"{cfg.source_prefix}{rel}"
+    if not include_images and p.suffix.lower() in IMAGE_EXTS:
+        return "image-mirror-excluded-from-compile"
+    if cfg.exclude_patterns and is_excluded_source(src_ref, cfg.exclude_patterns):
+        return "vault-exclude-pattern"
+    if cfg.compile_exclude_patterns and is_excluded_source(src_ref, cfg.compile_exclude_patterns):
+        return "compile-exclude-pattern"
+    for part in p.parts[:-1]:
+        low_part = part.lower()
+        if any(kw in low_part for kw in _OPERATIONAL_DIR_KEYWORDS) or part.startswith("DetectionRecognitionDemo"):
+            return "non-knowledge-operational-doc"
+    if p.name.lower().startswith(_OPERATIONAL_FILE_PREFIXES):
+        return "non-knowledge-operational-doc"
+    return None
+
+
+def _enforce_draft_status(md: str) -> str:
+    """Prevent machine-compiled pages from self-marking ``status: reviewed``."""
+    fm, body = split_frontmatter(md)
+    if not fm:
+        return md
+    changed = False
+    out_lines: list[str] = []
+    for line in fm.splitlines(keepends=True):
+        m = re.match(
+            r'^(\s*(?:status|状态)\s*:\s*)(["\']?)reviewed\2(\s*(?:#.*)?)$',
+            line.rstrip("\r\n"),
+            re.IGNORECASE,
+        )
+        if m:
+            nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+            out_lines.append(f"{m.group(1)}{m.group(2)}draft{m.group(2)}{m.group(3)}{nl}")
+            changed = True
+        else:
+            out_lines.append(line)
+    if not changed:
+        return md
+    return "---\n" + "".join(out_lines) + "---\n" + body
+
+
+def plan_compilation(vault: Path | str, *, include_images: bool = False) -> dict:
     """Inspect vault and return ``uncompiled_sources`` + ``stale_wiki_pages`` without calling an LLM."""
     cfg = VaultConfig.load(vault)
     covered_sources: set[str] = set()
     if cfg.wiki_root.is_dir():
         for wp in sorted(cfg.wiki_root.glob("*.md")):
             raw = wp.read_text(encoding="utf-8", errors="replace")
-            fm, _ = split_frontmatter(raw)
+            fm, body = split_frontmatter(raw)
             meta = parse_wiki_frontmatter(fm)
-            for s in meta["sources"]:
+            for s in [*meta["sources"], *_extract_body_source_refs(body, cfg)]:
                 clean = clean_source_ref(s)
                 if cfg.is_source_ref(clean):
                     covered_sources.add(cfg.normalize_source_ref(clean))
@@ -247,6 +324,8 @@ def plan_compilation(vault: Path | str) -> dict:
         m_rel = str(entry.get("mirror") or f"{src_rel}.md").lstrip("/")
         m_path = cfg.mirrors_root / m_rel
         if not m_path.is_file() or mirror_skip_reason(m_path, m_rel, cfg=cfg, manifest_entry=entry) is not None:
+            continue
+        if _compile_skip_reason(src_rel, cfg, include_images=include_images) is not None:
             continue
         src_ref = f"{cfg.source_prefix}{src_rel.lstrip('/')}"
         if src_ref not in covered_sources:
@@ -276,11 +355,12 @@ def compile_vault(
     protocol: str = "openai",
     max_items: int = 10,
     dry_run: bool = False,
+    include_images: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """Compile unindexed primary mirrors and refresh stale Wiki pages."""
     cfg = VaultConfig.load(vault)
-    plan = plan_compilation(cfg.root)
+    plan = plan_compilation(cfg.root, include_images=include_images)
     if dry_run:
         return {
             "vault": cfg.name,
@@ -367,7 +447,7 @@ def compile_vault(
             usr_prompt = (
                 f"请将以下一手史料编译为一篇结构化 Wiki 页面（标题建议：{stem_title}）。\n"
                 f"必须使用如下 YAML frontmatter 开头：\n"
-                f"---\ntitle: \"{stem_title}\"\ntype: source\nstatus: reviewed\nupdated: {today}\n"
+                f"---\ntitle: \"{stem_title}\"\ntype: source\nstatus: draft\nupdated: {today}\n"
                 f"sources:\n  - {src_ref}\n---\n\n"
                 f"正文包含：`# {stem_title}`、`## 概览`、`## 关键信息`、`## 待核验与口径提示`、"
                 f"`## 关联页面`（至少包含 {overview_link}）、`## 来源`（列出 `- {src_ref}`）。\n\n"
@@ -377,7 +457,7 @@ def compile_vault(
             usr_prompt = (
                 f"Compile the following primary source into a structured Wiki page titled '{stem_title}'.\n"
                 f"Start with exact YAML frontmatter:\n"
-                f"---\ntitle: \"{stem_title}\"\ntype: source\nstatus: reviewed\nupdated: {today}\n"
+                f"---\ntitle: \"{stem_title}\"\ntype: source\nstatus: draft\nupdated: {today}\n"
                 f"sources:\n  - {src_ref}\n---\n\n"
                 f"Include `# {stem_title}`, `## Overview`, `## Key Facts`, `## Caveats`, "
                 f"`## Related Pages` (include at least {overview_link}), and `## Sources` (`- {src_ref}`).\n\n"
@@ -387,9 +467,10 @@ def compile_vault(
         generated = _strip_outer_markdown_fence(caller(sys_prompt, usr_prompt))
         if not generated.startswith("---"):
             generated = (
-                f'---\ntitle: "{stem_title}"\ntype: source\nstatus: reviewed\nupdated: {today}\n'
+                f'---\ntitle: "{stem_title}"\ntype: source\nstatus: draft\nupdated: {today}\n'
                 f"sources:\n  - {src_ref}\n---\n\n{generated}\n"
             )
+        generated = _enforce_draft_status(generated)
         if overview_link not in generated:
             generated = generated.rstrip() + f"\n\n## {'关联页面' if is_zh else 'Related Pages'}\n\n{overview_link}\n"
 
@@ -456,7 +537,7 @@ def compile_vault(
         note_prompt = (
             f"Consolidate the following verified operational field notes and errata into a clean Wiki synthesis page "
             f"titled `{notes_title}`.\n"
-            f"Start with YAML frontmatter:\n---\ntitle: \"{notes_title}\"\ntype: synthesis\nstatus: reviewed\n"
+            f"Start with YAML frontmatter:\n---\ntitle: \"{notes_title}\"\ntype: synthesis\nstatus: draft\n"
             f"updated: {today}\nsources:{srcs_yaml}\n---\n\n"
             f"Include `{overview_link}` under Related Pages.\n\n"
             + (f"=== Previous Page ===\n{existing_notes_wiki[:4000]}\n\n" if existing_notes_wiki else "")
@@ -466,9 +547,10 @@ def compile_vault(
         gen_notes_md = _strip_outer_markdown_fence(caller(sys_prompt, note_prompt))
         if not gen_notes_md.startswith("---"):
             gen_notes_md = (
-                f'---\ntitle: "{notes_title}"\ntype: synthesis\nstatus: reviewed\nupdated: {today}\n'
+                f'---\ntitle: "{notes_title}"\ntype: synthesis\nstatus: draft\nupdated: {today}\n'
                 f"sources:{srcs_yaml}\n---\n\n{gen_notes_md}\n"
             )
+        gen_notes_md = _enforce_draft_status(gen_notes_md)
         if overview_link not in gen_notes_md:
             gen_notes_md = gen_notes_md.rstrip() + f"\n\n## {'关联页面' if is_zh else 'Related Pages'}\n\n{overview_link}\n"
         was_existing = notes_wp.is_file()

@@ -387,7 +387,7 @@ def run_doctor(
     installed_clients = [c for c in clients if c.get("installed")]
     configured_clients = [c for c in installed_clients if c.get("configured_servers")]
 
-    min_py = (3, 14)
+    min_py = (3, 11)
     min_py_str = f"{min_py[0]}.{min_py[1]}"
     py_ok = sys.version_info >= min_py
     poppler_hint = _poppler_install_hint()

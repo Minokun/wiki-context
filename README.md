@@ -5,7 +5,7 @@
 English | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB.svg)](pyproject.toml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero-brightgreen.svg)](pyproject.toml)
 [![Protocol: MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)](docs/gateway-and-acl.md)
 
@@ -78,7 +78,7 @@ The "LLM Wiki" pattern replaces vector DBs with LLM-maintained Markdown synthesi
 | **Unanswerable Query Defense** | High hallucination risk (feeds nearest chunks) | Depends on agent stopping on time | **Explicit `⚠️ Missing-Concept Alert`** + unmirrored boundary notes |
 | **Online Latency & Token Cost** | 1–5 s + Embedding/Rerank API calls | 15–40 s (3–6 tool calls, ~30k–40k tokens) | **1 tool call, ~2–35 ms, 2.6k–4.8k tokens, 0 LLM calls** |
 | **Access Control (RBAC)** | Chunk metadata filter (often leaky) | File-level OS permissions only | **Hot-reloaded `PrefixACLPolicy` + 100% Wiki provenance inheritance** |
-| **Runtime Footprint** | Heavy (Milvus/Qdrant + Docker + SDKs) | Plain folder | **Zero dependencies** (Python 3.14+ stdlib + immutable SQLite FTS5) |
+| **Runtime Footprint** | Heavy (Milvus/Qdrant + Docker + SDKs) | Plain folder | **Zero dependencies** (Python 3.11+ stdlib + immutable SQLite FTS5) |
 
 ---
 
@@ -127,7 +127,7 @@ Query: *"What is the Kafka partition retention period for billing events?"* (whe
 
 ## Key Engineering Highlights
 
-- **Zero Runtime & Build-Time Dependencies**: Pure Python 3.14+ standard library — including a self-contained PEP 517/660 wheel backend, native XML/ZIP extractors for `.docx`, `.pptx`, `.xlsx`, `.csv`/`.tsv`, `.md`/`.txt`, `pdftotext` integration for `.pdf`, and a pluggable `WCTX_OCR_CMD` hook for scanned pages.
+- **Zero Runtime & Build-Time Dependencies**: Pure Python 3.11+ standard library — including a self-contained PEP 517/660 wheel backend, native XML/ZIP extractors for `.docx`, `.pptx`, `.xlsx`, `.csv`/`.tsv`, `.md`/`.txt`, `pdftotext` integration for `.pdf`, and a pluggable `WCTX_OCR_CMD` hook for scanned pages.
 - **Native English & Chinese Vault Layouts**:
   - English (`--layout en`): `sources/`, `mirrors/`, `wiki/`, `index.md`, `log.md`
   - Chinese Obsidian (`--layout zh`): `史料/`, `史料_md/`, `知识库/`, `目录.md`, `日志.md` (auto-detected with zero config on existing Obsidian LLM Wiki vaults).
@@ -157,7 +157,7 @@ wctx doctor
 
 > **Let an AI Agent Install It for You**: Already using Claude Code, Cursor, or Codex CLI? Paste this prompt into your agent:
 > ```text
-> Clone and install wiki-context from https://github.com/Minokun/wiki-context.git (using pipx or a Python >= 3.14 environment), run wctx doctor to verify the setup, and launch wctx ui for me.
+> Clone and install wiki-context from https://github.com/Minokun/wiki-context.git (using pipx or a Python >= 3.11 environment), run wctx doctor to verify the setup, and launch wctx ui for me.
 > ```
 
 *(Zero third-party Python packages are downloaded or installed. Optional: install `poppler` (`brew install poppler` / `sudo apt install poppler-utils`) if you need native `pdftotext` PDF extraction and `pdftoppm` visual page rendering.)*
@@ -214,7 +214,7 @@ Pick the setup that matches your role — you do not need to deploy everything:
 | :--- | :--- | :--- | :--- |
 | **1. Personal Local Use** | **Desktop App** or **`wctx ui` (Web Console)** | Desktop App (or `wctx` CLI) locally | Drop folders in, auto-build indexes, auto-scan & connect 19 mainstream AI clients |
 | **2. Personal Multi-Device / LAN** | Desktop App / `wctx ui` LAN sharing | Desktop App or `wctx` on both machines | 5-minute single-use pairing code — zero manual IP or token copy-paste |
-| **3. Team Server (Admin)** | **`wctx gateway`** + **`wctx service install`** | Python 3.14+, `wctx` (optional `poppler`) on server | Multi-vault hosting, SHA-256 Bearer auth, folder ACLs; open `wctx ui` via SSH tunnel if needed |
+| **3. Team Server (Admin)** | **`wctx gateway`** + **`wctx service install`** | Python 3.11+, `wctx` (optional `poppler`) on server | Multi-vault hosting, SHA-256 Bearer auth, folder ACLs; open `wctx ui` via SSH tunnel if needed |
 | **4. Pure-MCP Client (HTTP MCP)** | **Direct Streamable HTTP MCP** | **Zero install** (no Python, no `wctx`, no app) | Just put the server URL + Bearer token `wctx_...` into Claude Code / Cursor / VS Code / WorkBuddy |
 | **5. Pure-MCP Client (stdio-only / Auto-Sync)** | **`wctx remote add`** or **`wctx bridge`** | `wctx` CLI (or Desktop App) locally | Auto-discover & configure all local AI clients, or bridge stdio-only clients over HTTPS |
 
@@ -265,9 +265,9 @@ Host shared team vaults on a Linux or macOS server with centralized indexing, Be
 # Optional system PDF extractor (recommended if your vaults contain PDFs)
 sudo apt-get update && sudo apt-get install -y poppler-utils
 
-# Install wiki-context (requires Python >= 3.14, zero third-party Python dependencies)
+# Install wiki-context (requires Python >= 3.11, zero third-party Python dependencies)
 pipx install git+https://github.com/Minokun/wiki-context.git
-# Or from local checkout / wheel: python3.14 -m pip install .
+# Or from local checkout / wheel: python3 -m pip install .
 
 wctx doctor
 ```
@@ -301,7 +301,7 @@ Manage tokens and folder rules in `/etc/wiki-context/tokens.json` (or `~/.wiki-c
   Open `http://127.0.0.1:8765` in your local browser to onboard vaults, configure folder ACLs, and issue tokens (or place Nginx HTTPS + HTTP Basic Auth / SSO in front of `127.0.0.1:8765`).
 - **Option B (CLI: Generate SHA-256 token entries manually)**:
   ```bash
-  python3.14 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("Give to teammate:", t); print("Store token_sha256:", hashlib.sha256(t.encode()).hexdigest())'
+  python3 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("Give to teammate:", t); print("Store token_sha256:", hashlib.sha256(t.encode()).hexdigest())'
   ```
   Write `/etc/wiki-context/tokens.json` (`chmod 600`):
   ```json

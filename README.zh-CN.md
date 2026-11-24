@@ -5,7 +5,7 @@
 [English](README.md) | 简体中文
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB.svg)](pyproject.toml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![Dependencies: Zero](https://img.shields.io/badge/第三方依赖-零-brightgreen.svg)](pyproject.toml)
 [![Protocol: MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)](docs/gateway-and-acl.md)
 
@@ -86,7 +86,7 @@
 | **超纲/不可答问题防幻觉** | 高危（强行返回最近邻切片诱导编造） | 依赖 Agent 自觉停止翻找 | **显式触发 `⚠️ 缺词预警`** + 未镜像/纯视觉页可答性边界声明 |
 | **在线问答延迟与 Token 开销** | 1～5 秒 + Embedding/Rerank 接口开销 | 15～40 秒（3～6 轮工具调用，消耗 ~3.5 万 Token） | **单次工具调用，~2–35 ms，仅 2.6k～4.8k Token，0 大模型调用** |
 | **多团队权限隔离（RBAC）** | 切片元数据过滤（难防派生摘要泄密） | 仅靠操作系统目录权限 | **热重载 `PrefixACLPolicy` + Wiki 100% 继承底层原件权限** |
-| **部署依赖与运维成本** | 重（Milvus/Qdrant + Docker + 各类 SDK） | 纯本地文件夹 | **零第三方依赖**（Python 3.14+ 标准库 + 单文件不可变 SQLite FTS5） |
+| **部署依赖与运维成本** | 重（Milvus/Qdrant + Docker + 各类 SDK） | 纯本地文件夹 | **零第三方依赖**（Python 3.11+ 标准库 + 单文件不可变 SQLite FTS5） |
 
 ---
 
@@ -135,7 +135,7 @@
 
 ## 核心工程特性一览
 
-1. **运行期与构建期双零依赖**：纯 Python 3.14+ 标准库实现（自带零依赖 PEP 517/660 构建后端、DOCX/PPTX/XLSX/CSV/MD 原生结构化提取器、`pdftotext` PDF 提取及可插拔 `WCTX_OCR_CMD` 扫描件 OCR 钩子），离线内网环境亦可秒级 `pip install -e .`。
+1. **运行期与构建期双零依赖**：纯 Python 3.11+ 标准库实现（自带零依赖 PEP 517/660 构建后端、DOCX/PPTX/XLSX/CSV/MD 原生结构化提取器、`pdftotext` PDF 提取及可插拔 `WCTX_OCR_CMD` 扫描件 OCR 钩子），离线内网环境亦可秒级 `pip install -e .`。
 2. **原生中英双语目录布局自适应**：
    - 英文布局（`--layout en`）：`sources/`、`mirrors/`、`wiki/`、`index.md`、`log.md`
    - 中文 Obsidian 布局（`--layout zh`）：`史料/`、`史料_md/`、`知识库/`、`目录.md`、`日志.md`（存量中文 Obsidian LLM Wiki 仓库无需写配置文件即可自动识别挂载）。
@@ -165,7 +165,7 @@ wctx doctor
 
 > **让 AI 帮你自动下载并安装（推荐）**：如果你已经在使用 Claude Code、Cursor、Codex CLI 等任意编码 Agent，可以直接把下面这句话发给它：
 > ```text
-> 请从 https://github.com/Minokun/wiki-context.git 下载安装 wiki-context（用 pipx 或 Python >= 3.14 的独立环境安装），运行 wctx doctor 检查环境，并打开 wctx ui 帮我引导配置。
+> 请从 https://github.com/Minokun/wiki-context.git 下载安装 wiki-context（用 pipx 或 Python >= 3.11 的独立环境安装），运行 wctx doctor 检查环境，并打开 wctx ui 帮我引导配置。
 > ```
 
 *（全程无需下载任何第三方 Python 依赖包；如需原生提取 PDF 文本与渲染 PDF 视觉页，可按需安装系统级 `poppler`：`brew install poppler` 或 `sudo apt install poppler-utils`。）*
@@ -222,7 +222,7 @@ wctx ui
 | :--- | :--- | :--- | :--- |
 | **1. 个人本机使用** | **桌面 App** 或 **`wctx ui`（Web 端）** | 本机装桌面 App（或 `wctx`） | 拖入本地文件夹即可建索引，自动扫描并一键连本机 19 款主流 AI 工具 |
 | **2. 个人多电脑 / 局域网共享** | 桌面 App / `wctx ui` 开启局域网共享 | 两台电脑装桌面 App 或 `wctx` | 生成 5 分钟一次性配对码，免填 IP 自动互联 |
-| **3. 团队服务器部署（管理员）** | **`wctx gateway`** + **`wctx service install`** | 服务器装 Python 3.14+、`wctx`（可选 `poppler`） | 多人共享、Bearer 密钥鉴权、按文件夹隔绝权限；按需 SSH 隧道开 `wctx ui` |
+| **3. 团队服务器部署（管理员）** | **`wctx gateway`** + **`wctx service install`** | 服务器装 Python 3.11+、`wctx`（可选 `poppler`） | 多人共享、Bearer 密钥鉴权、按文件夹隔绝权限；按需 SSH 隧道开 `wctx ui` |
 | **4. 纯 MCP 接入团队服务器（支持 HTTP MCP）** | **客户端直连 Streamable HTTP** | **零安装**（无需装 Python 或 `wctx`） | 向管理员拿 URL + 个人密钥 `wctx_...`，直接填进 Claude Code / Cursor / VS Code / WorkBuddy |
 | **5. 纯 MCP 接入团队服务器（仅支持 stdio / 一键全配）** | **`wctx remote add`** 或 **`wctx bridge`** | 仅需全局装 `wctx` CLI（或桌面端） | 自动发现并同步本机全部 AI 工具，或为仅支持本地 stdio 的工具做轻量转发 |
 
@@ -272,9 +272,9 @@ wctx ui
 # 安装系统 PDF 工具（可选，有 PDF 文档时建议安装）
 sudo apt-get update && sudo apt-get install -y poppler-utils
 
-# 安装 wiki-context（要求 Python >= 3.14，零第三方 Python 依赖）
+# 安装 wiki-context（要求 Python >= 3.11，零第三方 Python 依赖）
 pipx install git+https://github.com/Minokun/wiki-context.git
-# 或从源码 / wheel 安装：python3.14 -m pip install .
+# 或从源码 / wheel 安装：python3 -m pip install .
 
 wctx doctor
 ```
@@ -309,7 +309,7 @@ wctx compile --vault /srv/vaults/company --max-items 50
 - **方式 B（纯命令行生成 SHA-256 密钥文件）**：
   ```bash
   # 生成随机密钥及对应的 SHA-256（明文发给同事，哈希写入服务器配置）
-  python3.14 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("明文发给同事:", t); print("写入配置的 sha256:", hashlib.sha256(t.encode()).hexdigest())'
+  python3 -c 'import secrets, hashlib; t="wctx_"+secrets.token_urlsafe(24); print("明文发给同事:", t); print("写入配置的 sha256:", hashlib.sha256(t.encode()).hexdigest())'
   ```
   写入 `/etc/wiki-context/tokens.json`（`chmod 600 /etc/wiki-context/tokens.json`）：
   ```json

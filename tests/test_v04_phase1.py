@@ -23,11 +23,13 @@ from wiki_context.console import ConsoleState, create_console_server  # noqa: E4
 from wiki_context.context import PrefixACLPolicy, Principal  # noqa: E402
 from wiki_context.discovery import PairingManager, decode_pairing_code, validate_pairing_url  # noqa: E402
 from wiki_context.indexer import rebuild_index  # noqa: E402
-from wiki_context.mcp_server import run_stdio_server  # noqa: E402
+from wiki_context.mcp_server import KBService, run_stdio_server  # noqa: E402
+from wiki_context.remote_stdio import run_bridge  # noqa: E402
 from wiki_context.scaffold import init_vault  # noqa: E402
 from wiki_context.state_lock import atomic_write_bytes, ensure_schema_version, file_lock  # noqa: E402
 from wiki_context.sync import sync_vault  # noqa: E402
 from wiki_context.telemetry import TelemetryStore, scrub_telemetry_text  # noqa: E402
+from wiki_context.watcher import VaultWatcherManager  # noqa: E402
 
 
 class TestV04Phase1(unittest.TestCase):
@@ -406,6 +408,147 @@ class TestV04Phase1(unittest.TestCase):
             state.close()
             mock_srv.shutdown()
             mock_srv.server_close()
+
+    def test_07_telemetry_opt_out_sensitive_scrub_watcher_and_bridge(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        # 1. Default auto_compile_on_sync is False, and WCTX_TELEMETRY=0 suppresses telemetry.sqlite in Console & stdio
+        fake_ak = "LT" + "AI" + "0000TestDummyKey1234"
+        scrubbed = scrub_telemetry_text(f"用 {fake_ak} 登录，密码：MySecret99!")
+        self.assertNotIn(fake_ak, scrubbed)
+        self.assertNotIn("MySecret99!", scrubbed)
+        self.assertIn("[REDACTED_ACCESS_KEY_ID]", scrubbed)
+        self.assertIn("[REDACTED_SECRET]", scrubbed)
+
+        tel_cfg = self.root / "no-tel-home"
+        v_dir = self.root / "vault-priv"
+        init_vault(v_dir, name="PrivKB", layout="en")
+        (v_dir / "sources" / "note.md").write_text("# Note\n\nPrivate fact alpha-42.\n", encoding="utf-8")
+        sync_vault(v_dir)
+
+        with mock.patch.dict(os.environ, {"WCTX_TELEMETRY": "0", "WCTX_TELEMETRY_DB": str(tel_cfg / "stdio_tel.sqlite")}):
+            adm_tok = "adm_test_notel_tok"
+            st = ConsoleState(config_dir=tel_cfg, client_home=self.root / "fake-home", enable_watcher=False)
+            self.assertFalse(st.get_llm_compiler_status()["auto_compile_on_sync"])
+            srv = create_console_server(st, host="127.0.0.1", port=0, admin_token=adm_tok)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                self.assertFalse((tel_cfg / "telemetry.sqlite").exists())
+                req_list = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/logs/list",
+                    headers={"X-WCTX-Admin-Token": adm_tok},
+                )
+                with urllib.request.urlopen(req_list, timeout=3) as r:
+                    logs_data = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(logs_data["items"], [])
+                req_stats = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/logs/stats?hours=24",
+                    headers={"X-WCTX-Admin-Token": adm_tok},
+                )
+                with urllib.request.urlopen(req_stats, timeout=3) as r:
+                    stats_data = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(stats_data["total_calls"], 0)
+                self.assertEqual(len(stats_data["hourly"]), 24)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                st.close()
+            self.assertFalse((tel_cfg / "telemetry.sqlite").exists())
+
+            fake_stdin = type("FakeStd", (), {"buffer": io.BytesIO(b"")})()
+            with mock.patch.object(sys, "stdin", fake_stdin):
+                self.assertEqual(run_stdio_server(v_dir), 0)
+            self.assertFalse((tel_cfg / "stdio_tel.sqlite").exists())
+
+        # 2. Sensitive vault & WCTX_TELEMETRY_LOG_QUERIES=0 omit query text while preserving numeric counts
+        (v_dir / "vault.json").write_text(json.dumps({"name": "PrivKB", "layout": "en", "sensitive": True}), encoding="utf-8")
+        sens_db = self.root / "sens_tel.sqlite"
+        tel = TelemetryStore(db_path=sens_db, async_writer=False, enabled=True)
+        try:
+            with mock.patch.dict(os.environ, {"WCTX_USER": "alice", "WCTX_INTERNAL_MODEL": "1"}):
+                svc = KBService(v_dir, telemetry=tel, telemetry_vault_id="priv")
+                try:
+                    _, is_err = svc.dispatch_tool("wiki_context", {"question": "What is private fact alpha-42?"})
+                    self.assertFalse(is_err)
+                finally:
+                    svc.close()
+            rows = tel.list_invocations(limit=10)["items"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["query"], "")
+
+            with mock.patch.dict(os.environ, {"WCTX_TELEMETRY_LOG_QUERIES": "0"}):
+                tel.record({"client": "cursor", "mode": "stdio", "vault_id": "pub", "query": "secret prompt"})
+            rows2 = tel.list_invocations(limit=10)["items"]
+            self.assertEqual(len(rows2), 2)
+            self.assertEqual(rows2[0]["query"], "")
+        finally:
+            tel.close()
+
+        # 3. VaultWatcherManager detects source edits and triggers debounced callback
+        w_vault = self.root / "watch-vault"
+        init_vault(w_vault, name="WatchKB", layout="en")
+        (w_vault / "sources" / "doc.md").write_text("# Doc\nv1\n", encoding="utf-8")
+        fired = threading.Event()
+        seen_vids: list[str] = []
+        wm = VaultWatcherManager(
+            on_change=lambda vid: (seen_vids.append(vid), fired.set()),
+            poll_interval_sec=1.0,
+            debounce_sec=0.5,
+        )
+        wm.set_vaults({"watch-kb": w_vault})
+        wm.start()
+        try:
+            (w_vault / "sources" / "doc2.md").write_text("# Doc2\nnew file\n", encoding="utf-8")
+            self.assertTrue(fired.wait(timeout=5.0), "VaultWatcherManager did not trigger on_change")
+            self.assertEqual(seen_vids[0], "watch-kb")
+        finally:
+            wm.stop()
+
+        # 4. remote_stdio.run_bridge forwards JSON-RPC over HTTP with Bearer token and handles errors
+        class _MockBridgeHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                if self.headers.get("Authorization") != "Bearer wctx_bridge_tok":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                n = int(self.headers.get("Content-Length") or "0")
+                msg = json.loads(self.rfile.read(n).decode("utf-8"))
+                if msg.get("id") == 2:
+                    self.send_response(502)
+                    self.end_headers()
+                    return
+                resp = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"msg": "中文响应"}}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+        b_srv = HTTPServer(("127.0.0.1", 0), _MockBridgeHandler)
+        b_port = b_srv.server_address[1]
+        threading.Thread(target=b_srv.serve_forever, daemon=True).start()
+        try:
+            in_buf = io.BytesIO(
+                b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'
+                b'{"jsonrpc":"2.0","id":2,"method":"tools/call"}\n'
+            )
+            out_buf = io.BytesIO()
+            fake_in = type("FakeIn", (), {"buffer": in_buf})()
+            fake_out = type("FakeOut", (), {"buffer": out_buf})()
+            with mock.patch.object(sys, "stdin", fake_in), mock.patch.object(sys, "stdout", fake_out):
+                self.assertEqual(run_bridge(url=f"http://127.0.0.1:{b_port}/mcp", token="wctx_bridge_tok"), 0)
+            lines = [json.loads(line) for line in out_buf.getvalue().decode("utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["result"]["msg"], "中文响应")
+            self.assertEqual(lines[1]["error"]["code"], -32000)
+            self.assertIn("502", lines[1]["error"]["message"])
+        finally:
+            b_srv.shutdown()
+            b_srv.server_close()
 
 
 if __name__ == "__main__":

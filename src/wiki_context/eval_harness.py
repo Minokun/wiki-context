@@ -31,19 +31,7 @@ def generate_smoke_questions(vault: Path | str, *, max_questions: int = 8) -> di
     questions: list[dict] = []
     try:
         snap = svc._get_snapshot()
-        units = snap.index.units if snap.index.backend_name != "sqlite" else []
-        if not units and snap.index._con is not None:
-            import zlib
-            rows = snap.index._con.execute(
-                "SELECT source, heading, table_header, text_z FROM units LIMIT 60"
-            ).fetchall()
-            for src, h, th, tz in rows:
-                units.append({
-                    "source": src,
-                    "heading": h,
-                    "table_header": th,
-                    "text": zlib.decompress(tz).decode("utf-8"),
-                })
+        units = snap.index.sample_units(limit=60)
 
         code_re = re.compile(r"\b([A-Za-z]{2,8}[-_/]\d{2,6}|\d+(?:\.\d+)?(?:ms|s|MB|GB|RPS|%))\b")
         q_idx = 1
