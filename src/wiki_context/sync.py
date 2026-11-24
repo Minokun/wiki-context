@@ -40,6 +40,23 @@ class OCRProvider(Protocol):
     def extract(self, source_path: Path) -> ExtractedDocument: ...
 
 
+def _split_command_template(template: str, *, is_windows: bool | None = None) -> list[str]:
+    """Split a CLI command template without stripping Windows path backslashes."""
+    win = (os.name == "nt") if is_windows is None else bool(is_windows)
+    if not win:
+        return shlex.split(template, posix=True)
+    tokens: list[str] = []
+    for tok in shlex.split(template, posix=False):
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in {'"', "'"}:
+            quote = tok[0]
+            inner = tok[1:-1]
+            inner = inner.replace('\\"', '"') if quote == '"' else inner.replace("\\'", "'")
+            tokens.append(inner)
+        else:
+            tokens.append(tok)
+    return tokens
+
+
 class CommandOCRProvider:
     """Runs an external CLI OCR or ASR command template (`{input}`, optional `{output}`)."""
 
@@ -54,13 +71,15 @@ class CommandOCRProvider:
             uses_out_file = "{output}" in self.command_template
             argv = [
                 part.replace("{input}", str(source_path)).replace("{output}", str(out_md))
-                for part in shlex.split(self.command_template)
+                for part in _split_command_template(self.command_template)
             ]
             try:
                 proc = subprocess.run(
                     argv,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=self.timeout_sec,
                     check=False,
                 )

@@ -78,7 +78,7 @@ def main() -> int:
             "-m",
             "PyInstaller",
             "--onedir",
-            "--noconsole",
+            "--console" if os.name == "nt" else "--noconsole",
             "--clean",
             "--noconfirm",
             "--name",
@@ -130,7 +130,17 @@ def main() -> int:
         return 1
 
     # Smoke-test frozen engine `--version`
-    ver_out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True)
+    ver_out = subprocess.run(
+        [str(exe), "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+    if "wiki-context" not in ver_out.stdout:
+        print(f"Error: Unexpected --version output from {exe}: {ver_out.stdout!r}", file=sys.stderr)
+        return 1
     total_mb = sum(p.stat().st_size for p in ENGINE_OUT.rglob("*") if p.is_file()) / (1024 * 1024)
     print(f"[build_engine] OK: {ver_out.stdout.strip()} ({total_mb:.1f} MiB) -> {ENGINE_OUT}")
     return 0

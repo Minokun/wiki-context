@@ -148,8 +148,20 @@ def normalize_gateway_url(raw_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{clean_path}".rstrip("/")
 
 
-def detect_lan_ips() -> list[str]:
+_LAN_IPS_CACHE_LOCK = threading.Lock()
+_LAN_IPS_CACHE: tuple[float, list[str]] | None = None
+_LAN_IPS_CACHE_TTL_SEC = 15.0
+
+
+def detect_lan_ips(*, force_refresh: bool = False) -> list[str]:
     """Best-effort zero-dependency detection of local non-loopback IPv4 LAN addresses."""
+    global _LAN_IPS_CACHE
+    now = time.monotonic()
+    if not force_refresh:
+        with _LAN_IPS_CACHE_LOCK:
+            if _LAN_IPS_CACHE is not None and (now - _LAN_IPS_CACHE[0]) < _LAN_IPS_CACHE_TTL_SEC:
+                return list(_LAN_IPS_CACHE[1])
+
     found: list[str] = []
 
     def _add(ip: str) -> None:
@@ -170,13 +182,17 @@ def detect_lan_ips() -> list[str]:
     except OSError:
         pass
 
-    try:
-        _, _, ips = socket.gethostbyname_ex(socket.gethostname())
-        for ip in ips:
-            _add(ip)
-    except OSError:
-        pass
+    # Fallback only if UDP route probe found no IPv4 (avoids slow macOS mDNS `.local` lookups)
+    if not found:
+        try:
+            _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+            for ip in ips:
+                _add(ip)
+        except OSError:
+            pass
 
+    with _LAN_IPS_CACHE_LOCK:
+        _LAN_IPS_CACHE = (now, list(found))
     return found
 
 
@@ -1994,14 +2010,21 @@ class ConsoleState:
             status = self.start_lan_gateway(host="0.0.0.0", port=int(status.get("port") or 8090))
 
         port = int(status.get("port") or 8090)
-        urls: list[str] = list(status.get("lan_urls") or [])
-        ts = discover_tailscale_peers()
-        for tip in ts.get("self_ips") or []:
-            u = f"http://{tip}:{port}"
-            if u not in urls:
-                urls.append(u)
-        if allow_loopback and not urls:
-            urls.append(f"http://127.0.0.1:{port}")
+        bind_host = str(status.get("bind_host") or "").strip().lower()
+        is_loopback_bind = bind_host in {"127.0.0.1", "localhost", "::1"}
+        urls: list[str] = []
+        if is_loopback_bind:
+            if allow_loopback:
+                urls.append(f"http://127.0.0.1:{port}")
+        else:
+            urls.extend(status.get("lan_urls") or [])
+            ts = discover_tailscale_peers()
+            for tip in ts.get("self_ips") or []:
+                u = f"http://{tip}:{port}"
+                if u not in urls:
+                    urls.append(u)
+            if allow_loopback and f"http://127.0.0.1:{port}" not in urls:
+                urls.append(f"http://127.0.0.1:{port}")
         if not urls:
             raise ValueError("未检测到可用的局域网或 Tailscale IP 地址，无法生成配对码")
 

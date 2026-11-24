@@ -242,6 +242,20 @@ fn try_attach_existing_daemon() -> Option<BootstrapConfig> {
     fetch_daemon_bootstrap(port)
 }
 
+fn normalize_local_path(p: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = p.to_string_lossy();
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    p
+}
+
 fn resolve_engine_binary(app: &tauri::AppHandle) -> (String, Vec<String>, Option<PathBuf>) {
     let exe_name = if cfg!(target_os = "windows") {
         "wctx.exe"
@@ -255,7 +269,8 @@ fn resolve_engine_binary(app: &tauri::AppHandle) -> (String, Vec<String>, Option
             res_dir.join("engine").join(exe_name),
         ] {
             if cand.is_file() {
-                return (cand.to_string_lossy().to_string(), vec![], Some(cand));
+                let clean = normalize_local_path(cand);
+                return (clean.to_string_lossy().to_string(), vec![], Some(clean));
             }
         }
     }

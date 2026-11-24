@@ -199,6 +199,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            enc = (getattr(_stream, "encoding", "") or "").lower().replace("_", "-")
+            if enc != "utf-8":
+                try:
+                    _stream.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 

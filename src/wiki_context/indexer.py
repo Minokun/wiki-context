@@ -577,6 +577,9 @@ def rebuild_index(vault: Path | str, *, force: bool = False) -> dict:
         ts_str = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         gen_id = f"gen-{ts_str}-{sig[:8]}"
         gen_dir = cfg.index_root / gen_id
+        while gen_dir.exists():
+            gen_id = f"gen-{ts_str}-{sig[:8]}-{secrets.token_hex(3)}"
+            gen_dir = cfg.index_root / gen_id
         gen_dir.mkdir(parents=True, exist_ok=True)
 
         by_conv: dict[str, int] = {}

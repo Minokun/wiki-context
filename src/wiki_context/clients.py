@@ -511,6 +511,7 @@ def resolve_wctx_command() -> tuple[str, list[str]]:
     candidates: list[str | None] = [
         shim_env or None,
         shim_default,
+        sys.executable if getattr(sys, "frozen", False) else None,
         shutil.which("wctx"),
         "/opt/homebrew/bin/wctx",
         "/usr/local/bin/wctx",

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from wiki_context.extract import extract_document  # noqa: E402
 from wiki_context.policy import source_skip_reason  # noqa: E402
 from wiki_context.scaffold import init_vault  # noqa: E402
-from wiki_context.sync import sync_vault  # noqa: E402
+from wiki_context.sync import _split_command_template, sync_vault  # noqa: E402
 
 
 def _write_minimal_docx(path: Path, heading: str, cell_a: str, cell_b: str) -> None:
@@ -107,6 +107,24 @@ class TestExtractAndSync(unittest.TestCase):
             self.assertEqual(res["converted"], 1)
             mirror_txt = (v / "mirrors" / "diagram.png.md").read_text(encoding="utf-8")
             self.assertIn("Extracted port 8443", mirror_txt)
+
+    def test_split_command_template_preserves_windows_backslashes(self):
+        win_cmd = r'"C:\Program Files\Python\python.exe" -c ' + '"print(\'# OCR\\n\\n8443\')" "{input}"'
+        argv = _split_command_template(win_cmd, is_windows=True)
+        self.assertEqual(
+            argv,
+            [
+                r"C:\Program Files\Python\python.exe",
+                "-c",
+                r"print('# OCR\n\n8443')",
+                "{input}",
+            ],
+        )
+        unquoted_cmd = r"C:\Python314\python.exe -c " + '"print(\'ok\')"'
+        self.assertEqual(
+            _split_command_template(unquoted_cmd, is_windows=True),
+            [r"C:\Python314\python.exe", "-c", "print('ok')"],
+        )
 
 
 if __name__ == "__main__":
