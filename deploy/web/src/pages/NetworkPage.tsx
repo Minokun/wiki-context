@@ -7,9 +7,12 @@ import {
   ChevronRight,
   Code2,
   Copy,
+  Eye,
+  EyeOff,
   Globe,
   KeyRound,
   Link2,
+  Loader2,
   RefreshCw,
   ScanSearch,
   Server,
@@ -78,6 +81,16 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
   const [showManual, setShowManual] = useState(false);
   const [manualUrl, setManualUrl] = useState("");
   const [manualToken, setManualToken] = useState("");
+
+  // Connected remote wiki-context management
+  const remoteVaults = useMemo(() => vaults.filter((v) => v.kind === "remote"), [vaults]);
+  const [editingRemoteId, setEditingRemoteId] = useState<string | null>(null);
+  const [editRemoteUrl, setEditRemoteUrl] = useState("");
+  const [editRemoteToken, setEditRemoteToken] = useState("");
+  const [editRemoteShowToken, setEditRemoteShowToken] = useState(false);
+  const [editRemoteSyncClients, setEditRemoteSyncClients] = useState(true);
+  const [remoteBusy, setRemoteBusy] = useState<Record<string, "test" | "update" | "remove" | "">>({});
+  const [confirmDisconnectId, setConfirmDisconnectId] = useState<string | null>(null);
 
   // AI Clients Auto-Discovery & Sync state
   const [selectedClients, setSelectedClients] = useState<string[]>([]);
@@ -286,6 +299,86 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
       onRefresh();
     } catch (e) {
       onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const startEditRemote = (v: VaultInfo) => {
+    if (editingRemoteId === v.id) {
+      setEditingRemoteId(null);
+      setEditRemoteToken("");
+      return;
+    }
+    setEditingRemoteId(v.id);
+    setEditRemoteUrl(v.gateway_url || "");
+    setEditRemoteToken("");
+    setEditRemoteShowToken(false);
+    setEditRemoteSyncClients(true);
+    setConfirmDisconnectId(null);
+  };
+
+  const handleTestRemote = async (v: VaultInfo) => {
+    setRemoteBusy((prev) => ({ ...prev, [v.id]: "test" }));
+    try {
+      const res = await api.testRemote(v.id);
+      if (res.ok) {
+        onToast(
+          "success",
+          `「${v.name}」连接正常（${res.uid || v.remote_uid || "ok"} · ${res.latency_ms}ms · ${res.docs ?? v.docs} 篇文档）`,
+        );
+      } else {
+        onToast("error", `「${v.name}」连接异常：${res.error || "认证失败"}`);
+      }
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy((prev) => ({ ...prev, [v.id]: "" }));
+    }
+  };
+
+  const handleUpdateRemote = async (v: VaultInfo) => {
+    const nextUrl = editRemoteUrl.trim();
+    const nextTok = editRemoteToken.trim();
+    if (!nextUrl && !nextTok) {
+      onToast("info", "请填写新的访问密钥或网关地址");
+      return;
+    }
+    setRemoteBusy((prev) => ({ ...prev, [v.id]: "update" }));
+    try {
+      const res = await api.updateRemote({
+        vault_id: v.id,
+        gateway_url: nextUrl || undefined,
+        token: nextTok || undefined,
+        sync_clients: editRemoteSyncClients,
+      });
+      setEditRemoteToken("");
+      setEditingRemoteId(null);
+      onToast(
+        "success",
+        `已更新「${v.name}」（${res.uid} · ${res.token_masked}）${editRemoteSyncClients ? "，并同步至已安装 AI 工具" : ""}`,
+      );
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy((prev) => ({ ...prev, [v.id]: "" }));
+    }
+  };
+
+  const handleDisconnectRemote = async (v: VaultInfo) => {
+    setRemoteBusy((prev) => ({ ...prev, [v.id]: "remove" }));
+    try {
+      await api.removeVault(v.id, false);
+      setConfirmDisconnectId(null);
+      if (editingRemoteId === v.id) {
+        setEditingRemoteId(null);
+      }
+      onToast("info", `已断开远程共享库「${v.name}」`);
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy((prev) => ({ ...prev, [v.id]: "" }));
     }
   };
 
@@ -830,6 +923,238 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
               </div>
             )}
           </section>
+
+          {/* Connected Remote wiki-context Management */}
+          {remoteVaults.length > 0 && (
+            <section className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-[14px] font-bold text-[var(--ink-primary)]">
+                    已连接的远程 wiki-context
+                  </h2>
+                  <p className="text-xs text-[var(--ink-muted)]">
+                    共接入 {remoteVaults.length} 个远程共享知识库，可在此直接更新访问密钥、修改地址、测试连通或断开连接
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-2.5">
+                {remoteVaults.map((rv) => {
+                  const busyKind = remoteBusy[rv.id] || "";
+                  const isEditing = editingRemoteId === rv.id;
+                  const isConfirmingDisconnect = confirmDisconnectId === rv.id;
+                  return (
+                    <div
+                      key={rv.id}
+                      className={`rounded-xl border p-4 text-xs ${
+                        rv.ready
+                          ? "border-[var(--border-default)] bg-[var(--bg-subtle)]"
+                          : "border-rose-300 bg-rose-50/40 dark:border-rose-800 dark:bg-rose-950/20"
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-[13px] font-bold text-[var(--ink-primary)]">
+                              {rv.name}
+                            </span>
+                            <span className="rounded bg-[var(--bg-muted)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--ink-secondary)]">
+                              {rv.id}
+                              {rv.remote_vault_id && rv.remote_vault_id !== rv.id
+                                ? ` → ${rv.remote_vault_id}`
+                                : ""}
+                            </span>
+                            <span
+                              className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                                rv.ready
+                                  ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                                  : "bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
+                              }`}
+                            >
+                              {rv.ready ? "已连接" : "连接异常"}
+                            </span>
+                          </div>
+                          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-[var(--ink-muted)]">
+                            <span className="truncate">{rv.gateway_url || rv.mcp_url}</span>
+                            {rv.remote_uid && (
+                              <span>
+                                账号：{rv.remote_uid}
+                                {(rv.remote_groups || []).length > 0
+                                  ? ` (${(rv.remote_groups || []).join(", ")})`
+                                  : ""}
+                              </span>
+                            )}
+                            <span>密钥：{rv.token_masked || "未配置"}</span>
+                            <span>{rv.docs} 篇文档</span>
+                          </div>
+                          {!rv.ready && rv.online_error && (
+                            <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-800 dark:border-rose-800/80 dark:bg-rose-950/50 dark:text-rose-300">
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                              <span>{rv.online_error}（如服务端已重置密钥，请点击右侧「更新密钥 / 地址」）</span>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={Boolean(busyKind)}
+                            onClick={() => void handleTestRemote(rv)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)] disabled:opacity-50"
+                          >
+                            {busyKind === "test" ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+                            ) : (
+                              <RefreshCw className="h-3.5 w-3.5 text-[var(--accent)]" />
+                            )}
+                            测试连接
+                          </button>
+                          <button
+                            type="button"
+                            disabled={Boolean(busyKind)}
+                            onClick={() => startEditRemote(rv)}
+                            className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 font-semibold disabled:opacity-50 ${
+                              isEditing
+                                ? "border border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                                : "bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]"
+                            }`}
+                          >
+                            <KeyRound className="h-3.5 w-3.5" />
+                            {isEditing ? "收起编辑" : "更新密钥 / 地址"}
+                          </button>
+                          {isConfirmingDisconnect ? (
+                            <div className="inline-flex items-center gap-1">
+                              <button
+                                type="button"
+                                disabled={Boolean(busyKind)}
+                                onClick={() => void handleDisconnectRemote(rv)}
+                                className="rounded-lg bg-rose-600 px-2.5 py-1.5 font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
+                              >
+                                {busyKind === "remove" ? "断开中..." : "确认断开"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={Boolean(busyKind)}
+                                onClick={() => setConfirmDisconnectId(null)}
+                                className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] px-2 py-1.5 text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)]"
+                              >
+                                取消
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={Boolean(busyKind)}
+                              onClick={() => setConfirmDisconnectId(rv.id)}
+                              className="inline-flex items-center gap-1 rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] px-2.5 py-1.5 font-medium text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40 disabled:opacity-50"
+                            >
+                              <Unlink className="h-3.5 w-3.5" />
+                              断开
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {isEditing && (
+                        <form
+                          method="POST"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void handleUpdateRemote(rv);
+                          }}
+                          className="mt-3 space-y-2.5 border-t border-[var(--border-default)] pt-3"
+                        >
+                          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                            <div>
+                              <label
+                                htmlFor={`net-remote-url-${rv.id}`}
+                                className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                              >
+                                网关地址
+                              </label>
+                              <input
+                                id={`net-remote-url-${rv.id}`}
+                                name="gateway_url"
+                                type="url"
+                                value={editRemoteUrl}
+                                onChange={(e) => setEditRemoteUrl(e.target.value)}
+                                placeholder="http://100.64.195.4:8090"
+                                className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 font-mono text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                              />
+                            </div>
+                            <div>
+                              <label
+                                htmlFor={`net-remote-tok-${rv.id}`}
+                                className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                              >
+                                新访问密钥（仅更新地址时可留空）
+                              </label>
+                              <div className="relative flex items-center">
+                                <input
+                                  id={`net-remote-tok-${rv.id}`}
+                                  name="token"
+                                  type={editRemoteShowToken ? "text" : "password"}
+                                  value={editRemoteToken}
+                                  onChange={(e) => setEditRemoteToken(e.target.value)}
+                                  placeholder="粘贴服务端新发放的 wctx_..."
+                                  className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] py-1.5 pr-8 pl-2.5 font-mono text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                                />
+                                <button
+                                  type="button"
+                                  aria-label={editRemoteShowToken ? "隐藏密钥" : "显示密钥"}
+                                  onClick={() => setEditRemoteShowToken((s) => !s)}
+                                  className="absolute right-2 text-[var(--ink-muted)] hover:text-[var(--ink-primary)]"
+                                >
+                                  {editRemoteShowToken ? (
+                                    <EyeOff className="h-3.5 w-3.5" />
+                                  ) : (
+                                    <Eye className="h-3.5 w-3.5" />
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <label className="inline-flex cursor-pointer items-center gap-1.5 text-[var(--ink-secondary)]">
+                              <input
+                                type="checkbox"
+                                checked={editRemoteSyncClients}
+                                onChange={(e) => setEditRemoteSyncClients(e.target.checked)}
+                              />
+                              <span>同时同步更新本机已安装的 AI 工具配置（保留其余知识库）</span>
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={busyKind === "update"}
+                                onClick={() => setEditingRemoteId(null)}
+                                className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] px-3 py-1.5 font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)]"
+                              >
+                                取消
+                              </button>
+                              <button
+                                type="submit"
+                                disabled={busyKind === "update"}
+                                className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                              >
+                                {busyKind === "update" ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Check className="h-3.5 w-3.5" />
+                                )}
+                                {busyKind === "update" ? "验证更新中..." : "验证并保存"}
+                              </button>
+                            </div>
+                          </div>
+                        </form>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
           {/* Section 2 (Secondary): Multi-Device Sharing & Pairing */}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">

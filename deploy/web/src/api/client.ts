@@ -299,6 +299,34 @@ export const api = {
     remote_vault_ids?: string[];
     sync_clients?: boolean;
   }) => requestJson<unknown>("/api/remotes/connect", payload),
+  updateRemote: (payload: {
+    vault_id: string;
+    gateway_url?: string;
+    token?: string;
+    sync_clients?: boolean;
+  }) =>
+    requestJson<{
+      vault_id: string;
+      gateway_url: string;
+      uid: string;
+      groups: string[];
+      docs: number;
+      sections: number;
+      token_masked: string;
+      client_sync: { client_id: string; client_name: string }[];
+    }>("/api/remotes/update", payload),
+  testRemote: (vault_id: string) =>
+    requestJson<{
+      ok: boolean;
+      vault_id: string;
+      gateway_url: string;
+      uid?: string;
+      groups?: string[];
+      docs?: number;
+      sections?: number;
+      latency_ms: number;
+      error: string;
+    }>("/api/remotes/test", { vault_id }),
 
   // Tokens & ACL
   createToken: (payload: { uid: string; label?: string; groups: string[]; allowed_vaults: string[] }) =>

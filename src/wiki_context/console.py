@@ -2012,12 +2012,18 @@ class ConsoleState:
         *,
         gateway_url: str | None = None,
         token: str | None = None,
+        sync_clients: bool = True,
     ) -> dict[str, Any]:
         rec = self.get_vault_record(vault_id)
         if rec.get("kind") != "remote":
             raise ValueError(f"'{vault_id}' 不是远程知识库")
-        new_base = normalize_gateway_url(gateway_url or str(rec.get("gateway_url") or ""))
-        new_tok = (token or "").strip() or self.get_remote_token(vault_id)
+        old_base = str(rec.get("gateway_url") or "").strip().rstrip("/")
+        old_tok = self.get_remote_token(vault_id)
+        new_base = normalize_gateway_url(gateway_url or old_base)
+        new_tok = (token or "").strip() or old_tok
+        if not new_tok:
+            raise ValueError("请提供有效的访问密钥")
+
         probed = probe_remote_gateway(new_base, new_tok)
         rvid = str(rec.get("remote_vault_id") or vault_id)
         matched = next((v for v in probed["vaults"] if v["remote_vault_id"] == rvid), None)
@@ -2040,9 +2046,108 @@ class ConsoleState:
             _atomic_write_json(self.console_file, data)
             rem_doc = self._load_remotes_doc()
             rem_doc.setdefault("credentials", {})[vault_id] = {"token": new_tok, "updated_at": _now_iso()}
+            inst_id = str(rec.get("instance_id") or "").strip()
+            if inst_id and isinstance(rem_doc.get("nodes"), dict) and inst_id in rem_doc["nodes"]:
+                node = rem_doc["nodes"][inst_id]
+                if isinstance(node, dict):
+                    urls = [str(u).rstrip("/") for u in (node.get("urls") or []) if str(u).strip()]
+                    if new_base not in urls:
+                        urls.insert(0, new_base)
+                    node["urls"] = urls
+                    node["active_url"] = new_base
+                    node["last_seen_at"] = _now_iso()
             self._save_remotes_doc(rem_doc)
 
-        return {"vault_id": vault_id, "gateway_url": new_base, "uid": probed["uid"]}
+        if old_base or old_tok:
+            self._remote_probe_cache.pop((old_base, old_tok), None)
+        self._remote_probe_cache[(new_base, new_tok)] = (time.monotonic(), probed, "")
+
+        client_sync_results: list[dict[str, Any]] = []
+        if sync_clients:
+            installed_ids = [c["id"] for c in inspect_all_clients(home=self.client_home) if c["installed"]]
+            if installed_ids:
+                desired = self.build_desired_client_servers(vault_ids=[vault_id], mode="auto")
+                client_sync_results = [
+                    sync_client_mcp_config(cid, desired, remove_unlisted_wctx=False, home=self.client_home)
+                    for cid in installed_ids
+                ]
+
+        return {
+            "vault_id": vault_id,
+            "gateway_url": new_base,
+            "uid": probed["uid"],
+            "groups": probed["groups"],
+            "docs": matched["docs"],
+            "sections": matched["sections"],
+            "token_masked": _mask_token(new_tok),
+            "client_sync": client_sync_results,
+        }
+
+    def test_remote_vault(self, vault_id: str) -> dict[str, Any]:
+        """Actively test connectivity & token validity for a registered remote vault."""
+        rec = self.get_vault_record(vault_id)
+        if rec.get("kind") != "remote":
+            raise ValueError(f"'{vault_id}' 不是远程知识库")
+        gw = str(rec.get("gateway_url") or "").strip().rstrip("/")
+        rvid = str(rec.get("remote_vault_id") or vault_id).strip()
+        tok = self.get_remote_token(vault_id)
+        if not gw:
+            return {"ok": False, "vault_id": vault_id, "gateway_url": "", "latency_ms": 0.0, "error": "未指定网关地址"}
+        if not tok:
+            return {"ok": False, "vault_id": vault_id, "gateway_url": gw, "latency_ms": 0.0, "error": "未配置访问令牌"}
+
+        t0 = time.monotonic()
+        try:
+            probed = probe_remote_gateway(gw, tok, timeout=4.0)
+            latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            self._remote_probe_cache[(gw, tok)] = (time.monotonic(), probed, "")
+        except Exception as exc:
+            latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            self._remote_probe_cache[(gw, tok)] = (time.monotonic(), None, str(exc))
+            return {
+                "ok": False,
+                "vault_id": vault_id,
+                "gateway_url": gw,
+                "latency_ms": latency_ms,
+                "error": str(exc),
+            }
+
+        matched = next((rv for rv in probed.get("vaults", []) if rv.get("remote_vault_id") == rvid), None)
+        if matched is None:
+            return {
+                "ok": False,
+                "vault_id": vault_id,
+                "gateway_url": gw,
+                "uid": probed.get("uid", ""),
+                "latency_ms": latency_ms,
+                "error": f"远端网关未授权或不存在知识库 '{rvid}'",
+            }
+
+        with self._lock:
+            data = self._load_console_data()
+            for v in data.get("vaults") or []:
+                if isinstance(v, dict) and str(v.get("id")) == vault_id:
+                    v.update({
+                        "name": matched["name"],
+                        "layout": matched["layout"],
+                        "remote_uid": probed["uid"],
+                        "remote_groups": probed["groups"],
+                        "cached_docs": matched["docs"],
+                        "cached_sections": matched["sections"],
+                    })
+            _atomic_write_json(self.console_file, data)
+
+        return {
+            "ok": True,
+            "vault_id": vault_id,
+            "gateway_url": gw,
+            "uid": probed["uid"],
+            "groups": probed["groups"],
+            "docs": matched["docs"],
+            "sections": matched["sections"],
+            "latency_ms": latency_ms,
+            "error": "",
+        }
 
     def build_desired_client_servers(
         self,
@@ -2111,6 +2216,8 @@ class ConsoleState:
     def remove_vault_detailed(self, vault_id: str, *, cleanup_workspace: bool = False) -> dict[str, Any]:
         """Unregister a vault and optionally clean managed workspace cache while archiving curated Wiki/Memory."""
         removed_rec: dict[str, Any] | None = None
+        removed_gw = ""
+        removed_tok = ""
         with self._lock:
             data = self._load_console_data()
             before = list(data.get("vaults") or [])
@@ -2128,9 +2235,13 @@ class ConsoleState:
             _atomic_write_json(self.console_file, data)
             rem_doc = self._load_remotes_doc()
             if vault_id in (rem_doc.get("credentials") or {}):
+                removed_gw = str(removed_rec.get("gateway_url") or "").strip().rstrip("/")
+                removed_tok = str((rem_doc["credentials"].get(vault_id) or {}).get("token") or "").strip()
                 rem_doc["credentials"].pop(vault_id, None)
                 self._save_remotes_doc(rem_doc)
 
+        if removed_gw or removed_tok:
+            self._remote_probe_cache.pop((removed_gw, removed_tok), None)
         self.gateway.remove_vault(vault_id)
         self._compile_plan_cache.pop(vault_id, None)
         self._refresh_watcher_targets()
@@ -3994,7 +4105,13 @@ def create_console_server(
                         str(body.get("vault_id") or ""),
                         gateway_url=body.get("gateway_url"),
                         token=body.get("token"),
+                        sync_clients=bool(body.get("sync_clients", True)),
                     )
+                    self._send_json(200, res)
+                    return
+
+                if path == "/api/remotes/test":
+                    res = state.test_remote_vault(str(body.get("vault_id") or ""))
                     self._send_json(200, res)
                     return
 

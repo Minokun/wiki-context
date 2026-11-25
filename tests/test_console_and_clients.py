@@ -1126,6 +1126,107 @@ class TestConsoleAndClients(unittest.TestCase):
             gw.close()
             gw_ctx["telemetry"].close()
 
+    def test_remote_vault_update_token_syncs_clients_and_test_endpoint(self) -> None:
+        raw_dir = self.root / "remote-src-update"
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "标准.md").write_text("# 接触网标准\n\n导高范围 4000~5700mm。\n", encoding="utf-8")
+        self._api("/api/vaults/onboard", {"path": str(raw_dir), "vault_id": "wiki-srv", "name": "远端主库", "layout": "zh"})
+
+        tok1 = self._api("/api/tokens/create", {
+            "uid": "alice",
+            "label": "Alice v1",
+            "groups": ["reader"],
+            "allowed_vaults": ["wiki-srv"],
+        })
+        tok1_id = tok1["record"]["id"]
+        tok1_secret = tok1["token"]
+        lan_info = self._api("/api/lan-gateway/start", {"host": "127.0.0.1", "port": 0})
+        gw_url = f"http://127.0.0.1:{lan_info['port']}"
+
+        home_b = self.root / "home-b-upd"
+        home_b.mkdir(parents=True)
+        (home_b / ".claude.json").write_text("{}", encoding="utf-8")
+        cfg_b = self.root / "cfg-b-upd"
+        state_b = ConsoleState(config_dir=cfg_b, client_home=home_b)
+        srv_b = create_console_server(state_b, host="127.0.0.1", port=0)
+        threading.Thread(target=srv_b.serve_forever, daemon=True).start()
+        base_b = f"http://127.0.0.1:{srv_b.server_address[1]}"
+        try:
+            with urllib.request.urlopen(f"{base_b}/", timeout=5) as r_html:
+                m_csrf = re.search(r'"csrfToken":\s*"([^"]+)"', r_html.read().decode("utf-8"))
+                assert m_csrf is not None
+                csrf_b = m_csrf.group(1)
+
+            def api_b(path: str, payload: dict | None = None) -> tuple[int, dict]:
+                hdrs = {"X-WCTX-CSRF": csrf_b, "Accept": "application/json"}
+                data = None
+                method = "GET"
+                if payload is not None:
+                    method = "POST"
+                    hdrs["Content-Type"] = "application/json"
+                    data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(f"{base_b}{path}", data=data, headers=hdrs, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as err:
+                    return err.code, json.loads(err.read().decode("utf-8"))
+
+            # B has a local vault + connected remote vault
+            local_dir = self.root / "b-local-upd"
+            local_dir.mkdir(parents=True)
+            (local_dir / "笔记.md").write_text("# 个人笔记\n\n本地库保留。\n", encoding="utf-8")
+            st_c, _ = api_b("/api/vaults/onboard", {"path": str(local_dir), "vault_id": "wiki-local", "name": "本地库", "layout": "zh"})
+            self.assertEqual(st_c, 200)
+            st_c, _ = api_b("/api/remotes/connect", {"gateway_url": gw_url, "token": tok1_secret, "sync_clients": True})
+            self.assertEqual(st_c, 200)
+
+            # 1) /api/remotes/test returns ok=True initially
+            st_c, t_ok = api_b("/api/remotes/test", {"vault_id": "wiki-srv"})
+            self.assertEqual(st_c, 200)
+            self.assertTrue(t_ok["ok"])
+            self.assertEqual(t_ok["uid"], "alice")
+
+            # 2) Rotate token on gateway -> /api/remotes/test immediately catches 401
+            rot = self._api("/api/tokens/rotate", {"id": tok1_id})
+            tok2_secret = rot["token"]
+            self.assertNotEqual(tok1_secret, tok2_secret)
+            st_c, t_fail = api_b("/api/remotes/test", {"vault_id": "wiki-srv"})
+            self.assertEqual(st_c, 200)
+            self.assertFalse(t_fail["ok"])
+            self.assertIn("401", t_fail["error"])
+
+            # 3) Updating with an invalid token fails cleanly without corrupting stored credentials
+            st_bad, _ = api_b("/api/remotes/update", {"vault_id": "wiki-srv", "token": "wctx_invalid_999"})
+            self.assertEqual(st_bad, 400)
+            self.assertEqual(state_b.get_remote_token("wiki-srv"), tok1_secret)
+
+            # 4) Updating with new valid token updates credential, cache, overview, AND client config while preserving local vault
+            st_ok, upd = api_b("/api/remotes/update", {
+                "vault_id": "wiki-srv",
+                "gateway_url": gw_url,
+                "token": tok2_secret,
+                "sync_clients": True,
+            })
+            self.assertEqual(st_ok, 200)
+            self.assertEqual(upd["uid"], "alice")
+            self.assertEqual(state_b.get_remote_token("wiki-srv"), tok2_secret)
+
+            _, ov_b = api_b("/api/overview")
+            srv_info = next(v for v in ov_b["vaults"] if v["id"] == "wiki-srv")
+            self.assertTrue(srv_info["ready"])
+            self.assertEqual(srv_info["online_error"], "")
+
+            claude_cfg = json.loads((home_b / ".claude.json").read_text(encoding="utf-8"))
+            self.assertIn("wiki-local", claude_cfg["mcpServers"])
+            self.assertIn("wiki-srv", claude_cfg["mcpServers"])
+            self.assertEqual(claude_cfg["mcpServers"]["wiki-srv"]["headers"]["Authorization"], f"Bearer {tok2_secret}")
+        finally:
+            srv_b.shutdown()
+            srv_b.server_close()
+            state_b.close()
+            self._api("/api/lan-gateway/stop", {})
+
 
 if __name__ == "__main__":
     unittest.main()

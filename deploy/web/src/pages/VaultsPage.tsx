@@ -8,10 +8,12 @@ import {
   Edit3,
   ExternalLink,
   Eye,
+  EyeOff,
   FolderInput,
   FolderOpen,
   FolderTree,
   HardDrive,
+  KeyRound,
   Link2,
   Loader2,
   Lock,
@@ -220,6 +222,70 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
       onToast("error", e instanceof Error ? e.message : String(e));
     } finally {
       setProfileBusy("");
+    }
+  };
+
+  // Remote connection & credential management state
+  const [remoteGatewayInput, setRemoteGatewayInput] = useState("");
+  const [remoteTokenInput, setRemoteTokenInput] = useState("");
+  const [remoteShowToken, setRemoteShowToken] = useState(false);
+  const [remoteSyncClients, setRemoteSyncClients] = useState(true);
+  const [remoteBusy, setRemoteBusy] = useState<"" | "test" | "update">("");
+
+  useEffect(() => {
+    setRemoteGatewayInput(activeVault?.kind === "remote" ? activeVault.gateway_url || "" : "");
+    setRemoteTokenInput("");
+    setRemoteShowToken(false);
+    setRemoteSyncClients(true);
+  }, [activeVault?.id, activeVault?.kind, activeVault?.gateway_url]);
+
+  const handleTestRemote = async () => {
+    if (!activeVault || activeVault.kind !== "remote" || remoteBusy) return;
+    setRemoteBusy("test");
+    try {
+      const res = await api.testRemote(activeVault.id);
+      if (res.ok) {
+        onToast(
+          "success",
+          `连接正常（${res.uid || activeVault.remote_uid || "ok"} · ${res.latency_ms}ms · ${res.docs ?? activeVault.docs} 篇文档）`,
+        );
+      } else {
+        onToast("error", `连接异常：${res.error || "认证失败"}`);
+      }
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy("");
+    }
+  };
+
+  const handleUpdateRemote = async () => {
+    if (!activeVault || activeVault.kind !== "remote" || remoteBusy) return;
+    const nextUrl = remoteGatewayInput.trim();
+    const nextTok = remoteTokenInput.trim();
+    if (!nextUrl && !nextTok) {
+      onToast("info", "请填写新的访问密钥或网关地址");
+      return;
+    }
+    setRemoteBusy("update");
+    try {
+      const res = await api.updateRemote({
+        vault_id: activeVault.id,
+        gateway_url: nextUrl || undefined,
+        token: nextTok || undefined,
+        sync_clients: remoteSyncClients,
+      });
+      setRemoteTokenInput("");
+      onToast(
+        "success",
+        `已更新「${activeVault.name}」（${res.uid} · ${res.token_masked}）${remoteSyncClients ? "，并同步至已安装 AI 工具" : ""}`,
+      );
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy("");
     }
   };
 
@@ -713,7 +779,9 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                   <span
                     className={`rounded-md px-2 py-0.5 text-xs font-semibold ${
                       activeVault.kind === "remote"
-                        ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                        ? activeVault.ready
+                          ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                          : "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
                         : activeVault.source_available === false
                           ? "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
                           : activeVault.ready
@@ -722,7 +790,9 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                     }`}
                   >
                     {activeVault.kind === "remote"
-                      ? "共享知识库"
+                      ? activeVault.ready
+                        ? "共享知识库 · 已连接"
+                        : "共享知识库 · 连接异常"
                       : activeVault.source_available === false
                         ? "源目录离线"
                         : activeVault.ready
@@ -1245,15 +1315,22 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                             )}
                           </div>
                           <span
+                            title={v.kind === "remote" && !v.ready ? v.online_error || "连接异常" : undefined}
                             className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-medium ${
                               v.kind === "remote"
-                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                ? v.ready
+                                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                  : "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
                                 : v.ready
                                   ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
                                   : "bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300"
                             }`}
                           >
-                            {v.kind === "remote" ? "共享库" : `${v.docs} 篇文档 · ${v.wiki_docs} 篇整理`}
+                            {v.kind === "remote"
+                              ? v.ready
+                                ? `共享库 · ${v.docs} 篇`
+                                : "连接异常"
+                              : `${v.docs} 篇文档 · ${v.wiki_docs} 篇整理`}
                           </span>
                         </div>
 
@@ -2098,6 +2175,183 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                       </button>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* Remote Connection & Token Management (for kind === "remote") */}
+              {activeVault.kind === "remote" && (
+                <div className="space-y-3 rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] p-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 font-bold text-[var(--ink-primary)]">
+                      <KeyRound className="h-3.5 w-3.5 text-[var(--accent)]" />
+                      远程连接与密钥管理
+                    </span>
+                    <span
+                      className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                        activeVault.ready
+                          ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                          : "bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
+                      }`}
+                    >
+                      {activeVault.ready ? "已连接" : "连接异常"}
+                    </span>
+                  </div>
+
+                  {!activeVault.ready && activeVault.online_error && (
+                    <div className="flex items-start gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-2 text-[11px] leading-relaxed text-rose-800 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300">
+                      <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>{activeVault.online_error}</span>
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] p-2.5 text-[11px]">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--ink-muted)]">授权账号</span>
+                      <span className="font-mono font-semibold text-[var(--ink-primary)]">
+                        {activeVault.remote_uid || "—"}
+                        {(activeVault.remote_groups || []).length > 0
+                          ? ` (${(activeVault.remote_groups || []).join(", ")})`
+                          : ""}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--ink-muted)]">当前密钥</span>
+                      <span className="font-mono text-[var(--ink-primary)]">
+                        {activeVault.token_masked || "未配置"}
+                      </span>
+                    </div>
+                    {activeVault.mcp_url && (
+                      <div className="pt-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[var(--ink-muted)]">MCP 地址</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void copyToClipboard(activeVault.mcp_url || "").then((ok) => {
+                                if (ok) onToast("info", "已复制 MCP 地址");
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 font-medium text-[var(--accent)] hover:underline"
+                          >
+                            <Copy className="h-3 w-3" /> 复制
+                          </button>
+                        </div>
+                        <div className="mt-0.5 truncate font-mono text-[11px] text-[var(--ink-secondary)]">
+                          {activeVault.mcp_url}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      disabled={Boolean(remoteBusy)}
+                      onClick={() => void handleTestRemote()}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] py-1.5 font-semibold text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+                    >
+                      {remoteBusy === "test" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5 text-[var(--accent)]" />
+                      )}
+                      测试连接
+                    </button>
+                    <button
+                      type="button"
+                      disabled={Boolean(remoteBusy)}
+                      onClick={() => setRemoveTarget(activeVault)}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50/70 py-1.5 font-semibold text-rose-700 hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-950/35 dark:text-rose-300 disabled:opacity-50"
+                    >
+                      <Unlink className="h-3.5 w-3.5" />
+                      断开连接
+                    </button>
+                  </div>
+
+                  <details open={!activeVault.ready} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-subtle)] p-2.5">
+                    <summary className="flex cursor-pointer list-none items-center justify-between font-semibold text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]">
+                      <span>更新访问密钥 / 网关地址</span>
+                      <ChevronDown className="h-3.5 w-3.5 text-[var(--ink-muted)]" />
+                    </summary>
+
+                    <form
+                      method="POST"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void handleUpdateRemote();
+                      }}
+                      className="mt-2.5 space-y-2.5 border-t border-[var(--border-subtle)] pt-2.5"
+                    >
+                      <div>
+                        <label
+                          htmlFor={`vault-remote-url-${activeVault.id}`}
+                          className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                        >
+                          网关地址
+                        </label>
+                        <input
+                          id={`vault-remote-url-${activeVault.id}`}
+                          name="gateway_url"
+                          type="url"
+                          value={remoteGatewayInput}
+                          onChange={(e) => setRemoteGatewayInput(e.target.value)}
+                          placeholder="http://100.64.195.4:8090"
+                          className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 font-mono text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor={`vault-remote-tok-${activeVault.id}`}
+                          className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                        >
+                          新访问密钥（仅改地址时可留空）
+                        </label>
+                        <div className="relative flex items-center">
+                          <input
+                            id={`vault-remote-tok-${activeVault.id}`}
+                            name="token"
+                            type={remoteShowToken ? "text" : "password"}
+                            value={remoteTokenInput}
+                            onChange={(e) => setRemoteTokenInput(e.target.value)}
+                            placeholder="粘贴服务端新发放的 wctx_..."
+                            className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] py-1.5 pr-8 pl-2.5 font-mono text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                          />
+                          <button
+                            type="button"
+                            aria-label={remoteShowToken ? "隐藏密钥" : "显示密钥"}
+                            onClick={() => setRemoteShowToken((s) => !s)}
+                            className="absolute right-2 text-[var(--ink-muted)] hover:text-[var(--ink-primary)]"
+                          >
+                            {remoteShowToken ? (
+                              <EyeOff className="h-3.5 w-3.5" />
+                            ) : (
+                              <Eye className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                      <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-[var(--ink-secondary)]">
+                        <input
+                          type="checkbox"
+                          checked={remoteSyncClients}
+                          onChange={(e) => setRemoteSyncClients(e.target.checked)}
+                        />
+                        <span>同时同步更新已连接的 AI 工具配置</span>
+                      </label>
+                      <button
+                        type="submit"
+                        disabled={Boolean(remoteBusy)}
+                        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[var(--accent)] py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                      >
+                        {remoteBusy === "update" ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Check className="h-3.5 w-3.5" />
+                        )}
+                        {remoteBusy === "update" ? "验证更新中..." : "验证并更新密钥"}
+                      </button>
+                    </form>
+                  </details>
                 </div>
               )}
 
