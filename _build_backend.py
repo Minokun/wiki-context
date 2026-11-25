@@ -38,7 +38,7 @@ def _read_pyproject_meta() -> tuple[str, str]:
         m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
         if m:
             return m.group(1).strip(), DEFAULT_REQUIRES_PYTHON
-    return "0.5.4", DEFAULT_REQUIRES_PYTHON
+    return "0.5.5", DEFAULT_REQUIRES_PYTHON
 
 
 VERSION, REQUIRES_PYTHON = _read_pyproject_meta()

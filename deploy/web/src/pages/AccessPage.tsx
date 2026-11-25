@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -141,6 +142,56 @@ function buildTeammateMessage(
   return lines.join("\n");
 }
 
+const WCTX_REPO_URL = "https://github.com/Minokun/wiki-context.git";
+
+/**
+ * Build a prompt teammates paste straight into their own AI agent (Claude Code /
+ * Codex / Cursor …). The agent must connect through wctx's native path:
+ * install wctx → `wctx remote probe` → `wctx remote add` (auto-sync all local AI
+ * clients) → fall back to a `wctx bridge` stdio entry only for undetected clients.
+ */
+function buildAgentInstallPrompt(
+  baseUrl: string,
+  token: string,
+  targetVaults: { id: string; name: string }[],
+): string {
+  const effBase = (baseUrl.trim() || DEFAULT_FALLBACK_URL).replace(/\/+$/, "");
+  const effToken = token || "wctx_请替换为你的密钥";
+  const vaults = targetVaults.length > 0 ? targetVaults : [{ id: "wiki", name: "知识库" }];
+  const vaultLines = vaults.map((v) => `  - ${v.name}（ID: ${v.id}）`).join("\n");
+  const first = vaults[0];
+  const vaultFlags = vaults.map((v) => `--vault ${v.id}`).join(" ");
+
+  return [
+    "请帮我把团队知识库接入到本机的 AI 工具中。必须使用 wiki-context（命令 wctx）官方的 remote 接入方式完成，不要手动拼写 HTTP 型 MCP 配置、不要自行编写转发脚本。",
+    "",
+    "【连接信息】",
+    `- 网关地址：${effBase}`,
+    `- 访问密钥：${effToken}`,
+    "  （这是我的个人密钥：不要在回复中完整回显，不要写入任何会提交到 Git 的文件。）",
+    "- 授权知识库：",
+    vaultLines,
+    "",
+    "【请按顺序执行】",
+    "1. 检查是否已安装：运行 `wctx --version`。",
+    `   - 未安装：用 pipx 安装（需要 Python ≥ 3.11）：pipx install git+${WCTX_REPO_URL}`,
+    `   - 没有 pipx：可用 uv tool install git+${WCTX_REPO_URL}，或在独立的 Python ≥ 3.11 venv 中 pip install；不要装进系统 Python。`,
+    "   - 已安装：可执行 `pipx upgrade wiki-context`（或对应方式）升级到最新版。",
+    "   安装后运行 `wctx doctor`，确认 wctx 在 PATH 中、Python 版本满足要求；有问题先修复再继续。",
+    `2. 探测网关：wctx remote probe --url ${effBase} --token <访问密钥>`,
+    "   应能看到上述授权知识库；如连接失败，检查网络（同一局域网 / Tailscale / VPN）后把报错原文告诉我，不要反复重试。",
+    `3. 正式接入：wctx remote add --url ${effBase} --token <访问密钥>`,
+    `   （只接入部分库时追加：${vaultFlags}）`,
+    "   该命令会登记远程知识库，并自动把 MCP 配置同步到本机已安装的 AI 工具（Claude Code、Codex、Cursor、VS Code、Windsurf、Trae、Gemini CLI 等）。请查看输出 JSON 中的 connected_vaults 与 client_sync。",
+    "4. 检查你自己（当前这个 AI 工具）是否出现在 client_sync 中且同步成功：",
+    "   - 是：完成，跳到第 5 步。",
+    "   - 否（未被识别的工具）：在它的 MCP 配置里为每个知识库添加一个 stdio 服务器，用 wctx bridge 转发，密钥放在 env 中而不是命令行参数：",
+    `     command: "wctx"，args: ["bridge", "--url", "${effBase}/mcp/${first.id}"]，env: { "WCTX_TOKEN": "<访问密钥>", "PYTHONUTF8": "1" }`,
+    "     （其他知识库把 URL 末尾换成对应 ID；command 若找不到，请用 `which wctx` / `where wctx` 得到的绝对路径。）修改前先备份原配置文件，只合并、不要覆盖已有条目。",
+    "5. 运行 `wctx remote list` 确认已登记，然后告诉我：接入了哪些知识库、同步了哪些 AI 工具、改动了哪些配置文件，并提醒我重启或刷新 AI 工具的 MCP 列表。",
+  ].join("\n");
+}
+
 interface AccessPageProps {
   vaults: VaultInfo[];
   tokens: TokenRecord[];
@@ -176,7 +227,7 @@ export const AccessPage: React.FC<AccessPageProps> = ({
     }
     return pickDefaultShareBaseUrl(lan, gatewayBaseUrl);
   });
-  const [copiedKind, setCopiedKind] = useState<"" | "token" | "snippet" | "message" | "cli">("");
+  const [copiedKind, setCopiedKind] = useState<"" | "token" | "snippet" | "message" | "cli" | "agent">("");
 
   // Visual Role ACL editor state
   const [localAcl, setLocalAcl] = useState<Record<string, AclRule>>(acl || {});
@@ -229,7 +280,7 @@ export const AccessPage: React.FC<AccessPageProps> = ({
     }
   };
 
-  const triggerCopied = (kind: "token" | "snippet" | "message" | "cli", msg: string) => {
+  const triggerCopied = (kind: "token" | "snippet" | "message" | "cli" | "agent", msg: string) => {
     setCopiedKind(kind);
     onToast("info", msg);
     setTimeout(() => {
@@ -337,7 +388,8 @@ export const AccessPage: React.FC<AccessPageProps> = ({
     const fmtMeta =
       CLIENT_FORMAT_OPTIONS.find((f) => f.id === shareFormat) || CLIENT_FORMAT_OPTIONS[0];
     const fullMessage = buildTeammateMessage(shareFormat, snippet, cliCmd, fmtMeta.targetHint);
-    return { snippet, cliCmd, targetHint: fmtMeta.targetHint, fullMessage };
+    const agentPrompt = buildAgentInstallPrompt(shareBaseUrl, shareConfig.token, targetVaults);
+    return { snippet, cliCmd, targetHint: fmtMeta.targetHint, fullMessage, agentPrompt };
   }, [shareConfig, shareFormat, shareBaseUrl, localVaults]);
 
   const toggleRulePrefix = (kind: "allow" | "deny", prefix: string) => {
@@ -493,12 +545,56 @@ export const AccessPage: React.FC<AccessPageProps> = ({
                 </button>
               </div>
 
+              {/* AI Agent Self-Install Prompt (wctx remote add) */}
+              <div className="space-y-2 rounded-xl border border-[var(--accent)]/45 bg-[var(--bg-surface)] p-3.5">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 font-bold text-[var(--ink-primary)]">
+                      <Bot className="h-3.5 w-3.5 text-[var(--accent)]" />
+                      让 AI 自动安装（推荐）
+                    </div>
+                    <div className="text-[var(--ink-muted)]">
+                      把这段指令发给同事，粘贴到他正在用的 AI（Claude Code / Codex / Cursor 等）即可：AI 会安装 wctx，并通过 <code className="font-mono">wctx remote add</code> 自动接入知识库、同步本机全部 AI 工具。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyToClipboard(shareData.agentPrompt).then(
+                        (ok) => ok && triggerCopied("agent", "已复制 AI 安装指令，粘贴给 AI 即可自动接入"),
+                      )
+                    }
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)]"
+                  >
+                    {copiedKind === "agent" ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    {copiedKind === "agent" ? "已复制指令" : "复制 AI 安装指令"}
+                  </button>
+                </div>
+                <details className="group">
+                  <summary className="cursor-pointer select-none text-[11px] font-medium text-[var(--ink-secondary)] hover:text-[var(--accent)]">
+                    预览指令内容
+                  </summary>
+                  <pre className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3 font-mono text-[11px] text-[var(--ink-primary)]">
+                    {shareData.agentPrompt}
+                  </pre>
+                </details>
+                {!shareConfig.isPlaceholder && (
+                  <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                    指令内含明文密钥，会进入对方 AI 的对话记录；建议仅分享 reader 权限密钥，泄露后可在下方列表中「重置密钥」。
+                  </p>
+                )}
+              </div>
+
               {/* Teammate Ready-to-Paste MCP Config */}
               <div className="space-y-3 rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] p-3.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <div className="font-bold text-[var(--ink-primary)]">
-                      复制给同事的 MCP 配置（同事电脑无需安装任何软件）
+                      或手动配置：复制给同事的 MCP 配置（无需安装 wctx）
                     </div>
                     <div className="text-[var(--ink-muted)]">
                       适用位置：{shareData.targetHint}
@@ -633,7 +729,7 @@ export const AccessPage: React.FC<AccessPageProps> = ({
                         (ok) => ok && triggerCopied("message", "已复制完整配置与使用说明，直接发给同事即可"),
                       )
                     }
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)]"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-3.5 py-1.5 font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)]/70"
                   >
                     {copiedKind === "message" ? (
                       <Check className="h-3.5 w-3.5" />
