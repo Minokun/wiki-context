@@ -117,10 +117,22 @@ TOOLS_SPEC: list[dict] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string", "description": "Full natural-language question from the user."},
+                "focus_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Recommended: 2-6 core domain entities, project codes, component names, or metrics "
+                        "extracted verbatim from the user's question (strip filler like 'briefly explain', "
+                        "'recent progress', 'overview'). Do NOT invent terms not asked by the user."
+                    ),
+                },
                 "expanded_terms": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional: 2-5 canonical technical terms or acronyms corresponding to colloquial phrasing.",
+                    "description": (
+                        "Optional: 0-4 canonical technical terms or acronyms mapping colloquial phrasing to "
+                        "standard domain terminology (recall boost only; never triggers missing-concept alerts)."
+                    ),
                 },
                 "max_tokens": {
                     "type": "integer",
@@ -561,34 +573,34 @@ class KBService:
         return all_lines[s_idx:e_idx], total
 
     def build_server_instructions(self, *, slim_remote: bool = False) -> str:
-        cheatsheet = self.context_engine.domain_cheatsheet()
+        headline = self.context_engine.domain_headline()
         is_zh = self.cfg.layout == "zh"
         if is_zh:
-            ref_part = f" {cheatsheet}。" if cheatsheet else ""
+            domain_part = f" 适用领域：{headline}。" if headline else ""
             search_note = (
                 "仅在用户明确要求枚举库内文档时才调 `wiki_list`。"
                 if slim_remote
                 else "仅在用户明确要求列出文件，或 `wiki_context` 未命中需做底层词面排查时，才使用 `wiki_list` / `wiki_search`。"
             )
             return (
-                f"知识库「{self.cfg.name}」（wiki-context）。{ref_part}\n"
-                f"- 回答问题时首选且单独调用一次 `wiki_context`（已融合同义词对齐、编译综述、一手原文与缺口诊断），不要在首轮并行陪跑 `wiki_search` 或 `wiki_list`；请直接传入自然提问，勿在提问末尾堆砌通用字段清单。\n"
+                f"知识库「{self.cfg.name}」（wiki-context）。{domain_part}\n"
+                f"- 回答问题时首选且单独调用一次 `wiki_context`（已融合同义词对齐、编译综述、一手原文与缺口诊断），不要在首轮并行陪跑 `wiki_search` 或 `wiki_list`；请在 `question` 保留完整原问，并在 `focus_terms` 传入从原问提纯的 2-6 个行业实体/代号/指标（剔除「简要说明、基本情况、最新进展」等提问壳子，严禁脑补原问未提及的词）。\n"
                 f"- 仅当 `wiki_context` 片段标注「继续深读」需补全上下文时调用 `wiki_read`；需核对扫描件、印章、图表或 PDF 原页版式时调用 `wiki_inspect_visual`（支持 `asset=\"page-001.png\"` 按页渲染 PDF）。{search_note}"
             )
-        ref_en = f" {cheatsheet}." if cheatsheet else ""
+        domain_en = f" Domain: {headline}." if headline else ""
         search_en = (
             "Call `wiki_list` ONLY when explicitly asked to list vault files."
             if slim_remote
             else "Use `wiki_list` / `wiki_search` ONLY when explicitly listing files or probing exact keywords after `wiki_context`."
         )
         return (
-            f"Knowledge vault '{self.cfg.name}' (wiki-context).{ref_en}\n"
-            f"- Call `wiki_context` first as a single standalone call to answer domain or factual questions; do NOT run `wiki_search` or `wiki_list` in parallel alongside it.\n"
+            f"Knowledge vault '{self.cfg.name}' (wiki-context).{domain_en}\n"
+            f"- Call `wiki_context` first as a single standalone call to answer domain or factual questions; do NOT run `wiki_search` or `wiki_list` in parallel alongside it. Keep the full natural-language query in `question` and supply 2-6 extracted domain terms in `focus_terms` (no invented terms).\n"
             f"- Follow `wiki_read` hints only when an excerpt is truncated; use `wiki_inspect_visual` to inspect figures, standalone images, or rendered PDF pages (`asset=\"page-001.png\"`). {search_en}"
         )
 
     def build_tools_spec(self, *, slim_remote: bool = False) -> list[dict]:
-        cheatsheet = self.context_engine.domain_cheatsheet()
+        profile_summary = self.context_engine.domain_profile_summary()
         is_zh = self.cfg.layout == "zh"
         vault_tag = f"【{self.cfg.name}】" if is_zh else f"[{self.cfg.name}] "
         allowed = {"wiki_context", "wiki_read", "wiki_inspect_visual", "wiki_list"} if slim_remote else None
@@ -600,11 +612,11 @@ class KBService:
                 continue
             item = dict(t)
             desc = t["description"]
-            if name == "wiki_context" and cheatsheet:
+            if name == "wiki_context" and profile_summary:
                 if is_zh:
-                    desc = f"{desc} 【本库领域参考】{cheatsheet}。若提问为口语，可在 expanded_terms 补充对应标准术语。"
+                    desc = f"{desc} 【本库领域画像】{profile_summary}。调用时请结合画像在 `focus_terms` 提炼 2-6 个原问关键词，口语映射可放 `expanded_terms`。"
                 else:
-                    desc = f"{desc} [Vault Reference] {cheatsheet}. Supply 2-5 canonical terms in `expanded_terms` when queries use slang."
+                    desc = f"{desc} [Vault Profile] {profile_summary}. Extract 2-6 query terms in `focus_terms`; map slang to canonical terms in `expanded_terms`."
             elif name == "wiki_list" and slim_remote:
                 desc = (
                     "Call ONLY when the user explicitly asks to list files/documents in the vault; "
@@ -622,6 +634,8 @@ class KBService:
         q = str(args.get("question") or "").strip()
         if not q:
             return {"error": "question must not be empty"}
+        ft = args.get("focus_terms")
+        ft_list = [str(x) for x in ft if isinstance(x, (str, int, float))] if isinstance(ft, list) else None
         exp = args.get("expanded_terms")
         exp_list = [str(x) for x in exp if isinstance(x, (str, int, float))] if isinstance(exp, list) else None
         max_toks = args.get("max_tokens")
@@ -630,6 +644,7 @@ class KBService:
         return self.context_engine.build(
             snap,
             q,
+            focus_terms=ft_list,
             expanded_terms=exp_list,
             max_tokens=max_toks_int,
             principal=user,
@@ -1208,6 +1223,13 @@ class KBService:
             return
         omit_q = bool(self.cfg.sensitive)
         query_str = "" if omit_q else str(args.get("question") or args.get("query") or args.get("source") or args.get("filter") or "")
+        if is_err and not query_str and not omit_q and isinstance(args, dict) and args:
+            try:
+                query_str = json.dumps(args, ensure_ascii=False)[:200]
+            except (TypeError, ValueError):
+                query_str = str(args)[:200]
+        raw_focus = [] if omit_q else (args.get("focus_terms") if isinstance(args.get("focus_terms"), list) else [])
+        raw_exp = [] if omit_q else (args.get("expanded_terms") if isinstance(args.get("expanded_terms"), list) else [])
         hit_sources: list[str] = []
         if isinstance(out, dict):
             for h in (out.get("wiki_hits") or ()):
@@ -1229,6 +1251,8 @@ class KBService:
             "tool": tool,
             "query": query_str,
             "omit_query": omit_q,
+            "focus_terms": [str(x) for x in raw_focus if isinstance(x, (str, int, float))],
+            "expanded_terms": [str(x) for x in raw_exp if isinstance(x, (str, int, float))],
             "route": str(out.get("route") or "") if isinstance(out, dict) else "",
             "elapsed_ms": elapsed_ms,
             "wiki_count": int(out.get("wiki_count") or len(out.get("wiki_hits") or ())) if isinstance(out, dict) else 0,

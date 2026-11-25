@@ -14,6 +14,7 @@ runs `lint_vault`, and refreshes the immutable FTS5 index.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from .config import VaultConfig
+from .config import VaultConfig, normalize_domain_profile, save_domain_profile
 from .freshness import (
     check_vault_freshness,
     clean_source_ref,
@@ -46,6 +47,8 @@ from .net import (
 )
 from .policy import IMAGE_EXTS, mirror_skip_reason
 from .search import is_excluded_source
+from .synonym_miner import _valid_term as _valid_synonym_term
+from .telemetry import scrub_telemetry_text
 
 LLMCallable = Callable[[str, str], str]
 
@@ -2049,6 +2052,16 @@ def compile_vault(
     idx_summary = rebuild_index(cfg.root)
     lint_report = lint_vault(cfg.root)
 
+    domain_profile_res: dict[str, Any] | None = None
+    if not was_cancelled:
+        try:
+            cfg_latest = VaultConfig.load(cfg.root)
+            need_dp, _reason_dp = should_refresh_domain_profile(cfg_latest, force=False)
+            if need_dp:
+                domain_profile_res = generate_domain_profile(cfg_latest.root, caller=caller, force=False)
+        except Exception:
+            domain_profile_res = None
+
     return {
         "vault": cfg.name,
         "compiled_pages": compiled_pages,
@@ -2063,4 +2076,275 @@ def compile_vault(
         "cancelled": was_cancelled,
         "lint": lint_report,
         "index": idx_summary,
+        "domain_profile": domain_profile_res,
+    }
+
+
+_CONTRACT_AMOUNT_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:万元|万|亿元|亿|元|rmb|usd|\$)", re.I)
+_SKIP_PROFILE_TITLES = frozenset({"页面名", "page", "title", "专题", "目录", "index", "log", "日志"})
+
+
+def _sanitize_profile_signal(text: str, *, max_len: int = 48) -> str:
+    clean = scrub_telemetry_text(str(text or ""))
+    clean = _CONTRACT_AMOUNT_RE.sub("[金额]", clean)
+    clean = " ".join(clean.split()).strip(" -_|·")
+    return clean[:max_len]
+
+
+def _read_vault_doc_counts(cfg: VaultConfig) -> tuple[int, int]:
+    """Read `(doc_count, wiki_count)` from active index summary, or count files directly if unindexed."""
+    cur_file = cfg.index_root / "current.json"
+    if cur_file.is_file():
+        try:
+            cur_meta = json.loads(cur_file.read_text(encoding="utf-8"))
+            gen_id = str(cur_meta.get("generation_id") or "").strip()
+            if gen_id and "/" not in gen_id and ".." not in gen_id:
+                sum_file = cfg.index_root / gen_id / "summary.json"
+                if sum_file.is_file():
+                    summ = json.loads(sum_file.read_text(encoding="utf-8"))
+                    if isinstance(summ, dict):
+                        return max(0, int(summ.get("docs") or 0)), max(0, int(summ.get("wiki_docs") or 0))
+        except (OSError, ValueError):
+            pass
+
+    doc_count = 0
+    if cfg.mirrors_root.is_dir():
+        for mp in cfg.mirrors_root.rglob("*.md"):
+            if mp.is_symlink():
+                continue
+            rel = mp.relative_to(cfg.mirrors_root).as_posix()
+            if not rel.startswith(".") and rel not in {"INDEX.md", "索引.md"}:
+                doc_count += 1
+    wiki_count = 0
+    if cfg.wiki_root.is_dir():
+        for wp in cfg.wiki_root.glob("*.md"):
+            if not wp.is_symlink():
+                wiki_count += 1
+    return doc_count, wiki_count
+
+
+def collect_domain_profile_signals(cfg: VaultConfig) -> dict[str, Any]:
+    """Collect privacy-scrubbed structural signals for AI Domain Profile synthesis."""
+    top_dirs: list[str] = []
+    seen_dirs: set[str] = set()
+
+    def _add_dir(name: str) -> None:
+        clean = _sanitize_profile_signal(name, max_len=40)
+        if not clean or clean.startswith(".") or clean.lower() in {"__pycache__", "node_modules"}:
+            return
+        low = clean.lower()
+        if low not in seen_dirs:
+            seen_dirs.add(low)
+            top_dirs.append(clean)
+
+    for mname, mpath in cfg.iter_source_roots():
+        if mname:
+            _add_dir(mname)
+        elif mpath.is_dir():
+            try:
+                for child in sorted(mpath.iterdir()):
+                    if child.is_dir() and not child.is_symlink():
+                        _add_dir(child.name)
+            except OSError:
+                pass
+
+    if cfg.mirrors_root.is_dir():
+        try:
+            for child in sorted(cfg.mirrors_root.iterdir()):
+                if child.is_dir() and not child.is_symlink():
+                    _add_dir(child.name)
+        except OSError:
+            pass
+
+    top_dirs_sorted = sorted(top_dirs, key=lambda x: x.lower())[:30]
+
+    wiki_titles: list[str] = []
+    seen_titles: set[str] = set()
+    if cfg.wiki_root.is_dir():
+        for wp in sorted(cfg.wiki_root.glob("*.md")):
+            if wp.is_symlink():
+                continue
+            stem = wp.stem.strip()
+            if stem.lower() in _SKIP_PROFILE_TITLES or stem in {"知识库总览", "Overview"}:
+                continue
+            san = _sanitize_profile_signal(stem, max_len=48)
+            if san and san.lower() not in seen_titles and san.lower() not in _SKIP_PROFILE_TITLES:
+                seen_titles.add(san.lower())
+                wiki_titles.append(san)
+            if len(wiki_titles) >= 24:
+                break
+
+    synonym_pairs: list[str] = []
+    if cfg.synonyms_path.is_file():
+        try:
+            syn_doc = json.loads(cfg.synonyms_path.read_text(encoding="utf-8"))
+            for grp in (syn_doc.get("groups") or ()):
+                if not isinstance(grp, dict):
+                    continue
+                cans = [str(c).strip() for c in (grp.get("canonical") or ()) if _valid_synonym_term(str(c).strip(), is_alias=False)]
+                als = [str(a).strip() for a in (grp.get("aliases") or ()) if _valid_synonym_term(str(a).strip(), is_alias=True)]
+                if cans and als:
+                    synonym_pairs.append(f"{cans[0]} ({'/'.join(als[:2])})")
+                if len(synonym_pairs) >= 15:
+                    break
+        except (OSError, ValueError):
+            pass
+
+    doc_count, wiki_count = _read_vault_doc_counts(cfg)
+    fp_payload = json.dumps(
+        {
+            "dirs": top_dirs_sorted,
+            "doc_bucket": doc_count // 25,
+            "wiki_bucket": wiki_count // 10,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    fingerprint = hashlib.sha256(fp_payload.encode("utf-8")).hexdigest()[:16]
+    return {
+        "vault_name": cfg.name,
+        "layout": cfg.layout,
+        "top_dirs": top_dirs_sorted,
+        "wiki_titles": wiki_titles,
+        "synonym_pairs": synonym_pairs,
+        "doc_count": doc_count,
+        "wiki_count": wiki_count,
+        "fingerprint": fingerprint,
+    }
+
+
+def should_refresh_domain_profile(cfg: VaultConfig, *, force: bool = False) -> tuple[bool, str]:
+    """Determine whether a vault's `domain_profile` needs AI generation or refresh."""
+    signals = collect_domain_profile_signals(cfg)
+    if signals["doc_count"] == 0 and signals["wiki_count"] == 0:
+        return False, "empty_vault"
+
+    existing = cfg.domain_profile if isinstance(cfg.domain_profile, dict) else {}
+    if not force and existing and (existing.get("locked") is True or existing.get("source") == "manual"):
+        return False, "locked_manual"
+    if force:
+        return True, "forced"
+    if not existing or not existing.get("domain") or existing.get("source") != "auto":
+        return True, "missing"
+
+    prev_dirs = sorted([str(x).strip() for x in (existing.get("top_dirs_at_gen") or ()) if str(x).strip()], key=lambda x: x.lower())
+    if prev_dirs != signals["top_dirs"]:
+        return True, "top_dirs_changed"
+
+    prev_docs = int(existing.get("doc_count_at_gen") or 0)
+    prev_wiki = int(existing.get("wiki_count_at_gen") or 0)
+    if (
+        abs(signals["doc_count"] - prev_docs) >= max(10, int(max(prev_docs, 1) * 0.25))
+        or abs(signals["wiki_count"] - prev_wiki) >= max(10, int(max(prev_wiki, 1) * 0.25))
+    ):
+        return True, "scale_growth"
+    return False, "up_to_date"
+
+
+def _parse_domain_profile_json(raw_reply: str) -> dict[str, Any]:
+    txt = (raw_reply or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt).strip()
+    try:
+        parsed = json.loads(txt)
+        if isinstance(parsed, dict):
+            return parsed
+    except ValueError:
+        pass
+    m = re.search(r"\{[\s\S]*\}", txt)
+    if m:
+        parsed = json.loads(m.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"LLM 未返回有效的领域画像 JSON: {txt[:160]}")
+
+
+def generate_domain_profile(
+    vault: Path | str,
+    *,
+    llm_cfg: dict[str, Any] | None = None,
+    caller: LLMCallable | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Synthesize an ACL-safe `domain_profile` via one LLM call and persist to `vault.json`."""
+    cfg = VaultConfig.load(vault)
+    need, reason = should_refresh_domain_profile(cfg, force=force)
+    if not need:
+        return {
+            "vault": cfg.name,
+            "generated": False,
+            "skipped": True,
+            "reason": reason,
+            "profile": cfg.domain_profile,
+        }
+
+    eff_cfg = llm_cfg or {}
+    eff_base = str(eff_cfg.get("base_url") or os.environ.get("WCTX_BASE_URL") or "").strip()
+    if cfg.sensitive and caller is None and eff_base and not is_local_llm_url(eff_base):
+        raise ValueError(
+            f"Vault '{cfg.name}' is marked `sensitive: true`; refusing remote LLM endpoint '{eff_base}' for domain profile."
+        )
+
+    eff_caller = caller or build_http_llm_caller(
+        model=eff_cfg.get("model"),
+        base_url=eff_cfg.get("base_url"),
+        api_key=eff_cfg.get("api_key"),
+        protocol=str(eff_cfg.get("protocol") or "openai"),
+        max_tokens=1024,
+        disable_thinking=bool(eff_cfg.get("disable_thinking", False)),
+    )
+
+    signals = collect_domain_profile_signals(cfg)
+    is_zh = cfg.layout == "zh"
+    lang_note = "Simplified Chinese" if is_zh else "English"
+    sys_prompt = (
+        "You are a knowledge-vault domain profiler for an AI search gateway.\n"
+        f"Output ONLY a valid JSON object in {lang_note} with keys:\n"
+        '{"domain": "...", "entity_hints": ["...", "..."], "query_tips": "..."}\n'
+        "Strict rules:\n"
+        "1. Summarize ONLY the industry/engineering scope, typical entity naming formats (e.g. project code patterns like JCxx-xx, device/line/standard types), and keyword-extraction tips.\n"
+        "2. NEVER include contract prices/amounts, personal names, confidential client deals, emails, phone numbers, or credentials.\n"
+        "3. `domain` <= 60 chars; `entity_hints`: 3-5 short items <= 28 chars each; `query_tips` <= 60 chars.\n"
+        "4. Return raw JSON only (no markdown fences or explanation)."
+    )
+    user_payload = json.dumps(
+        {
+            "vault_name": signals["vault_name"],
+            "top_directories": signals["top_dirs"],
+            "sample_wiki_titles": signals["wiki_titles"],
+            "domain_terminology": signals["synonym_pairs"],
+            "counts": {"docs": signals["doc_count"], "wiki_pages": signals["wiki_count"]},
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    raw_reply = eff_caller(sys_prompt, user_payload)
+    parsed = _parse_domain_profile_json(raw_reply)
+
+    scrubbed_raw = {
+        "domain": _sanitize_profile_signal(str(parsed.get("domain") or ""), max_len=80),
+        "entity_hints": [
+            _sanitize_profile_signal(str(x), max_len=36)
+            for x in (parsed.get("entity_hints") or ())
+            if str(x).strip()
+        ],
+        "query_tips": _sanitize_profile_signal(str(parsed.get("query_tips") or ""), max_len=80),
+        "source": "auto",
+        "locked": False,
+        "fingerprint": signals["fingerprint"],
+        "top_dirs_at_gen": signals["top_dirs"],
+        "doc_count_at_gen": signals["doc_count"],
+        "wiki_count_at_gen": signals["wiki_count"],
+        "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    saved = save_domain_profile(cfg.root, scrubbed_raw)
+    if not saved or not saved.get("domain"):
+        raise ValueError("LLM 返回的领域画像缺少有效 domain 字段")
+    return {
+        "vault": cfg.name,
+        "generated": True,
+        "skipped": False,
+        "reason": reason,
+        "profile": saved,
     }

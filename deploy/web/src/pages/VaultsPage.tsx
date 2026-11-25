@@ -174,6 +174,55 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
   const [synGroups, setSynGroups] = useState<{ canonical: string; aliases: string }[]>([]);
   const [synLoading, setSynLoading] = useState(false);
 
+  // Domain Profile state (AI auto-maintained or manually locked)
+  const [profileDomain, setProfileDomain] = useState("");
+  const [profileHints, setProfileHints] = useState("");
+  const [profileTips, setProfileTips] = useState("");
+  const [profileBusy, setProfileBusy] = useState<"" | "save" | "generate" | "unlock">("");
+
+  useEffect(() => {
+    const dp = activeVault?.domain_profile;
+    setProfileDomain(dp?.domain || "");
+    setProfileHints((dp?.entity_hints || []).join(" / "));
+    setProfileTips(dp?.query_tips || "");
+  }, [activeVault?.id, activeVault?.domain_profile?.domain, activeVault?.domain_profile?.updated_at, activeVault?.domain_profile?.locked]);
+
+  const handleDomainProfileAction = async (action: "save" | "generate" | "unlock") => {
+    if (!activeVault || activeVault.kind !== "local" || profileBusy) return;
+    setProfileBusy(action);
+    try {
+      const hints = profileHints
+        .split(/[/、,，\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 6);
+      const res = await api.saveDomainProfile({
+        vault_id: activeVault.id,
+        action,
+        ...(action === "save"
+          ? { domain: profileDomain.trim(), entity_hints: hints, query_tips: profileTips.trim() }
+          : {}),
+      });
+      if (action === "generate") {
+        onToast("success", `已通过 AI 生成「${activeVault.name}」的领域画像`);
+      } else if (action === "unlock") {
+        onToast("info", "已恢复 AI 自动维护，目录/文档增长时将自动更新");
+      } else {
+        onToast("success", `已保存「${activeVault.name}」的手动领域画像（已锁定）`);
+      }
+      if (res.domain_profile) {
+        setProfileDomain(res.domain_profile.domain || "");
+        setProfileHints((res.domain_profile.entity_hints || []).join(" / "));
+        setProfileTips(res.domain_profile.query_tips || "");
+      }
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setProfileBusy("");
+    }
+  };
+
   // Layer-4 Memory state
   const [memItems, setMemItems] = useState<MemoryItem[]>([]);
   const [memStatusFilter, setMemStatusFilter] = useState("active");
@@ -1367,6 +1416,135 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                     </div>
                   )}
                 </div>
+              )}
+
+              {/* Collapsible Domain Profile Panel (AI Auto-Maintained + Manual Override) */}
+              {activeVault && activeVault.kind === "local" && (
+                <details className="group rounded-xl border border-[var(--border-default)] bg-[var(--bg-subtle)] p-4">
+                  <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 text-[13px] font-bold text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]">
+                    <span className="inline-flex items-center gap-2">
+                      <Sparkles className="h-4 w-4 text-[var(--accent)]" />
+                      <span>领域画像（用于引导 AI 精准提词）</span>
+                      <span
+                        className={`rounded px-2 py-0.5 text-[11px] font-semibold ${
+                          activeVault.domain_profile?.locked || activeVault.domain_profile?.source === "manual"
+                            ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300"
+                            : activeVault.domain_profile?.domain
+                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                              : "bg-[var(--bg-muted)] text-[var(--ink-muted)]"
+                        }`}
+                      >
+                        {activeVault.domain_profile?.locked || activeVault.domain_profile?.source === "manual"
+                          ? "已手动锁定"
+                          : activeVault.domain_profile?.domain
+                            ? "AI 自动维护"
+                            : "待生成"}
+                      </span>
+                    </span>
+                    <span className="max-w-full truncate font-normal text-xs text-[var(--ink-muted)]">
+                      {activeVault.domain_profile?.domain || "展开查看或手动配置"}
+                    </span>
+                  </summary>
+
+                  <form
+                    method="POST"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void handleDomainProfileAction("save");
+                    }}
+                    className="mt-4 space-y-3 border-t border-[var(--border-subtle)] pt-3 text-xs"
+                  >
+                    <div>
+                      <label
+                        htmlFor={`dp-domain-${activeVault.id}`}
+                        className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                      >
+                        行业与业务范围（≤60字，勿包含机密客户或金额）
+                      </label>
+                      <input
+                        id={`dp-domain-${activeVault.id}`}
+                        name="domain"
+                        value={profileDomain}
+                        onChange={(e) => setProfileDomain(e.target.value)}
+                        placeholder="例：轨道交通弓网在线监测、接触网/靴轨检测及软硬件交付项目"
+                        className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        htmlFor={`dp-hints-${activeVault.id}`}
+                        className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                      >
+                        核心实体命名格式（用 / 分隔，3–5 项）
+                      </label>
+                      <input
+                        id={`dp-hints-${activeVault.id}`}
+                        name="entity_hints"
+                        value={profileHints}
+                        onChange={(e) => setProfileHints(e.target.value)}
+                        placeholder="例：项目号(JCxx-xx) / 线路与车型 / 核心器件与指标(CTA120/导高/拉出值)"
+                        className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        htmlFor={`dp-tips-${activeVault.id}`}
+                        className="mb-1 block font-medium text-[var(--ink-secondary)]"
+                      >
+                        AI 提词建议
+                      </label>
+                      <textarea
+                        id={`dp-tips-${activeVault.id}`}
+                        name="query_tips"
+                        rows={2}
+                        value={profileTips}
+                        onChange={(e) => setProfileTips(e.target.value)}
+                        placeholder="例：优先提炼项目号、线路、设备名与指标，剔除「简要说明、最近进展」等泛化问法"
+                        className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={Boolean(profileBusy) || !llmCompiler?.ready}
+                          onClick={() => void handleDomainProfileAction("generate")}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-1.5 font-semibold text-[var(--ink-primary)] hover:bg-[var(--bg-muted)] disabled:opacity-50"
+                        >
+                          {profileBusy === "generate" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          )}
+                          AI 重新生成
+                        </button>
+                        {(activeVault.domain_profile?.locked || activeVault.domain_profile?.source === "manual") && (
+                          <button
+                            type="button"
+                            disabled={Boolean(profileBusy)}
+                            onClick={() => void handleDomainProfileAction("unlock")}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] px-3 py-1.5 font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)] disabled:opacity-50"
+                          >
+                            恢复 AI 自动维护
+                          </button>
+                        )}
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={Boolean(profileBusy) || !profileDomain.trim()}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                      >
+                        {profileBusy === "save" ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Check className="h-3.5 w-3.5" />
+                        )}
+                        保存手动画像
+                      </button>
+                    </div>
+                  </form>
+                </details>
               )}
             </div>
           )}

@@ -38,6 +38,17 @@ _BLOCKLIST_ALIAS_WORDS = frozenset({
     "可选", "默认", "备注", "说明", "参见", "详见", "例如", "必填", "正常", "异常", "其他", "其它",
 })
 
+_UNIT_AND_NOISE_ALIASES = frozenset({
+    "mm", "nm", "nmm", "cm", "km", "kmh", "kmb", "ms", "fps", "fips", "deg",
+    "hz", "khz", "mhz", "kv", "mv", "ma", "kw", "mw", "db", "kg", "min", "sec",
+    "ppm", "name", "id", "no", "sn", "type", "code", "num", "max", "avg", "sum",
+})
+
+_BAD_CJK_PREFIX_RE = re.compile(
+    r"^(?:的|了|着|过|个|选配|总|图示|实测|设定|设计|颜色|用于|采用|使用|包含|其中)"
+)
+_BAD_CJK_CONNECTOR_RE = re.compile(r"(?:与.*间|的.*用)")
+
 
 def _clean_term(raw: str) -> str:
     s = re.sub(r"[`*~]+", "", raw or "").strip(" _\t\r\n.,;:，。；：\"'")
@@ -45,14 +56,19 @@ def _clean_term(raw: str) -> str:
     return s
 
 
-def _valid_term(t: str) -> bool:
+def _valid_term(t: str, *, is_alias: bool = False) -> bool:
     if not t or len(t) < 2 or len(t) > 40:
         return False
     low = t.lower()
     if low in _BLOCKLIST_ALIAS_WORDS:
         return False
+    if is_alias and low in _UNIT_AND_NOISE_ALIASES:
+        return False
     if re.fullmatch(r"[\d.\-+%/ ]+", t):
         return False
+    if not is_alias:
+        if _BAD_CJK_PREFIX_RE.match(t) or _BAD_CJK_CONNECTOR_RE.search(t):
+            return False
     return True
 
 
@@ -77,7 +93,9 @@ def _mine_from_markdown_tables(md_text: str) -> list[tuple[str, list[str]]]:
                         aliases = [
                             cells[a_i]
                             for a_i in alias_cols
-                            if a_i < len(cells) and _valid_term(cells[a_i]) and cells[a_i].lower() != canon.lower()
+                            if a_i < len(cells)
+                            and _valid_term(cells[a_i], is_alias=True)
+                            and cells[a_i].lower() != canon.lower()
                         ]
                         if aliases:
                             pairs.append((canon, aliases))
@@ -93,31 +111,45 @@ def _mine_from_inline_prose(md_text: str) -> list[tuple[str, list[str]]]:
     for m in _INLINE_CJK_PAREN_RE.finditer(md_text):
         c_term = _clean_term(m.group(1))
         raw_in = _clean_term(m.group(2))
+        if len(c_term) > 14:
+            continue
         # Handle `English Name / ABBR` inside parentheses
         sub_aliases = [_clean_term(p) for p in re.split(r"[/,，;；|]+", raw_in)]
-        sub_aliases = [a for a in sub_aliases if _valid_term(a) and a.lower() != c_term.lower()]
+        sub_aliases = [
+            a for a in sub_aliases if _valid_term(a, is_alias=True) and a.lower() != c_term.lower()
+        ]
         if _valid_term(c_term) and sub_aliases:
             pairs.append((c_term, sub_aliases))
 
     for m in _INLINE_CJK_ALIAS_PAREN_RE.finditer(md_text):
         c_term = _clean_term(m.group(1))
         raw_in = _clean_term(m.group(2))
+        if len(c_term) > 14:
+            continue
         sub_aliases = [_clean_term(p) for p in re.split(r"[、/,，;；|]+", raw_in)]
-        sub_aliases = [a for a in sub_aliases if _valid_term(a) and a.lower() != c_term.lower()]
+        sub_aliases = [
+            a for a in sub_aliases if _valid_term(a, is_alias=True) and a.lower() != c_term.lower()
+        ]
         if _valid_term(c_term) and sub_aliases:
             pairs.append((c_term, sub_aliases))
 
     for m in _INLINE_EN_ACRONYM_RE.finditer(md_text):
         full_en = _clean_term(m.group(1))
         acr = _clean_term(m.group(2))
-        if _valid_term(full_en) and _valid_term(acr):
+        if _valid_term(full_en) and _valid_term(acr, is_alias=True):
             # Initials sanity check: first letter of acronym matches first letter of phrase
             if full_en[0].upper() == acr[0].upper():
                 pairs.append((full_en, [acr]))
     return pairs
 
 
-def mine_synonyms(vault: Path | str, *, apply: bool = False, max_groups: int = 200) -> dict:
+def mine_synonyms(
+    vault: Path | str,
+    *,
+    apply: bool = False,
+    max_groups: int = 200,
+    clean_existing: bool = False,
+) -> dict:
     """Mine candidate canonical-alias groups from mirrors & Wiki pages."""
     cfg = VaultConfig.load(vault)
     files_to_scan: list[Path] = []
@@ -168,7 +200,35 @@ def mine_synonyms(vault: Path | str, *, apply: bool = False, max_groups: int = 2
         except (OSError, ValueError):
             pass
 
-    existing_groups = list(existing_doc.get("groups") or ())
+    existing_groups_raw = list(existing_doc.get("groups") or ())
+    cleaned_removed = 0
+    existing_groups: list[dict] = []
+    if clean_existing:
+        for g in existing_groups_raw:
+            if not isinstance(g, dict):
+                cleaned_removed += 1
+                continue
+            cans = [
+                _clean_term(str(c))
+                for c in (g.get("canonical") or ())
+                if _valid_term(_clean_term(str(c)), is_alias=False)
+            ]
+            als = [
+                _clean_term(str(a))
+                for a in (g.get("aliases") or ())
+                if _valid_term(_clean_term(str(a)), is_alias=True)
+            ]
+            can_low = {c.lower() for c in cans}
+            als = [a for a in als if a.lower() not in can_low]
+            if cans and als:
+                if len(cans) < len(g.get("canonical") or ()) or len(als) < len(g.get("aliases") or ()):
+                    cleaned_removed += 1
+                existing_groups.append({"canonical": cans, "aliases": als})
+            else:
+                cleaned_removed += 1
+    else:
+        existing_groups = existing_groups_raw
+
     known_terms: set[str] = set()
     for g in existing_groups:
         if isinstance(g, dict):
@@ -191,7 +251,8 @@ def mine_synonyms(vault: Path | str, *, apply: bool = False, max_groups: int = 2
         if len(new_groups) >= max_groups:
             break
 
-    if apply and new_groups:
+    applied = bool(apply and (new_groups or cleaned_removed > 0))
+    if applied:
         merged_groups = [*existing_groups, *new_groups]
         out_doc = {
             "version": existing_doc.get("version", 1),
@@ -206,6 +267,7 @@ def mine_synonyms(vault: Path | str, *, apply: bool = False, max_groups: int = 2
         "vault": cfg.name,
         "scanned_files": len(files_to_scan),
         "discovered_groups": len(new_groups),
-        "applied": bool(apply and new_groups),
+        "cleaned_removed": cleaned_removed,
+        "applied": applied,
         "groups": new_groups,
     }

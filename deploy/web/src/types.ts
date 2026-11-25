@@ -36,6 +36,19 @@ export interface SourceMountInfo {
   available: boolean;
 }
 
+export interface DomainProfile {
+  domain: string;
+  entity_hints: string[];
+  query_tips: string;
+  source?: "auto" | "manual" | string;
+  locked?: boolean;
+  fingerprint?: string;
+  top_dirs_at_gen?: string[];
+  doc_count_at_gen?: number;
+  wiki_count_at_gen?: number;
+  updated_at?: string;
+}
+
 export interface LlmProviderPreset {
   id: string;
   label: string;
@@ -117,6 +130,7 @@ export interface VaultInfo {
   sources_dir?: string;
   wiki_dir?: string;
   notes_dir?: string;
+  domain_profile?: DomainProfile;
   source_prefixes?: string[];
   folder_tree?: FolderTreeNode[];
   sample_sources?: string[];
@@ -141,6 +155,8 @@ export interface TokenRecord {
   allowed_vaults: string[];
   disabled: boolean;
   created_at: string;
+  /** True when the console still holds this key's raw secret and can copy it in one click. */
+  copyable?: boolean;
 }
 
 export interface AclRule {

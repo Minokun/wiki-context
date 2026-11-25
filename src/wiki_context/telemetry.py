@@ -204,6 +204,11 @@ def _open_wal_connection(db_path: Path) -> sqlite3.Connection:
     con.execute("CREATE INDEX IF NOT EXISTS idx_inv_ts ON mcp_invocations(ts_epoch DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_inv_vault ON mcp_invocations(vault_id, id DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_inv_client ON mcp_invocations(client, id DESC)")
+    existing_cols = {str(r[1]) for r in con.execute("PRAGMA table_info(mcp_invocations)").fetchall()}
+    if "focus_terms_json" not in existing_cols:
+        con.execute("ALTER TABLE mcp_invocations ADD COLUMN focus_terms_json TEXT NOT NULL DEFAULT '[]'")
+    if "expanded_terms_json" not in existing_cols:
+        con.execute("ALTER TABLE mcp_invocations ADD COLUMN expanded_terms_json TEXT NOT NULL DEFAULT '[]'")
     con.commit()
     _ensure_private_file(db_path)
     return con
@@ -214,8 +219,9 @@ INSERT INTO mcp_invocations (
     ts, ts_epoch, client, mode, principal_uid, vault_id, tool,
     query_redacted, route, elapsed_ms,
     wiki_count, primary_count, memory_count, acl_filtered_count,
-    missing_concepts_json, hit_sources_json, is_error, error_text
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    missing_concepts_json, hit_sources_json, is_error, error_text,
+    focus_terms_json, expanded_terms_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -275,6 +281,16 @@ class TelemetryStore:
         acl_filtered_count = int(event.get("acl_filtered_count") or 0)
         missing = [str(x)[:80] for x in (event.get("missing_concepts") or [])[:16]]
         hits = [str(x)[:200] for x in (event.get("hit_sources") or [])[:20]]
+        focus_terms = (
+            []
+            if (event.get("omit_query") or not is_telemetry_query_logging_enabled())
+            else [scrub_telemetry_text(str(x))[:80] for x in (event.get("focus_terms") or ()) if str(x).strip()][:8]
+        )
+        expanded_terms = (
+            []
+            if (event.get("omit_query") or not is_telemetry_query_logging_enabled())
+            else [scrub_telemetry_text(str(x))[:80] for x in (event.get("expanded_terms") or ()) if str(x).strip()][:8]
+        )
         is_error = 1 if event.get("is_error") else 0
         error_text = scrub_telemetry_text(str(event.get("error_text") or ""))[:300]
         return (
@@ -296,6 +312,8 @@ class TelemetryStore:
             json.dumps(hits, ensure_ascii=False),
             is_error,
             error_text,
+            json.dumps(focus_terms, ensure_ascii=False),
+            json.dumps(expanded_terms, ensure_ascii=False),
         )
 
     def record(self, event: dict[str, Any]) -> None:
@@ -439,6 +457,14 @@ class TelemetryStore:
             hits = json.loads(r[16]) if r[16] else []
         except ValueError:
             hits = []
+        try:
+            focus_terms = json.loads(r[19]) if (len(r) > 19 and r[19]) else []
+        except ValueError:
+            focus_terms = []
+        try:
+            expanded_terms = json.loads(r[20]) if (len(r) > 20 and r[20]) else []
+        except ValueError:
+            expanded_terms = []
         return {
             "id": int(r[0]),
             "ts": r[1],
@@ -459,6 +485,8 @@ class TelemetryStore:
             "hit_sources": hits,
             "is_error": bool(r[17]),
             "error_text": r[18],
+            "focus_terms": focus_terms,
+            "expanded_terms": expanded_terms,
         }
 
     def _open_ro(self) -> sqlite3.Connection:
@@ -511,7 +539,8 @@ class TelemetryStore:
         sql = (
             "SELECT id, ts, ts_epoch, client, mode, principal_uid, vault_id, tool, "
             "query_redacted, route, elapsed_ms, wiki_count, primary_count, memory_count, "
-            "acl_filtered_count, missing_concepts_json, hit_sources_json, is_error, error_text "
+            "acl_filtered_count, missing_concepts_json, hit_sources_json, is_error, error_text, "
+            "focus_terms_json, expanded_terms_json "
             f"FROM mcp_invocations WHERE {' AND '.join(clauses)} ORDER BY id DESC LIMIT ?"
         )
         params.append(lim)
@@ -533,7 +562,8 @@ class TelemetryStore:
             rows = con.execute(
                 "SELECT id, ts, ts_epoch, client, mode, principal_uid, vault_id, tool, "
                 "query_redacted, route, elapsed_ms, wiki_count, primary_count, memory_count, "
-                "acl_filtered_count, missing_concepts_json, hit_sources_json, is_error, error_text "
+                "acl_filtered_count, missing_concepts_json, hit_sources_json, is_error, error_text, "
+                "focus_terms_json, expanded_terms_json "
                 "FROM mcp_invocations WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(after_id), max(1, min(int(limit), 200))),
             ).fetchall()

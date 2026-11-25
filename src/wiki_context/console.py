@@ -44,12 +44,14 @@ from .clients import (
     resolve_wctx_command,
     sync_client_mcp_config,
 )
-from .config import VaultConfig
+from .config import VaultConfig, normalize_domain_profile, save_domain_profile
 from .compiler import (
     LLM_PROVIDER_PRESETS,
     compile_vault,
+    generate_domain_profile,
     is_local_llm_url,
     plan_compilation,
+    should_refresh_domain_profile,
     test_llm_connection,
 )
 from .context import AllowAllPolicy, PrefixACLPolicy, Principal, SynonymBook
@@ -353,6 +355,44 @@ def load_console_vault_map(config_dir: Path | str | None = None) -> tuple[dict[s
     return vmap, tokens_file
 
 
+TOKEN_SECRETS_FILENAME = "token_secrets.json"
+
+
+def _load_token_secrets(config_dir: Path) -> dict[str, str]:
+    """Read the private ``token_secrets.json`` map ``{token_id: raw_secret}`` (callers hold the state lock)."""
+    p = config_dir / TOKEN_SECRETS_FILENAME
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    raw = d.get("secrets") if isinstance(d, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(v, str) and v}
+
+
+def _write_token_secret_locked(config_dir: Path, token_id: str, raw_secret: str | None) -> None:
+    """Set (or drop when ``raw_secret`` is None) one token's raw secret; callers hold the state lock.
+
+    Raw secrets live outside ``tokens.json`` (which keeps SHA-256 only) in a 0600 file so the
+    console can offer one-click copy of issued keys without leaking them into token listings.
+    """
+    secrets_map = _load_token_secrets(config_dir)
+    if raw_secret is None:
+        if token_id not in secrets_map:
+            return
+        secrets_map.pop(token_id, None)
+    else:
+        secrets_map[token_id] = raw_secret
+    _atomic_write_json(
+        config_dir / TOKEN_SECRETS_FILENAME,
+        {"version": 1, "secrets": secrets_map},
+        private_mode=True,
+    )
+
+
 def _mint_token_into_file(
     tok_path: Path,
     lock_path: Path,
@@ -403,6 +443,7 @@ def _mint_token_into_file(
                 r["id"] = f"tok_legacy_{i}"
         doc["tokens"].append(record)
         _atomic_write_json(tok_path, doc, private_mode=True)
+        _write_token_secret_locked(tok_path.parent, tok_id, raw_secret)
 
     return {
         "token": raw_secret,
@@ -532,6 +573,7 @@ class ConsoleState:
         self._job_cancel_events: dict[str, threading.Event] = {}
         self._compile_finished_ts: dict[str, float] = {}
         self._compile_plan_cache: dict[str, tuple[tuple[str, int, bool, bool], dict[str, int]]] = {}
+        self._profile_gen_inflight: set[str] = set()
         self._job_lock = threading.Lock()
         self._hydrating_vaults: set[str] = set()
         self._vault_access_errors: dict[str, str] = {}
@@ -610,6 +652,7 @@ class ConsoleState:
                     self._refresh_watcher_targets()
                     if enable_watcher:
                         self._watcher.start()
+                        self._trigger_startup_profile_backfill([vid for vid, _ in local_specs])
                 except Exception:
                     pass
 
@@ -618,6 +661,7 @@ class ConsoleState:
             self._refresh_watcher_targets(init_data)
             if enable_watcher:
                 self._watcher.start()
+                self._trigger_startup_profile_backfill([vid for vid, _ in local_specs])
 
         lan_cfg = init_data.get("lan_gateway")
         if isinstance(lan_cfg, dict) and lan_cfg.get("enabled"):
@@ -997,7 +1041,111 @@ class ConsoleState:
             elif "api_key" in payload and str(payload.get("api_key") or "").strip():
                 self._save_llm_secret(str(payload["api_key"]).strip())
 
+        rt_after = self._resolve_llm_runtime()
+        if rt_after.get("ready"):
+            for v in self._load_console_data().get("vaults") or []:
+                if isinstance(v, dict) and v.get("kind") != "remote" and v.get("id"):
+                    self.maybe_auto_generate_domain_profile_async(str(v["id"]), reason="llm_configured")
+
         return self.get_llm_compiler_status()
+
+    def _trigger_startup_profile_backfill(self, vault_ids: list[str]) -> None:
+        if not vault_ids:
+            return
+        rt = self._resolve_llm_runtime()
+        if not rt.get("ready"):
+            return
+        for vid in vault_ids:
+            self.maybe_auto_generate_domain_profile_async(vid, reason="startup_backfill")
+
+    def maybe_auto_generate_domain_profile_async(
+        self,
+        vault_id: str,
+        *,
+        reason: str = "",
+        force: bool = False,
+        caller: Any | None = None,
+    ) -> bool:
+        """Spawn a coalesced background AI domain-profile synthesis task if needed and permitted."""
+        try:
+            vpath = self.get_vault_path(vault_id)
+        except Exception:
+            return False
+        if not vpath.is_dir():
+            return False
+        rt = self._resolve_llm_runtime()
+        if caller is None and not rt.get("ready"):
+            return False
+        try:
+            cfg = VaultConfig.load(vpath)
+        except Exception:
+            return False
+        if cfg.sensitive and caller is None and not is_local_llm_url(str(rt.get("base_url") or "")):
+            return False
+        need, _ = should_refresh_domain_profile(cfg, force=force)
+        if not need:
+            return False
+        with self._job_lock:
+            if vault_id in self._profile_gen_inflight:
+                return False
+            self._profile_gen_inflight.add(vault_id)
+
+        def _worker() -> None:
+            try:
+                generate_domain_profile(vpath, llm_cfg=rt, caller=caller, force=force)
+            except Exception:
+                pass
+            finally:
+                with self._job_lock:
+                    self._profile_gen_inflight.discard(vault_id)
+
+        threading.Thread(
+            target=_worker,
+            name=f"wctx-profile-{vault_id}",
+            daemon=True,
+        ).start()
+        return True
+
+    def save_vault_domain_profile(self, vault_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Manually update, unlock for AI auto-maintenance, or force-regenerate a vault's domain profile."""
+        vpath = self.get_vault_path(vault_id)
+        action = str(payload.get("action") or "save").strip().lower()
+        if action == "generate":
+            rt = self._resolve_llm_runtime()
+            if not rt.get("ready"):
+                raise ValueError("尚未配置可用的整理模型（LLM），无法自动生成领域画像")
+            res = generate_domain_profile(vpath, llm_cfg=rt, force=True)
+            return {
+                "vault_id": vault_id,
+                "action": "generate",
+                "domain_profile": res.get("profile") or {},
+            }
+        cfg = VaultConfig.load(vpath)
+        if action == "unlock":
+            cur = dict(cfg.domain_profile or {})
+            if cur:
+                cur["locked"] = False
+                cur["source"] = "auto"
+                saved = save_domain_profile(vpath, cur)
+            else:
+                saved = {}
+            return {"vault_id": vault_id, "action": "unlock", "domain_profile": saved}
+
+        prev = dict(cfg.domain_profile or {})
+        manual_doc = normalize_domain_profile({
+            "domain": payload.get("domain") or "",
+            "entity_hints": payload.get("entity_hints") or [],
+            "query_tips": payload.get("query_tips") or "",
+            "source": "manual",
+            "locked": True,
+            "fingerprint": prev.get("fingerprint") or "",
+            "top_dirs_at_gen": prev.get("top_dirs_at_gen") or [],
+            "doc_count_at_gen": prev.get("doc_count_at_gen") or 0,
+            "wiki_count_at_gen": prev.get("wiki_count_at_gen") or 0,
+            "updated_at": _now_iso(),
+        })
+        saved = save_domain_profile(vpath, manual_doc)
+        return {"vault_id": vault_id, "action": "save", "domain_profile": saved}
 
     def _effective_compile_flags(self, cfg: VaultConfig, rt: dict[str, Any] | None = None) -> tuple[bool, bool]:
         """Resolve per-vault `(skip_csv, project_rollup)` honoring explicit `vault.json` overrides."""
@@ -1359,6 +1507,7 @@ class ConsoleState:
             entry["sources_dir"] = cfg.sources_dir
             entry["wiki_dir"] = cfg.wiki_dir
             entry["notes_dir"] = cfg.notes_dir
+            entry["domain_profile"] = cfg.domain_profile
             if cfg.sources_path is not None and not cfg.sources_root.is_dir():
                 entry["online_error"] = (
                     f"原始文档目录暂不可访问或已移动：{cfg.sources_root}（历史索引仍可查询，可使用“重定位源目录”恢复同步）"
@@ -1655,6 +1804,8 @@ class ConsoleState:
             uncompiled_cnt = 0
         if should_compile and rt["ready"] and uncompiled_cnt > 0:
             compile_job = self.start_compile_job(vid, trigger="onboard")
+        elif rt["ready"]:
+            self.maybe_auto_generate_domain_profile_async(vid, reason="onboard")
         return {
             "vault_id": vid,
             **rep,
@@ -1678,6 +1829,8 @@ class ConsoleState:
         compile_job: dict[str, Any] | None = None
         if rt["ready"] and rt["auto_compile_on_sync"]:
             compile_job = self.start_compile_job(vault_id, trigger="import")
+        if rt["ready"] and (not compile_job or compile_job.get("status") != "running"):
+            self.maybe_auto_generate_domain_profile_async(vault_id, reason="import")
         return {"vault_id": vault_id, **rep, "llm_ready": rt["ready"], "compile_job": compile_job}
 
     def mount_folder(self, *, vault_id: str, external_folder: str, mount_name: str = "") -> dict[str, Any]:
@@ -1695,6 +1848,8 @@ class ConsoleState:
         compile_job: dict[str, Any] | None = None
         if rt["ready"] and rt["auto_compile_on_sync"]:
             compile_job = self.start_compile_job(vault_id, trigger="mount")
+        if rt["ready"] and (not compile_job or compile_job.get("status") != "running"):
+            self.maybe_auto_generate_domain_profile_async(vault_id, reason="mount")
         return {"vault_id": vault_id, **rep, "llm_ready": rt["ready"], "compile_job": compile_job}
 
     def unmount_folder(self, *, vault_id: str, mount_name: str, purge_mirrors: bool = True) -> dict[str, Any]:
@@ -2271,10 +2426,13 @@ class ConsoleState:
             try:
                 res = self.sync_registered_vault(vault_id, force=force)
                 rt = self._resolve_llm_runtime()
+                cjob: dict[str, Any] | None = None
                 if rt["ready"] and rt["auto_compile_on_sync"]:
                     cjob = self.start_compile_job(vault_id, trigger=f"sync:{trigger}")
                     if cjob.get("job_id"):
                         res["compile_job"] = cjob
+                if rt["ready"] and (not cjob or cjob.get("status") != "running"):
+                    self.maybe_auto_generate_domain_profile_async(vault_id, reason=f"sync:{trigger}")
                 with self._job_lock:
                     job_rec["status"] = "done"
                     job_rec["result"] = res
@@ -2692,6 +2850,7 @@ class ConsoleState:
     def list_tokens_public(self) -> list[dict[str, Any]]:
         with self._lock:
             doc = self._load_tokens_doc()
+            secret_map = _load_token_secrets(self.config_dir)
         out: list[dict[str, Any]] = []
         for idx, row in enumerate(doc.get("tokens") or []):
             if not isinstance(row, dict):
@@ -2712,8 +2871,34 @@ class ConsoleState:
                 "allowed_vaults": [str(v) for v in (row.get("allowed_vaults") or ["*"])],
                 "disabled": bool(row.get("disabled") is True),
                 "created_at": str(row.get("created_at") or ""),
+                "copyable": self._secret_matches(row, secret_map.get(tid)),
             })
         return out
+
+    @staticmethod
+    def _secret_matches(row: dict[str, Any], raw_secret: str | None) -> bool:
+        """A stored raw secret is only valid while it still hashes to the record's current SHA-256."""
+        if not raw_secret:
+            return False
+        expected = str(row.get("token_sha256") or "")
+        if expected:
+            return secrets.compare_digest(_sha256_hex(raw_secret), expected)
+        legacy = str(row.get("token") or "")
+        return bool(legacy) and secrets.compare_digest(raw_secret, legacy)
+
+    def reveal_token(self, token_id: str) -> dict[str, Any]:
+        """Return the raw secret of an issued token for one-click copy (admin console only)."""
+        with self._lock:
+            doc = self._load_tokens_doc()
+            secret_map = _load_token_secrets(self.config_dir)
+        for i, r in enumerate(doc.get("tokens") or []):
+            if not isinstance(r, dict) or str(r.get("id") or f"tok_{i}") != token_id:
+                continue
+            raw = secret_map.get(token_id) or str(r.get("token") or "")
+            if not self._secret_matches(r, raw):
+                raise ValueError("该密钥创建于旧版本，本机未保存原文，无法复制；可点「重置密钥」生成可复制的新密钥")
+            return {"id": token_id, "token": raw}
+        raise KeyError(f"Unknown token_id '{token_id}'")
 
     def create_token(
         self,
@@ -2754,7 +2939,7 @@ class ConsoleState:
                 if rid == token_id:
                     r["id"] = rid
                     if label is not None:
-                        r["label"] = label.strip()[:80]
+                        r["label"] = str(label).strip()[:80] or str(r.get("uid") or rid)
                     if groups is not None:
                         r["groups"] = [str(g).strip() for g in groups if str(g).strip()] or ["all"]
                     if allowed_vaults is not None:
@@ -2787,6 +2972,8 @@ class ConsoleState:
             if target is None:
                 raise KeyError(f"Unknown token_id '{token_id}'")
             self._save_tokens_doc(doc)
+            with file_lock(self.state_lock_file, blocking=True):
+                _write_token_secret_locked(self.config_dir, token_id, raw_secret)
         return {
             "token": raw_secret,
             "record": {k: v for k, v in target.items() if k != "token_sha256"},
@@ -2804,6 +2991,8 @@ class ConsoleState:
                 return False
             doc["tokens"] = kept
             self._save_tokens_doc(doc)
+            with file_lock(self.state_lock_file, blocking=True):
+                _write_token_secret_locked(self.config_dir, token_id, None)
             return True
 
     def get_acl_rules(self) -> dict[str, dict[str, list[str]]]:
@@ -3655,6 +3844,14 @@ def create_console_server(
                     self._send_json(200, res)
                     return
 
+                if path == "/api/vaults/domain-profile":
+                    res = state.save_vault_domain_profile(
+                        str(body.get("vault_id") or ""),
+                        body,
+                    )
+                    self._send_json(200, res)
+                    return
+
                 if path == "/api/playground/inspect":
                     res = state.inspect_playground(
                         vault_id=str(body.get("vault_id") or ""),
@@ -3744,6 +3941,11 @@ def create_console_server(
                         disabled=body.get("disabled"),
                     )
                     self._send_json(200, {"updated": ok})
+                    return
+
+                if path == "/api/tokens/reveal":
+                    res = state.reveal_token(str(body.get("id") or ""))
+                    self._send_json(200, res)
                     return
 
                 if path == "/api/tokens/rotate":

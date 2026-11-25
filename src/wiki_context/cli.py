@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .compiler import compile_vault
+from .compiler import compile_vault, generate_domain_profile
+from .config import VaultConfig, load_domain_profile
 from .console import (
     ConsoleState,
     build_standalone_gateway_context,
@@ -183,6 +184,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_syn.add_argument("action", choices=["mine"], nargs="?", default="mine")
     p_syn.add_argument("--vault", default=".", help="Vault root path")
     p_syn.add_argument("--apply", action="store_true", help="Write discovered groups into synonyms.json")
+    p_syn.add_argument("--clean", action="store_true", help="Remove noisy unit/fragment entries from existing synonyms.json")
+
+    # profile (inspect or AI-generate vault domain profile)
+    p_prof = sub.add_parser("profile", help="Inspect or AI-generate a vault's domain profile in vault.json")
+    p_prof.add_argument("--vault", default=".", help="Vault root path")
+    p_prof.add_argument("--generate", action="store_true", help="Synthesize or refresh domain profile via configured LLM")
+    p_prof.add_argument("--force", action="store_true", help="Force regeneration even if up-to-date or manually locked")
 
     # eval (quantitative retrieval & guardrail benchmark)
     p_eval = sub.add_parser("eval", help="Benchmark Strict Recall, MRR, Latency, and Anti-Hallucination Guardrails")
@@ -522,8 +530,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "synonyms":
-            rep = mine_synonyms(args.vault, apply=args.apply)
+            rep = mine_synonyms(args.vault, apply=args.apply, clean_existing=args.clean)
             print(json.dumps(rep, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "profile":
+            if args.generate:
+                res = generate_domain_profile(args.vault, force=args.force)
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                return 0
+            cfg = VaultConfig.load(args.vault)
+            print(json.dumps({"vault": cfg.name, "domain_profile": load_domain_profile(args.vault)}, ensure_ascii=False, indent=2))
             return 0
 
         if args.cmd == "eval":

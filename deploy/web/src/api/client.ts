@@ -208,6 +208,25 @@ export const api = {
       "/api/vaults/synonyms",
       { vault_id, groups },
     ),
+  saveDomainProfile: (payload: {
+    vault_id: string;
+    action?: "save" | "generate" | "unlock";
+    domain?: string;
+    entity_hints?: string[];
+    query_tips?: string;
+  }) =>
+    requestJson<{
+      vault_id: string;
+      action: string;
+      domain_profile: {
+        domain: string;
+        entity_hints: string[];
+        query_tips: string;
+        source?: string;
+        locked?: boolean;
+        updated_at?: string;
+      };
+    }>("/api/vaults/domain-profile", payload),
 
   // Playground
   playgroundInspect: (payload: {
@@ -291,6 +310,7 @@ export const api = {
     allowed_vaults?: string[];
     disabled?: boolean;
   }) => requestJson<{ updated: boolean }>("/api/tokens/update", payload),
+  revealToken: (id: string) => requestJson<{ id: string; token: string }>("/api/tokens/reveal", { id }),
   rotateToken: (id: string) => requestJson<{ token: string; record: TokenRecord }>("/api/tokens/rotate", { id }),
   deleteToken: (id: string) => requestJson<{ deleted: boolean }>("/api/tokens/delete", { id }),
   saveAcl: (acl: Record<string, { allow: string[]; deny: string[] }>) =>

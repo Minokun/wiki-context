@@ -332,7 +332,7 @@ const AppInner: React.FC = () => {
         });
         setUpdateModalOpen(true);
       } else {
-        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.6"})`);
+        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.7"})`);
       }
     } catch {
       pushToast("info", "暂未检测到线上新版本（请确认网络或已发布 GitHub Release）");

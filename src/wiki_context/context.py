@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Any, Callable
 
-from .config import VaultConfig
+from .config import VaultConfig, format_domain_profile
 from .memory import MemoryNote, MemoryStore
+from .synonym_miner import _valid_term as _valid_synonym_term
 from .search import (
     ACLFilter,
     BM25Index,
@@ -371,6 +372,8 @@ _META_INQUIRY_RE = re.compile(
     r"结果不一致|不一致|是否有关联|有关联|是否有关系|检测手段|优先排查|重点检查|"
     r"需要预警|需要报警|注意事项|哪些方面|怎么处理|如何处理|如何确认|如何验证|什么时候|"
     r"具体信息|详细信息|基本信息|具体内容|什么来着|来着|"
+    r"简要说明|简述|项目背景|项目基本情况|基本情况|交付范围|设备构成|"
+    r"最近进展|最新进展|最新动态|当前进展|进展情况|主要区别|"
     r"(?:那你|请你|麻烦你|麻烦|帮我|给我|替我|请)?(?:大致|大概|简单|简要|详细|具体|全面|系统地?)?"
     r"(?:讲解|介绍|讲讲|说说|聊聊|梳理|总结|概括|解释|看一下|看看|查一下|查查|找一下|找找)(?:一下|下)?|"
     r"那你给我|请你帮我|麻烦帮我|给我输出出来|输出出来|"
@@ -388,6 +391,8 @@ _GENERIC_CORE_WORDS = frozenset({
     "排查", "影响", "区别", "差异", "关联", "关系", "规则", "指标", "情况", "方法", "原因",
     "严重", "合格", "正常", "超标", "超限", "背景", "需求", "核心", "内容", "目标", "功能",
     "定位", "概述", "简介", "结论", "结果", "信息", "具体", "详情", "详细", "基本",
+    "简要", "简明", "大致", "整体", "总体", "进展", "动态", "方面", "相关", "主要",
+    "基本情况", "项目背景", "交付范围", "设备构成", "最近进展", "最新进展", "最新动态", "项目基本情况",
     "system", "service", "config", "configuration", "architecture", "design", "spec",
     "specification", "standard", "requirement", "requirements", "background", "overview",
     "summary", "status", "issue", "problem", "error", "method", "value", "values", "limit",
@@ -413,6 +418,8 @@ class QueryPlan:
     core_concepts: list[tuple[str, set[str]]]
     facets: list[tuple[str, set[str]]]
     auto_synonyms: list[str]
+    focus_terms: list[str] = field(default_factory=list)
+    expanded_terms: list[str] = field(default_factory=list)
 
 
 def _split_cjk_concept(run: str, anchors: tuple[str, ...]) -> list[str]:
@@ -475,6 +482,7 @@ def _strip_paren_field_lists(q: str) -> tuple[str, list[str]]:
 def build_query_plan(
     question: str,
     *,
+    focus_terms: list[str] | None = None,
     expanded_terms: list[str] | None = None,
     max_tokens: int | None = None,
     synonym_book: SynonymBook | None = None,
@@ -489,7 +497,7 @@ def build_query_plan(
         budget = DEFAULT_COMPLEX_TOKENS if mode == "complex" else DEFAULT_FACT_TOKENS
     char_budget = int(budget * CHARS_PER_TOKEN)
 
-    raw_tokens, groups = tokenize_query(q)
+    raw_tokens, raw_groups = tokenize_query(q)
     main_q_cand, attr_chunks = _strip_paren_field_lists(q)
     main_core = _STOP_QUERY_PHRASE_RE.sub(" ", _META_INQUIRY_RE.sub(" ", _MODAL_PARTICLE_SUFFIX_RE.sub(" ", main_q_cand)))
     main_core_toks, _ = tokenize_query(main_core)
@@ -501,64 +509,6 @@ def build_query_plan(
     core_tokens_raw, _ = tokenize_query(core_text_clean)
     core_token_set = set(core_tokens_raw)
     main_token_set = set(main_core_toks) if has_distinct_main else core_token_set
-
-    primary_surface_toks = {m.group(0) for m in LATIN_NUM_RE.finditer(q.lower())}
-    weights: dict[str, float] = {}
-    core_weights: dict[str, float] = {}
-    seen_tok_counts: dict[str, int] = {}
-    for tok in raw_tokens:
-        if tok in core_token_set:
-            base_w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
-            if tok not in main_token_set:
-                base_w *= 0.42
-            # Derived sub-variants of a compound code shouldn't stack 3x-5x weight over other query concepts
-            is_derived_sub = (
-                bool(re.search(r"[a-z0-9]", tok))
-                and tok not in primary_surface_toks
-                and any(tok in g and len(g) > 1 for g in groups)
-            )
-            w = base_w * 0.48 if is_derived_sub else base_w
-            occ = seen_tok_counts.get(tok, 0)
-            seen_tok_counts[tok] = occ + 1
-            inc = w if occ == 0 else w * 0.25
-            cap = w * 1.60
-            weights[tok] = min(cap, weights.get(tok, 0.0) + inc)
-            core_weights[tok] = min(cap, core_weights.get(tok, 0.0) + inc)
-        else:
-            weights[tok] = max(weights.get(tok, 0.0), 0.30)
-
-    auto_syns: list[str] = []
-    if synonym_book is not None:
-        for added_cans, all_triggers in synonym_book.expand_structured(q):
-            auto_syns.extend(added_cans)
-            trig_toks: set[str] = set()
-            for tr in all_triggers:
-                tt, _ = tokenize_query(tr)
-                trig_toks.update(tt)
-            syn_toks: list[str] = []
-            for ac in added_cans:
-                at, _ = tokenize_query(ac)
-                syn_toks.extend(at)
-            for st_tok in syn_toks:
-                weights[st_tok] = max(weights.get(st_tok, 0.0), 0.58)
-            merged = False
-            for grp in groups:
-                if grp & trig_toks:
-                    grp.update(syn_toks)
-                    merged = True
-            if not merged and syn_toks:
-                groups.append(set(syn_toks))
-
-    ext_terms = [str(t).strip() for t in (expanded_terms or ()) if str(t).strip()][:8]
-    if ext_terms:
-        ext_union: set[str] = set()
-        for phrase in ext_terms:
-            etoks, _ = tokenize_query(phrase)
-            for et in etoks:
-                weights[et] = max(weights.get(et, 0.0), 0.60)
-                ext_union.add(et)
-        if ext_union:
-            groups.append(ext_union)
 
     anchors = tuple(dict.fromkeys([
         *extra_anchors,
@@ -609,10 +559,161 @@ def build_query_plan(
                         found.append((sp, sp_toks))
         return found
 
-    core_concepts = _extract_concepts_from(core_text_clean)
-    facet_source_concepts = _extract_concepts_from(main_core) if has_distinct_main else core_concepts
-    if not facet_source_concepts:
-        facet_source_concepts = core_concepts
+    raw_focus = [str(t).strip() for t in (focus_terms or ()) if str(t).strip()][:6]
+    sanitized_focus: list[str] = []
+    seen_focus_low: set[str] = set()
+    for item in raw_focus:
+        clean_item = _STOP_QUERY_PHRASE_RE.sub(" ", _META_INQUIRY_RE.sub(" ", item)).strip(" ：:，,。.;；?!？！")
+        if not clean_item:
+            continue
+        if len(clean_item) > 14 or re.search(r"[，。；？！?!]", clean_item):
+            for sub_lbl, _ in _extract_concepts_from(clean_item):
+                low_s = sub_lbl.lower()
+                if low_s not in seen_focus_low:
+                    seen_focus_low.add(low_s)
+                    sanitized_focus.append(sub_lbl)
+                    if len(sanitized_focus) >= 8:
+                        break
+        else:
+            low_i = clean_item.lower()
+            if low_i not in seen_focus_low and low_i not in _GENERIC_CORE_WORDS and low_i not in EN_STOPWORDS:
+                seen_focus_low.add(low_i)
+                sanitized_focus.append(clean_item)
+        if len(sanitized_focus) >= 8:
+            break
+
+    focus_tok_set: set[str] = set()
+    focus_groups: list[set[str]] = []
+    seen_group_keys: set[tuple[str, ...]] = set()
+    focus_surface_toks: set[str] = set()
+    for ft in sanitized_focus:
+        ft_toks, ft_grps = tokenize_query(ft)
+        focus_tok_set.update(ft_toks)
+        for m in LATIN_NUM_RE.finditer(ft.lower()):
+            focus_surface_toks.add(m.group(0))
+        grp_union: set[str] = set(ft_toks)
+        for g in ft_grps:
+            grp_union.update(g)
+        gkey = tuple(sorted(grp_union))
+        if grp_union and gkey not in seen_group_keys:
+            seen_group_keys.add(gkey)
+            focus_groups.append(grp_union)
+
+    primary_surface_toks = {m.group(0) for m in LATIN_NUM_RE.finditer(q.lower())} | focus_surface_toks
+    q_code_toks: set[str] = set()
+    for m in LATIN_NUM_RE.finditer(q):
+        q_code_toks.update(tokenize(m.group(0)))
+
+    weights: dict[str, float] = {}
+    core_weights: dict[str, float] = {}
+    seen_tok_counts: dict[str, int] = {}
+    for tok in raw_tokens:
+        if tok in core_token_set:
+            base_w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
+            if sanitized_focus:
+                if tok not in focus_tok_set and tok not in q_code_toks:
+                    base_w *= 0.35
+            elif tok not in main_token_set:
+                base_w *= 0.42
+            # Derived sub-variants of a compound code shouldn't stack 3x-5x weight over other query concepts
+            is_derived_sub = (
+                bool(re.search(r"[a-z0-9]", tok))
+                and tok not in primary_surface_toks
+                and any(tok in g and len(g) > 1 for g in raw_groups)
+            )
+            w = base_w * 0.48 if is_derived_sub else base_w
+            occ = seen_tok_counts.get(tok, 0)
+            seen_tok_counts[tok] = occ + 1
+            inc = w if occ == 0 else w * 0.25
+            cap = w * 1.60
+            weights[tok] = min(cap, weights.get(tok, 0.0) + inc)
+            core_weights[tok] = min(cap, core_weights.get(tok, 0.0) + inc)
+        else:
+            weights[tok] = max(weights.get(tok, 0.0), 0.20 if sanitized_focus else 0.30)
+
+    for ft in sanitized_focus:
+        ft_toks, ft_grps = tokenize_query(ft)
+        for tok in ft_toks:
+            base_fw = 1.45 if (_TECH_CODE_RE.match(tok) or LATIN_NUM_RE.fullmatch(tok)) else 1.15
+            is_derived_ft = (
+                bool(re.search(r"[a-z0-9]", tok))
+                and tok not in primary_surface_toks
+                and any(tok in g and len(g) > 1 for g in ft_grps)
+            )
+            fw = base_fw * 0.48 if is_derived_ft else base_fw
+            weights[tok] = max(weights.get(tok, 0.0), fw)
+            core_weights[tok] = max(core_weights.get(tok, 0.0), fw)
+
+    groups: list[set[str]] = list(focus_groups) if sanitized_focus else list(raw_groups)
+    if sanitized_focus:
+        for m in LATIN_NUM_RE.finditer(core_text_clean):
+            mtoks, _ = tokenize_query(m.group(0))
+            mset = set(mtoks)
+            if mset and not (mset & focus_tok_set):
+                gkey = tuple(sorted(mset))
+                if gkey not in seen_group_keys:
+                    seen_group_keys.add(gkey)
+                    groups.append(mset)
+
+    syn_input = q if not sanitized_focus else f"{q} {' '.join(sanitized_focus)}"
+    auto_syns: list[str] = []
+    if synonym_book is not None:
+        for added_cans, all_triggers in synonym_book.expand_structured(syn_input):
+            auto_syns.extend(added_cans)
+            trig_toks: set[str] = set()
+            for tr in all_triggers:
+                tt, _ = tokenize_query(tr)
+                trig_toks.update(tt)
+            syn_toks: list[str] = []
+            for ac in added_cans:
+                at, _ = tokenize_query(ac)
+                syn_toks.extend(at)
+            for st_tok in syn_toks:
+                weights[st_tok] = max(weights.get(st_tok, 0.0), 0.58)
+            merged = False
+            for grp in groups:
+                if grp & trig_toks:
+                    grp.update(syn_toks)
+                    merged = True
+            if not merged and syn_toks:
+                groups.append(set(syn_toks))
+
+    ext_terms = [str(t).strip() for t in (expanded_terms or ()) if str(t).strip()][:6]
+    if ext_terms:
+        for phrase in ext_terms:
+            etoks, _ = tokenize_query(phrase)
+            if etoks:
+                for et in etoks:
+                    weights[et] = max(weights.get(et, 0.0), 0.65)
+                groups.append(set(etoks))
+
+    if sanitized_focus:
+        core_concepts: list[tuple[str, set[str]]] = []
+        seen_c_low: set[str] = set()
+        for ft in sanitized_focus:
+            ext_sub = _extract_concepts_from(ft)
+            if ext_sub:
+                for sl, st in ext_sub:
+                    if sl.lower() not in seen_c_low:
+                        seen_c_low.add(sl.lower())
+                        core_concepts.append((sl, st))
+            else:
+                ft_set = set(tokenize(ft))
+                if ft_set and ft.lower() not in seen_c_low:
+                    seen_c_low.add(ft.lower())
+                    core_concepts.append((ft, ft_set))
+        # Anti-hallucination guardrail: keep omitted tech codes / proper nouns from `question`
+        for qlbl, qtset in _extract_concepts_from(core_text_clean):
+            if (LATIN_NUM_RE.fullmatch(qlbl) or NUM_MEASURE_RE.fullmatch(qlbl.lower())) and qlbl.lower() not in seen_c_low:
+                if not any(qtset & ct for _, ct in core_concepts):
+                    seen_c_low.add(qlbl.lower())
+                    core_concepts.append((qlbl, qtset))
+        facet_source_concepts = list(core_concepts)
+    else:
+        core_concepts = _extract_concepts_from(core_text_clean)
+        facet_source_concepts = _extract_concepts_from(main_core) if has_distinct_main else core_concepts
+        if not facet_source_concepts:
+            facet_source_concepts = core_concepts
 
     facets: list[tuple[str, set[str]]] = []
     for lbl, tset in facet_source_concepts:
@@ -634,6 +735,8 @@ def build_query_plan(
         core_concepts=core_concepts,
         facets=facets[:4],
         auto_synonyms=auto_syns,
+        focus_terms=sanitized_focus,
+        expanded_terms=ext_terms,
     )
 
 
@@ -662,9 +765,14 @@ class CatalogCache:
             return ""
 
         topics: list[str] = []
-        skip_titles = {"log.md", "index.md", "overview", "日志.md", "目录.md", "知识库总览", "史料清单"}
+        skip_titles = {
+            "log.md", "index.md", "overview", "日志.md", "目录.md", "知识库总览", "史料清单",
+            "页面名", "专题", "title", "page", "pages", "notes", "说明",
+        }
         for line in raw.splitlines():
             s = line.strip()
+            if s.startswith("|") and ("---" in s or "页面名" in s or "专题" in s or re.search(r"\|\s*(?:Page|Title)\s*\|", s, re.I)):
+                continue
             m1 = re.search(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", s)
             if m1:
                 t = m1.group(1).strip()
@@ -685,8 +793,13 @@ class CatalogCache:
             )
             raw_low = raw.lower()
             for grp in synonym_book.groups:
-                if is_local or any(term.lower() in raw_low for term in grp):
-                    syn_pairs.append(f"{grp[0]}({'/'.join(grp[1:3])})")
+                if not grp or not _valid_synonym_term(grp[0], is_alias=False):
+                    continue
+                valid_als = [a for a in grp[1:] if _valid_synonym_term(a, is_alias=True)]
+                if not valid_als:
+                    continue
+                if is_local or any(term.lower() in raw_low for term in (grp[0], *valid_als)):
+                    syn_pairs.append(f"{grp[0]}({'/'.join(valid_als[:2])})")
                 if len(syn_pairs) >= 8:
                     break
 
@@ -736,15 +849,46 @@ class ContextPackEngine:
         self._inline_src_re = re.compile(
             rf"(?:{re.escape(self.cfg.sources_dir)}|sources|史料)/[^\s`\"'<>)\]）】；，,]+"
         )
+        self._vault_cfg_mtime_ns: int | None = None
+        self._cached_domain_profile: dict[str, Any] = dict(self.cfg.domain_profile)
+
+    def _reload_domain_profile_if_needed(self) -> dict[str, Any]:
+        cfg_file = self.vault / "vault.json"
+        if not cfg_file.is_file() and (self.vault / ".vault.json").is_file():
+            cfg_file = self.vault / ".vault.json"
+        try:
+            st = cfg_file.stat() if cfg_file.is_file() else None
+        except OSError:
+            st = None
+        mtime = st.st_mtime_ns if st is not None else 0
+        if self._vault_cfg_mtime_ns != mtime:
+            self._vault_cfg_mtime_ns = mtime
+            try:
+                self._cached_domain_profile = dict(VaultConfig.load(self.vault).domain_profile)
+            except Exception:
+                self._cached_domain_profile = {}
+        return self._cached_domain_profile
+
+    def domain_headline(self) -> str:
+        dp = self._reload_domain_profile_if_needed()
+        return str(dp.get("domain") or "").strip()[:80]
+
+    def domain_profile_summary(self) -> str:
+        dp = self._reload_domain_profile_if_needed()
+        formatted = format_domain_profile(dp, layout=self.cfg.layout)
+        if formatted:
+            return formatted
+        return self.catalog.cheatsheet(self.synonym_book)
 
     def domain_cheatsheet(self) -> str:
-        return self.catalog.cheatsheet(self.synonym_book)
+        return self.domain_profile_summary()
 
     def build(
         self,
         snap,
         question: str,
         *,
+        focus_terms: list[str] | None = None,
         expanded_terms: list[str] | None = None,
         max_tokens: int | None = None,
         principal: Principal | None = None,
@@ -760,6 +904,7 @@ class ContextPackEngine:
         user = principal or Principal()
         plan = build_query_plan(
             q,
+            focus_terms=focus_terms,
             expanded_terms=expanded_terms,
             max_tokens=max_tokens,
             synonym_book=self.synonym_book,
@@ -1045,6 +1190,8 @@ class ContextPackEngine:
             "route": plan.route_mode,
             "route_reason": plan.route_reason,
             "token_budget": plan.token_budget,
+            "focus_terms": plan.focus_terms,
+            "expanded_terms": plan.expanded_terms,
             "auto_synonyms": plan.auto_synonyms,
             "missing_concepts": missing_concepts,
             "boundary_notes": boundary_notes,

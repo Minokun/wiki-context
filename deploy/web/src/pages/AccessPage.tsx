@@ -9,6 +9,7 @@ import {
   Folder,
   FolderTree,
   Key,
+  Pencil,
   Plus,
   RotateCw,
   Send,
@@ -200,6 +201,17 @@ export const AccessPage: React.FC<AccessPageProps> = ({
     denied_wiki: string[];
   } | null>(null);
 
+  // Issued token row actions: one-click copy + edit (label / roles / vault scope)
+  const [copiedTokenId, setCopiedTokenId] = useState("");
+  const [editTarget, setEditTarget] = useState<{
+    id: string;
+    uid: string;
+    label: string;
+    groups: string[];
+    allowedVaults: string[];
+  } | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+
   const localVaults = vaults.filter((v) => v.kind === "local");
 
   useEffect(() => {
@@ -314,6 +326,55 @@ export const AccessPage: React.FC<AccessPageProps> = ({
       onRefresh();
     } catch (e) {
       onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleCopyToken = async (t: TokenRecord) => {
+    if (!t.copyable) {
+      onToast("info", "该密钥创建于旧版本，本机未保存原文，无法复制；可点「重置密钥」生成可复制的新密钥");
+      return;
+    }
+    try {
+      const res = await api.revealToken(t.id);
+      const ok = await copyToClipboard(res.token);
+      if (!ok) {
+        onToast("error", "复制失败，请检查浏览器剪贴板权限");
+        return;
+      }
+      setCopiedTokenId(t.id);
+      onToast("info", `已复制 '${t.label || t.uid}' 的访问密钥`);
+      setTimeout(() => setCopiedTokenId((cur) => (cur === t.id ? "" : cur)), 1800);
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editTarget) return;
+    if (editTarget.groups.length === 0) {
+      onToast("error", "请至少选择一个角色");
+      return;
+    }
+    if (editTarget.allowedVaults.length === 0) {
+      onToast("error", "请至少选择一个可访问的知识库");
+      return;
+    }
+    setEditSaving(true);
+    try {
+      const res = await api.updateToken({
+        id: editTarget.id,
+        label: editTarget.label.trim() || editTarget.uid,
+        groups: editTarget.groups,
+        allowed_vaults: editTarget.allowedVaults,
+      });
+      if (!res.updated) throw new Error("未找到该密钥，可能已被撤销");
+      onToast("success", "已保存，新的角色与权限立即生效");
+      setEditTarget(null);
+      onRefresh();
+    } catch (e) {
+      onToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditSaving(false);
     }
   };
 
@@ -1054,6 +1115,36 @@ export const AccessPage: React.FC<AccessPageProps> = ({
                           <div className="inline-flex items-center gap-1.5">
                             <button
                               type="button"
+                              onClick={() => void handleCopyToken(t)}
+                              title={t.copyable ? "复制完整访问密钥" : "旧版本密钥未保存原文，重置后可复制"}
+                              className={`inline-flex items-center gap-1 rounded-md border border-[var(--border-default)] bg-[var(--bg-surface)] px-2 py-1 font-medium hover:bg-[var(--bg-muted)] ${
+                                t.copyable ? "text-[var(--ink-secondary)]" : "text-[var(--ink-muted)] opacity-60"
+                              }`}
+                            >
+                              {copiedTokenId === t.id ? (
+                                <Check className="h-3 w-3 text-emerald-600" />
+                              ) : (
+                                <Copy className="h-3 w-3" />
+                              )}
+                              {copiedTokenId === t.id ? "已复制" : "复制"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEditTarget({
+                                  id: t.id,
+                                  uid: t.uid,
+                                  label: t.label || t.uid,
+                                  groups: [...(t.groups || [])],
+                                  allowedVaults: [...(t.allowed_vaults || ["*"])],
+                                })
+                              }
+                              className="inline-flex items-center gap-1 rounded-md border border-[var(--border-default)] bg-[var(--bg-surface)] px-2 py-1 font-medium text-[var(--ink-secondary)] hover:bg-[var(--bg-muted)]"
+                            >
+                              <Pencil className="h-3 w-3" /> 编辑
+                            </button>
+                            <button
+                              type="button"
                               onClick={() =>
                                 setShareConfig({
                                   token: "",
@@ -1317,6 +1408,126 @@ export const AccessPage: React.FC<AccessPageProps> = ({
           </div>
         </div>
       </aside>
+
+      {/* Edit Issued Token Modal */}
+      {editTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl border border-[var(--border-strong)] bg-[var(--bg-surface)] p-5 text-xs text-[var(--ink-primary)] shadow-2xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-[14px] font-bold text-[var(--ink-primary)]">编辑访问密钥</h3>
+                <p className="mt-1 font-mono text-[var(--ink-muted)]">{editTarget.uid}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditTarget(null)}
+                className="rounded-md p-1 text-[var(--ink-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)]"
+                title="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3.5">
+              <div>
+                <label className="mb-1 block font-medium text-[var(--ink-secondary)]">密钥名称</label>
+                <input
+                  value={editTarget.label}
+                  onChange={(e) => setEditTarget({ ...editTarget, label: e.target.value })}
+                  maxLength={80}
+                  placeholder="如 小明的笔记本"
+                  className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-subtle)] px-2.5 py-1.5 text-[var(--ink-primary)] focus:border-[var(--accent)] focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1.5 block font-medium text-[var(--ink-secondary)]">所属角色</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {Array.from(new Set([...selectableGroups, ...editTarget.groups])).map((g) => {
+                    const on = editTarget.groups.includes(g);
+                    return (
+                      <button
+                        key={g}
+                        type="button"
+                        onClick={() =>
+                          setEditTarget({
+                            ...editTarget,
+                            groups: on ? editTarget.groups.filter((x) => x !== g) : [...editTarget.groups, g],
+                          })
+                        }
+                        className={`rounded-md border px-2 py-0.5 font-mono font-semibold ${
+                          on
+                            ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                            : "border-[var(--border-default)] bg-[var(--bg-subtle)] text-[var(--ink-secondary)]"
+                        }`}
+                      >
+                        {g}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1.5 block font-medium text-[var(--ink-secondary)]">可访问的知识库</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {Array.from(new Set(["*", ...localVaults.map((v) => v.id), ...editTarget.allowedVaults])).map(
+                    (vid) => {
+                      const on = editTarget.allowedVaults.includes(vid);
+                      const matchedVault = localVaults.find((v) => v.id === vid);
+                      return (
+                        <button
+                          key={vid}
+                          type="button"
+                          onClick={() => {
+                            if (vid === "*") {
+                              setEditTarget({ ...editTarget, allowedVaults: ["*"] });
+                              return;
+                            }
+                            const cleaned = editTarget.allowedVaults.filter((x) => x !== "*");
+                            setEditTarget({
+                              ...editTarget,
+                              allowedVaults: on ? cleaned.filter((x) => x !== vid) : [...cleaned, vid],
+                            });
+                          }}
+                          className={`rounded-md border px-2 py-0.5 font-semibold ${
+                            on
+                              ? "border-emerald-400 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300"
+                              : "border-[var(--border-default)] bg-[var(--bg-subtle)] text-[var(--ink-secondary)]"
+                          }`}
+                        >
+                          {vid === "*" ? "全部知识库" : matchedVault?.name || vid}
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+                <p className="mt-1.5 text-[var(--ink-muted)]">
+                  修改立即生效，对方无需重新配置或重新配对。
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditTarget(null)}
+                className="rounded-lg px-3 py-1.5 font-medium text-[var(--ink-secondary)] hover:text-[var(--ink-primary)]"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={editSaving || editTarget.groups.length === 0 || editTarget.allowedVaults.length === 0}
+                onClick={() => void handleSaveEdit()}
+                className="rounded-lg bg-[var(--accent)] px-4 py-1.5 font-semibold text-white hover:bg-[var(--accent-hover)] disabled:opacity-40"
+              >
+                {editSaving ? "保存中…" : "保存"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

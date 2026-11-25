@@ -8,8 +8,12 @@ out of the box, with optional overrides via ``vault.json`` or ``.vault.json``.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from .state_lock import file_lock, replace_with_retry
 
 LAYOUT_PRESETS: dict[str, dict[str, str]] = {
     "en": {
@@ -75,6 +79,7 @@ class VaultConfig:
     ocr_image_dirs: frozenset[str] = field(default_factory=frozenset)
     anchor_terms: tuple[str, ...] = ()
     acl_rules: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    domain_profile: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, vault_path: Path | str) -> VaultConfig:
@@ -151,6 +156,9 @@ class VaultConfig:
         acl_raw = raw_cfg.get("acl")
         acl_rules = dict(acl_raw) if isinstance(acl_raw, dict) else {}
 
+        raw_dp = raw_cfg.get("domain_profile")
+        domain_profile = normalize_domain_profile(raw_dp) if isinstance(raw_dp, dict) else {}
+
         raw_sources_path = str(raw_cfg.get("sources_path") or "").strip()
         sources_path: Path | None = None
         if raw_sources_path:
@@ -214,6 +222,7 @@ class VaultConfig:
             ocr_image_dirs=ocr_image_dirs,
             anchor_terms=anchor_terms,
             acl_rules=acl_rules,
+            domain_profile=domain_profile,
         )
 
     @property
@@ -361,3 +370,113 @@ class VaultConfig:
             "exclude_patterns": list(self.exclude_patterns),
             "ocr_image_dirs": sorted(self.ocr_image_dirs),
         }
+
+
+def normalize_domain_profile(raw: Any, *, preserve_meta: bool = True) -> dict[str, Any]:
+    """Normalize and length-clamp a Vault domain profile dict."""
+    if not isinstance(raw, dict):
+        return {}
+    domain = " ".join(str(raw.get("domain") or "").split()).strip()[:80]
+    hints_raw = raw.get("entity_hints") or ()
+    entity_hints: list[str] = []
+    if isinstance(hints_raw, (list, tuple)):
+        seen_h: set[str] = set()
+        for item in hints_raw:
+            clean_h = " ".join(str(item or "").split()).strip()[:36]
+            if clean_h and clean_h.lower() not in seen_h:
+                seen_h.add(clean_h.lower())
+                entity_hints.append(clean_h)
+            if len(entity_hints) >= 6:
+                break
+    query_tips = " ".join(str(raw.get("query_tips") or "").split()).strip()[:80]
+    if not domain and not entity_hints and not query_tips:
+        return {}
+
+    out: dict[str, Any] = {
+        "domain": domain,
+        "entity_hints": entity_hints,
+        "query_tips": query_tips,
+    }
+    if preserve_meta:
+        src = str(raw.get("source") or "").strip().lower()
+        if src in {"auto", "manual"}:
+            out["source"] = src
+        if "locked" in raw:
+            out["locked"] = bool(raw.get("locked") is True)
+        if raw.get("fingerprint"):
+            out["fingerprint"] = str(raw["fingerprint"])[:64]
+        top_dirs = raw.get("top_dirs_at_gen")
+        if isinstance(top_dirs, (list, tuple)):
+            out["top_dirs_at_gen"] = [str(x).strip() for x in top_dirs if str(x).strip()][:50]
+        if "doc_count_at_gen" in raw:
+            try:
+                out["doc_count_at_gen"] = max(0, int(raw["doc_count_at_gen"]))
+            except (TypeError, ValueError):
+                pass
+        if "wiki_count_at_gen" in raw:
+            try:
+                out["wiki_count_at_gen"] = max(0, int(raw["wiki_count_at_gen"]))
+            except (TypeError, ValueError):
+                pass
+        if raw.get("updated_at"):
+            out["updated_at"] = str(raw["updated_at"])[:40]
+    return out
+
+
+def load_domain_profile(vault_path: Path | str) -> dict[str, Any]:
+    return dict(VaultConfig.load(vault_path).domain_profile)
+
+
+def save_domain_profile(vault_path: Path | str, profile: dict[str, Any]) -> dict[str, Any]:
+    """Atomically persist `domain_profile` into `vault.json` (or `.vault.json`) without dropping keys."""
+    root = Path(vault_path).expanduser().resolve()
+    norm = normalize_domain_profile(profile)
+    with file_lock(root / ".vault.lock", blocking=True):
+        cfg_path = root / "vault.json"
+        if not cfg_path.is_file() and (root / ".vault.json").is_file():
+            cfg_path = root / ".vault.json"
+        raw_cfg: dict[str, Any] = {}
+        if cfg_path.is_file():
+            try:
+                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw_cfg = loaded
+            except (OSError, ValueError):
+                raw_cfg = {}
+        if norm:
+            raw_cfg["domain_profile"] = norm
+        else:
+            raw_cfg.pop("domain_profile", None)
+        tmp = cfg_path.with_name(f".{cfg_path.name}.tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(raw_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        replace_with_retry(tmp, cfg_path)
+    return norm
+
+
+def format_domain_profile(profile: dict[str, Any], *, layout: str = "zh") -> str:
+    """Format a compact, ACL-safe domain profile summary for MCP instructions / tool descriptions."""
+    norm = normalize_domain_profile(profile, preserve_meta=False)
+    domain = str(norm.get("domain") or "").strip()
+    if not domain:
+        return ""
+    hints = [str(x).strip() for x in (norm.get("entity_hints") or ()) if str(x).strip()][:5]
+    tips = str(norm.get("query_tips") or "").strip()
+    if layout == "zh":
+        parts = [f"行业领域：{domain}"]
+        if hints:
+            parts.append(f"核心实体：{' / '.join(hints)}")
+        if tips:
+            parts.append(f"提词建议：{tips}")
+        text = "；".join(parts)
+        if len(text) > 180:
+            text = text[:179].rstrip("；、 ") + "…"
+        return text
+    parts = [f"Domain: {domain}"]
+    if hints:
+        parts.append(f"Entities: {' / '.join(hints)}")
+    if tips:
+        parts.append(f"Query tips: {tips}")
+    text = "; ".join(parts)
+    if len(text) > 320:
+        text = text[:319].rstrip("; ") + "…"
+    return text
