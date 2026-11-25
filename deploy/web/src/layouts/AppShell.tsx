@@ -133,11 +133,11 @@ export const AppShell: React.FC<AppShellProps> = ({
               title={checkingUpdate ? "正在检查更新..." : "点击检查在线更新"}
               className="hidden rounded px-1 py-0.5 font-mono text-xs text-[var(--ink-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)] disabled:opacity-60 xl:inline"
             >
-              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.5.8"}`}
+              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.5.9"}`}
             </button>
           ) : (
             <span className="hidden font-mono text-xs text-[var(--ink-muted)] xl:inline">
-              v{overview?.version || "0.5.8"}
+              v{overview?.version || "0.5.9"}
             </span>
           )}
           {mode === "desktop" && availableUpdateVersion && onOpenUpdateModal && (
@@ -288,11 +288,13 @@ export const AppShell: React.FC<AppShellProps> = ({
             <div className="flex items-center gap-2">
               <span
                 className={`h-2 w-2 rounded-full ${
-                  selectedVault?.ready
-                    ? "bg-emerald-500"
-                    : selectedVault?.hydrating
-                      ? "bg-amber-500"
-                      : "bg-slate-400"
+                  selectedVault?.kind === "remote" && !selectedVault.ready
+                    ? "bg-rose-500"
+                    : selectedVault?.ready
+                      ? "bg-emerald-500"
+                      : selectedVault?.hydrating
+                        ? "bg-amber-500"
+                        : "bg-slate-400"
                 }`}
               />
               <span className="truncate text-[13px] font-bold text-[var(--ink-primary)]">
@@ -302,7 +304,9 @@ export const AppShell: React.FC<AppShellProps> = ({
             <div className="mt-0.5 truncate text-xs text-[var(--ink-muted)]">
               {selectedVault
                 ? selectedVault.kind === "remote"
-                  ? "来自其他电脑的共享知识库"
+                  ? selectedVault.ready
+                    ? `${selectedVault.remote_uid ? `共享 · ${selectedVault.remote_uid} · ` : "共享 · "}${selectedVault.docs} 篇文档`
+                    : "远程连接异常（点击检查或更新密钥）"
                   : `${selectedVault.docs} 篇文档 · ${selectedVault.wiki_docs} 篇已整理`
                 : "点击下方按钮添加本地文件夹"}
             </div>
@@ -323,17 +327,25 @@ export const AppShell: React.FC<AppShellProps> = ({
                   const isCompiling = activeJob?.status === "running";
                   const pendingCount = (v.uncompiled_count || 0) + (v.stale_count || 0);
                   const subtitle = isRemote
-                    ? "共享知识库"
+                    ? v.ready
+                      ? v.remote_uid
+                        ? `共享 · ${v.remote_uid}`
+                        : "共享 · 已连接"
+                      : "连接异常 / 已离线"
                     : v.source_available === false
                       ? "源目录离线"
                       : pendingCount > 0
                         ? `待整理 ${pendingCount} 篇`
                         : `已整理 ${v.wiki_docs} 篇`;
+                  const itemTitle =
+                    isRemote && !v.ready
+                      ? v.online_error || `无法连接 ${v.gateway_url || v.id}`
+                      : v.sources_path || v.path || v.gateway_url || v.id;
                   return (
                     <button
                       key={v.id}
                       type="button"
-                      title={v.sources_path || v.path || v.gateway_url || v.id}
+                      title={itemTitle}
                       onClick={() => onSelectVault(v.id)}
                       className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left ${
                         selected
@@ -354,7 +366,13 @@ export const AppShell: React.FC<AppShellProps> = ({
                           >
                             {v.name || v.id}
                           </div>
-                          <div className="truncate text-xs text-[var(--ink-muted)]">
+                          <div
+                            className={`truncate text-xs ${
+                              isRemote && !v.ready
+                                ? "text-rose-600 dark:text-rose-400"
+                                : "text-[var(--ink-muted)]"
+                            }`}
+                          >
                             {subtitle}
                           </div>
                         </div>
@@ -367,8 +385,19 @@ export const AppShell: React.FC<AppShellProps> = ({
                             : "整理中"}
                         </span>
                       ) : isRemote ? (
-                        <span className="shrink-0 rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-xs font-medium text-[var(--accent)]">
-                          共享
+                        <span
+                          className={`inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium ${
+                            v.ready
+                              ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                              : "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
+                          }`}
+                        >
+                          <span
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              v.ready ? "bg-emerald-500" : "bg-rose-500"
+                            }`}
+                          />
+                          {v.ready ? "在线" : "离线"}
                         </span>
                       ) : v.hydrating ? (
                         <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">

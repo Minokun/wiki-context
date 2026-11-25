@@ -373,9 +373,9 @@ _META_INQUIRY_RE = re.compile(
     r"需要预警|需要报警|注意事项|哪些方面|怎么处理|如何处理|如何确认|如何验证|什么时候|"
     r"具体信息|详细信息|基本信息|具体内容|什么来着|来着|"
     r"简要说明|简述|项目背景|项目基本情况|基本情况|交付范围|设备构成|"
-    r"最近进展|最新进展|最新动态|当前进展|进展情况|主要区别|"
+    r"最近进展|最新进展|最新动态|当前进展|进展情况|主要区别|技术项点要求|各项技术要求|编写要求|"
     r"(?:那你|请你|麻烦你|麻烦|帮我|给我|替我|请)?(?:大致|大概|简单|简要|详细|具体|全面|系统地?)?"
-    r"(?:讲解|介绍|讲讲|说说|聊聊|梳理|总结|概括|解释|看一下|看看|查一下|查查|找一下|找找)(?:一下|下)?|"
+    r"(?:讲解|介绍|讲讲|说说|聊聊|梳理|总结|概括|解释|列出|指出|给出|看一下|看看|查一下|查查|找一下|找找)(?:一下|下)?|"
     r"那你给我|请你帮我|麻烦帮我|给我输出出来|输出出来|"
     r"\b(?:what\s+is\s+the|what\s+are\s+the|can\s+you\s+explain|please\s+explain|"
     r"walk\s+me\s+through|tell\s+me\s+about|give\s+me\s+an?\s+overview\s+of|"
@@ -383,7 +383,25 @@ _META_INQUIRY_RE = re.compile(
     re.I,
 )
 
-_TECH_CODE_RE = re.compile(r"^(?:[a-z]{1,6}\d{1,5}|\d{1,4}[a-z]{1,4}|rfc|iso|iec|ieee|gb|tb|uic)$", re.I)
+_TECH_CODE_RE = re.compile(r"^(?:[a-z]{1,6}\d{1,5}|\d{1,4}[a-z]{1,4}|rfc|iso|iec|ieee|gb|tb|uic|en|din|dl)$", re.I)
+
+_STRUCTURED_STD_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:GB(?:/T)?|TB(?:/T)?|DL(?:/T)?|JB(?:/T)?|NB(?:/T)?|JT(?:/T)?|CJ(?:/T)?|"
+    r"Q/[A-Z0-9]+|ISO(?:/IEC)?|IEC|IEEE|EN|DIN|UIC|JJG|JJF|RFC)\s*[-–—]?\s*\d{2,6}(?:[.\-–—]\d{1,5})*(?![A-Za-z0-9])",
+    re.I,
+)
+
+_CJK_INTERROGATIVE_RE = re.compile(
+    r"(?:哪个|哪几|哪两|哪三|哪家|哪天|哪年|哪月|哪日|哪一|哪类|哪些|哪儿|哪里|"
+    r"什么|多少|几个|几部分|几类|几种|几位|几项|几套|几台|是否|能否|可否|"
+    r"如何|怎么|怎样|为什么|为何|有没有|是不是|请问|请列出|告诉我)"
+)
+_SPURIOUS_TRAILING_CJK_RE = re.compile(r"[的了着过在用做以和与及向从对把被是有为里中上下项]$")
+
+_EXAM_HEADING_RE = re.compile(
+    r"(?:复习(?:思考)?题|思考题|简答题|问答题|选择题|填空题|判断题|计算题|习题|课后练习|练习题|自测题|模拟题|考试题|试题)"
+)
+_QUERY_WANTS_EXAM_RE = re.compile(r"(?:复习题|思考题|简答题|习题|考题|试题|练习题|自测|选择题|填空题|判断题)")
 
 _GENERIC_CORE_WORDS = frozenset({
     "检测", "监测", "系统", "方案", "技术", "参数", "标准", "规范", "要求", "报告", "数据",
@@ -392,6 +410,10 @@ _GENERIC_CORE_WORDS = frozenset({
     "严重", "合格", "正常", "超标", "超限", "背景", "需求", "核心", "内容", "目标", "功能",
     "定位", "概述", "简介", "结论", "结果", "信息", "具体", "详情", "详细", "基本",
     "简要", "简明", "大致", "整体", "总体", "进展", "动态", "方面", "相关", "主要",
+    "简称", "全称", "名称", "标准名称", "主题", "编号", "物料编号", "项目编号", "合同编号",
+    "时间", "日期", "签订时间", "签订日期", "交货期", "完成时限", "参会", "我方", "对方",
+    "改动", "变化", "修改", "字母", "开头", "字母开头", "组成", "部分", "分别", "各自",
+    "验收要求", "编写要求", "技术要求", "技术项点要求", "各项技术要求", "文档编写规范", "模板章节要求",
     "基本情况", "项目背景", "交付范围", "设备构成", "最近进展", "最新进展", "最新动态", "项目基本情况",
     "system", "service", "config", "configuration", "architecture", "design", "spec",
     "specification", "standard", "requirement", "requirements", "background", "overview",
@@ -454,14 +476,28 @@ def _split_cjk_concept(run: str, anchors: tuple[str, ...]) -> list[str]:
         out.append(best_anchor)
         rem = rem[best_pos + len(best_anchor):]
 
-    expanded: list[str] = []
-    for seg in (out or [run]):
-        if len(seg) <= 8:
-            expanded.append(seg)
-        else:
-            expanded.append(seg[:4])
-            expanded.append(seg[-4:])
-    return expanded
+    return [seg for seg in (out or [run]) if 2 <= len(seg) <= 8]
+
+
+def _is_spurious_cjk_concept(sp: str, *, anchor_set: frozenset[str] | set[str]) -> bool:
+    """Reject CJK interrogative shells and torn cross-word fragments from missing-concept guardrails."""
+    if not sp or len(sp) < 2 or len(sp) > 8:
+        return True
+    if sp in _GENERIC_CORE_WORDS:
+        return True
+    if _CJK_INTERROGATIVE_RE.search(sp):
+        return True
+    if _SPURIOUS_TRAILING_CJK_RE.search(sp):
+        return True
+    if sp.endswith(("分别", "各自", "哪些", "哪几", "提出", "参加", "参会", "包括", "包含", "属于", "称为")):
+        return True
+    if sp.startswith(("哪些", "哪个", "哪几", "哪两", "哪家", "哪天", "请问", "请列", "列出", "各项", "是否", "能否")):
+        return True
+    if len(sp) == 4 and sp[:2] in _GENERIC_CORE_WORDS and sp[2:] in _GENERIC_CORE_WORDS:
+        return True
+    if len(sp) > 6 and sp not in anchor_set and not any(sp.endswith(a) for a in _COMPOUND_HEAD_ANCHORS):
+        return True
+    return False
 
 
 def _strip_paren_field_lists(q: str) -> tuple[str, list[str]]:
@@ -516,17 +552,40 @@ def build_query_plan(
         *_COMPOUND_HEAD_ANCHORS,
         "标准", "规范", "规则", "接口", "协议", "阈值", "范围", "架构",
     ]))
+    anchor_set = frozenset(anchors)
     clause_filler_re = re.compile(
-        r"(?:有一台|有一个|有一份|有一张|有一|有个|我的|你的|他的|她的|咱们|怎么样|怎样|"
-        r"与|和|及|或|或者|对|在|从|将|把|被|向|由|跟|同|的|了|着|过|但|而|中|内|上|下|有|是|"
-        r"是否|能否|可不可以|有没有|为什么|怎么|如何|哪些|多少|什么|"
+        r"(?:有一台|有一个|有一份|有一张|有一|有个|我的|你的|他的|她的|我方|对方|咱们|怎么样|怎样|"
+        r"(?:第[一二三四五六七八九十百\d]{1,4}|[这那每各]?[几两三四五六七八九十]+|哪(?:几|两|三|一)?)[次期批轮节条项步类种部分个套台名位]|"
+        r"哪个|哪几|哪两|哪三|哪家|哪天|哪年|哪月|哪日|哪一|哪类|哪些|哪儿|哪里|谁|多少|几个|几部分|几类|几种|"
+        r"请列出|列出|指出|给出|请问|告诉我|分别|各自|"
+        r"与|和|及|或|或者|对|在|从|将|把|被|向|由|跟|的|了|着|过|但|而|中|内|上|下|有|是|"
+        r"是否|能否|可不可以|有没有|是不是|为什么|怎么|如何|什么|"
+        r"简称|全称|主题|名称|开头|结尾|属于|包含|包括|组成|提出|负责|参与|参会|改动|"
         r"连续|超过|低于|高于|大于|小于|达到|通过|判断|发生|出现|存在|进行|使用|采用|导致|引起|说明|需要|应该|可以)+"
     )
 
     def _extract_concepts_from(text_src: str) -> list[tuple[str, set[str]]]:
         found: list[tuple[str, set[str]]] = []
         local_seen: set[str] = set()
+        covered_spans: list[tuple[int, int]] = []
+
+        def _overlaps(s_pos: int, e_pos: int) -> bool:
+            return any(not (e_pos <= cs or s_pos >= ce) for cs, ce in covered_spans)
+
+        for m in _STRUCTURED_STD_RE.finditer(text_src):
+            raw_std = " ".join(m.group(0).split())
+            low_std = raw_std.lower()
+            if low_std in local_seen:
+                continue
+            toks, _ = tokenize_query(low_std)
+            if toks:
+                local_seen.add(low_std)
+                covered_spans.append((m.start(), m.end()))
+                found.append((raw_std, set(toks)))
+
         for m in LATIN_NUM_RE.finditer(text_src):
+            if _overlaps(m.start(), m.end()):
+                continue
             raw_lbl = m.group(0)
             low_lbl = raw_lbl.lower()
             if low_lbl in local_seen or low_lbl in EN_STOPWORDS or low_lbl in _GENERIC_CORE_WORDS:
@@ -538,20 +597,32 @@ def build_query_plan(
             toks, _ = tokenize_query(low_lbl)
             if toks:
                 local_seen.add(low_lbl)
+                covered_spans.append((m.start(), m.end()))
                 found.append((raw_lbl, set(toks)))
 
-        for m in NUM_MEASURE_RE.finditer(text_src.lower()):
-            comp = m.group(1) + m.group(2)
+        for m in NUM_MEASURE_RE.finditer(text_src):
+            if _overlaps(m.start(), m.end()):
+                continue
+            if m.start() > 0 and re.match(r"[A-Za-z0-9\-_/]", text_src[m.start() - 1]):
+                continue
+            comp = (m.group(1) + m.group(2)).lower()
+            covered_spans.append((m.start(), m.end()))
             if comp not in local_seen:
                 local_seen.add(comp)
                 found.append((comp, {comp}))
 
-        for seg in clause_filler_re.split(text_src):
+        cjk_src_chars = list(text_src)
+        for cs, ce in covered_spans:
+            for ci in range(max(0, cs), min(len(cjk_src_chars), ce)):
+                cjk_src_chars[ci] = " "
+        cjk_src = "".join(cjk_src_chars)
+
+        for seg in clause_filler_re.split(cjk_src):
             for run in CJK_RUN_RE.findall(seg):
                 if len(run) < 2 or run in _GENERIC_CORE_WORDS:
                     continue
                 for sp in _split_cjk_concept(run, anchors):
-                    if len(sp) < 2 or len(sp) > 8 or sp in _GENERIC_CORE_WORDS or sp in local_seen:
+                    if sp in local_seen or _is_spurious_cjk_concept(sp, anchor_set=anchor_set):
                         continue
                     sp_toks = set(tokenize(sp))
                     if sp_toks:
@@ -609,7 +680,7 @@ def build_query_plan(
     seen_tok_counts: dict[str, int] = {}
     for tok in raw_tokens:
         if tok in core_token_set:
-            base_w = 1.45 if _TECH_CODE_RE.match(tok) else 1.0
+            base_w = 1.85 if _TECH_CODE_RE.match(tok) else 1.0
             if sanitized_focus:
                 if tok not in focus_tok_set and tok not in q_code_toks:
                     base_w *= 0.35
@@ -826,8 +897,8 @@ class CatalogCache:
 
 class ContextPackEngine:
     PROVENANCE_BOOST = 1.25
-    ADJACENT_MERGE_GAP = 20
-    MAX_MERGED_SPAN_LINES = 95
+    ADJACENT_MERGE_GAP = 42
+    MAX_MERGED_SPAN_LINES = 115
 
     def __init__(
         self,
@@ -959,7 +1030,16 @@ class ContextPackEngine:
 
         # Step 2: Parallel coarse retrieval (with pre-LIMIT C-level FTS5 ACL filtering)
         acl_filter = compile_acl_filter(self.policy, user)
-        wiki_max_k = 3 if plan.route_mode == "complex" or len(plan.facets) >= 2 else 2
+        if plan.token_budget <= 1500:
+            wiki_max_k = 1
+            target_l2_k = 3
+        elif plan.token_budget <= 2200:
+            wiki_max_k = 2 if len(plan.facets) >= 2 else 1
+            target_l2_k = 4
+        else:
+            wiki_max_k = 3 if plan.route_mode == "complex" or len(plan.facets) >= 2 else 2
+            target_l2_k = 6 if plan.route_mode == "complex" else 4
+
         raw_wiki = index.search_wiki_weighted(plan.weighted_tokens, plan.groups, k=8, max_per_source=3)
         wiki_candidates = [w for w in raw_wiki if allowed_wiki(w)]
 
@@ -973,6 +1053,23 @@ class ContextPackEngine:
         )
         # Defense-in-depth assert: re-verify returned rows through Python AccessPolicy
         l2_candidates = [h for h in raw_l2 if allowed_l2(h.get("source") or "", hit=h)]
+
+        # P-04: Demote textbook review/exam-question sections unless the user explicitly asks for exam questions
+        if l2_candidates and not _QUERY_WANTS_EXAM_RE.search(q):
+            for h in l2_candidates:
+                hd = str(h.get("heading") or "")
+                tx = str(h.get("text") or "")
+                non_empty = [ln.strip() for ln in tx.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+                q_line_ratio = (
+                    sum(1 for ln in non_empty if ln.endswith(("?", "？"))) / len(non_empty)
+                    if len(non_empty) >= 3
+                    else 0.0
+                )
+                if _EXAM_HEADING_RE.search(hd):
+                    h["score"] = round(float(h.get("score") or 0.0) * 0.22, 4)
+                elif q_line_ratio >= 0.60:
+                    h["score"] = round(float(h.get("score") or 0.0) * 0.30, 4)
+            l2_candidates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
 
         if include_debug and not acl_filter.allow_all:
             # Populate Playground X-Ray Shadow Diff for hits pruned inside SQLite FTS5 `acl_pfx`
@@ -1074,7 +1171,6 @@ class ContextPackEngine:
 
         # Step 4: Bounded merge -> elastic selection -> table-header-pinned windowing
         merged_pool = self._merge_adjacent_candidates(l2_candidates, resolve_mirror_fn=resolve_mirror_fn)
-        target_l2_k = 6 if plan.route_mode == "complex" else 4
         selected_l2 = self._select_l2_with_elastic_cap(
             merged_pool,
             plan.facets,
@@ -1083,17 +1179,96 @@ class ContextPackEngine:
             q_idf=q_idf_sample,
         )
 
-        usable_chars = max(1200, plan.char_budget - 260)
+        # P-07: Account for global header/footer + per-block framing overhead in total budget
+        est_blocks = len(selected_wiki) + max(len(selected_l2), 1)
+        overhead_reserve = 220 + est_blocks * 140
+        usable_chars = max(720, plan.char_budget - overhead_reserve)
         wiki_char_budget = int(usable_chars * 0.24) if selected_wiki else 0
-        l2_char_budget = usable_chars - wiki_char_budget
+        l2_char_budget = max(480, usable_chars - wiki_char_budget)
 
         formatted_wiki = self._format_wiki_blocks(selected_wiki, plan, wiki_char_budget)
-        actual_wiki_chars = sum(len(w["content"]) + 80 for w in formatted_wiki)
-        l2_char_budget = max(l2_char_budget, usable_chars - actual_wiki_chars)
+        actual_wiki_chars = sum(len(w["content"]) + 90 for w in formatted_wiki)
+        l2_char_budget = max(min(l2_char_budget, max(420, usable_chars - actual_wiki_chars)), l2_char_budget if not formatted_wiki else 420)
 
         formatted_l2 = self._format_l2_blocks(
             selected_l2, plan, l2_char_budget, snap=snap, resolve_mirror_fn=resolve_mirror_fn
         )
+
+        # P-02: Index-backed exact-match rescue BEFORE claiming any concept is missing from vault
+        def _compose_combined_text(w_blocks: list[dict], s_blocks: list[dict], pinned: list[str], mems: list[dict]) -> tuple[str, float]:
+            top_l2_v = max((float(s.get("score") or 0.0) for s in s_blocks), default=0.0)
+            top_w_v = max((float(w.get("score") or 0.0) for w in w_blocks), default=0.0)
+            sc_l2 = (
+                [s for s in s_blocks if float(s.get("score") or 0.0) >= top_l2_v * 0.35]
+                if top_l2_v >= 15.0
+                else s_blocks
+            )
+            sc_w = (
+                [w for w in w_blocks if float(w.get("score") or 0.0) >= top_w_v * 0.50]
+                if top_w_v >= 15.0
+                else w_blocks
+            )
+            txt = "\n".join(
+                [
+                    *(w["content"] + " " + w["heading"] for w in sc_w),
+                    *(s["content"] + " " + s["heading"] + " " + s["source"] for s in sc_l2),
+                    *pinned,
+                    *(m["text"] for m in mems),
+                ]
+            ).lower()
+            return txt, top_l2_v
+
+        pre_combined, _ = _compose_combined_text(formatted_wiki, formatted_l2, [], [])
+        pre_missing = self._detect_missing_concepts(plan, pre_combined)
+        if pre_missing:
+            concept_map = {lbl: tset for lbl, tset in plan.core_concepts}
+            seen_sel_keys = {(h.get("source"), h.get("line_start"), h.get("page_num")) for h in selected_l2}
+            rescued_any = False
+            for mc in pre_missing[:2]:
+                mc_toks = concept_map.get(mc) or set(tokenize(mc))
+                if not mc_toks:
+                    continue
+                probe_weights = {t: 2.0 for t in mc_toks}
+                for kt, kw in plan.core_weighted_tokens.items():
+                    if kt not in probe_weights:
+                        probe_weights[kt] = kw * 0.2
+                probe_hits = index.search_weighted(
+                    probe_weights,
+                    [set(mc_toks)],
+                    k=6,
+                    max_per_source=2,
+                    acl_filter=acl_filter,
+                    query_text=mc,
+                )
+                for ph in probe_hits:
+                    psrc = ph.get("source") or ""
+                    pkey = (psrc, ph.get("line_start"), ph.get("page_num"))
+                    if pkey in seen_sel_keys or not allowed_l2(psrc, hit=ph):
+                        continue
+                    pblob = f"{psrc} {ph.get('heading', '')} {ph.get('text', '')}".lower()
+                    pcompact = re.sub(r"[.\-/+_\s]+", "", pblob)
+                    if not self._concept_present_in_text(
+                        mc, mc_toks, pblob, pcompact, synonym_book=self.synonym_book
+                    ):
+                        continue
+                    ph = dict(ph)
+                    ph["facet_rescued"] = mc
+                    ph["score"] = max(float(ph.get("score") or 0.0), 18.0)
+                    if len(selected_l2) >= target_l2_k and len(selected_l2) >= 2:
+                        rep_idx = next(
+                            (i for i in range(len(selected_l2) - 1, 0, -1) if not selected_l2[i].get("facet_rescued")),
+                            len(selected_l2) - 1,
+                        )
+                        selected_l2[rep_idx] = ph
+                    else:
+                        selected_l2.append(ph)
+                    seen_sel_keys.add(pkey)
+                    rescued_any = True
+                    break
+            if rescued_any:
+                formatted_l2 = self._format_l2_blocks(
+                    selected_l2, plan, l2_char_budget, snap=snap, resolve_mirror_fn=resolve_mirror_fn
+                )
 
         # Layer-4 Operational Memory & 1-hop Source-Anchored Errata Pins
         retrieved_src_set: set[str] = set()
@@ -1142,26 +1317,9 @@ class ContextPackEngine:
         ]
 
         # Step 5: Anti-hallucination missing-concept & unmirrored boundary check
-        top_l2_sc = max((float(s.get("score") or 0.0) for s in formatted_l2), default=0.0)
-        top_w_sc_fmt = max((float(w.get("score") or 0.0) for w in formatted_wiki), default=0.0)
-        scoped_l2 = (
-            [s for s in formatted_l2 if float(s.get("score") or 0.0) >= top_l2_sc * 0.35]
-            if top_l2_sc >= 15.0
-            else formatted_l2
+        combined_text, top_l2_sc = _compose_combined_text(
+            formatted_wiki, formatted_l2, pinned_errata_texts, memory_blocks
         )
-        scoped_wiki = (
-            [w for w in formatted_wiki if float(w.get("score") or 0.0) >= top_w_sc_fmt * 0.50]
-            if top_w_sc_fmt >= 15.0
-            else formatted_wiki
-        )
-        combined_text = "\n".join(
-            [
-                *(w["content"] + " " + w["heading"] for w in scoped_wiki),
-                *(s["content"] + " " + s["heading"] + " " + s["source"] for s in scoped_l2),
-                *pinned_errata_texts,
-                *(m["text"] for m in memory_blocks),
-            ]
-        ).lower()
         missing_concepts = self._detect_missing_concepts(plan, combined_text)
         boundary_notes = self._collect_boundary_notes(
             snap,
@@ -1600,7 +1758,7 @@ class ContextPackEngine:
         hdr = (table_header or "").strip() or html_tbl_hdr
         hdr_low = hdr.lower()
         hdr_cost = (len(hdr) + 2) if hdr else 0
-        body_budget = max(240, max_chars - hdr_cost)
+        body_budget = max(min(220, max_chars), max_chars - hdr_cost)
 
         tok_val: dict[str, float] = {}
         for tok, qw in plan.weighted_tokens.items():
@@ -1679,33 +1837,151 @@ class ContextPackEngine:
         shown_e = (base_line_start + line_offsets[best_r]) if base_line_start is not None else None
         return out_text, shown_s, shown_e, (not is_full_span)
 
+    def _expand_heading_only_wiki_hit(self, w: dict, *, max_chars: int) -> tuple[str, int | None, int | None]:
+        """P-09: When a Wiki hit contains only an H1/title line, append its opening `## 概览` / body lines."""
+        raw_text = w.get("text") or ""
+        ls = w.get("line_start")
+        le = w.get("line_end")
+        non_heading = [ln.strip() for ln in raw_text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        if non_heading or not isinstance(ls, int):
+            return raw_text, ls, le
+        src = str(w.get("source") or "")
+        parts = PurePosixPath(src).parts
+        if len(parts) < 2:
+            return raw_text, ls, le
+        try:
+            wiki_root_res = self.cfg.wiki_root.resolve()
+            wfile = (wiki_root_res / PurePosixPath(*parts[1:])).resolve()
+            if wiki_root_res not in wfile.parents or not wfile.is_file():
+                return raw_text, ls, le
+            all_lines = wfile.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return raw_text, ls, le
+
+        start_idx = max(0, ls - 1)
+        picked_lines: list[str] = []
+        total_c = 0
+        seen_subheadings = 0
+        new_end = ls
+        for idx in range(start_idx, min(len(all_lines), start_idx + 28)):
+            ln = all_lines[idx]
+            stripped = ln.strip()
+            if idx > start_idx and re.match(r"^##\s+", stripped):
+                seen_subheadings += 1
+                if seen_subheadings >= 2 or (seen_subheadings == 1 and any(x.strip() and not x.strip().startswith("#") for x in picked_lines)):
+                    break
+            next_c = total_c + len(ln) + 1
+            if picked_lines and next_c > min(680, max(360, max_chars)):
+                break
+            picked_lines.append(ln)
+            total_c = next_c
+            new_end = idx + 1
+        while picked_lines and not picked_lines[-1].strip():
+            picked_lines.pop()
+            new_end -= 1
+        if len(picked_lines) <= len(raw_text.splitlines()):
+            return raw_text, ls, le
+        return "\n".join(picked_lines), ls, max(ls, new_end)
+
     def _format_wiki_blocks(self, wiki_hits: list[dict], plan: QueryPlan, total_budget: int) -> list[dict]:
         if not wiki_hits or total_budget <= 0:
             return []
-        per_budget = max(550, total_budget // len(wiki_hits))
+        per_budget = max(min(550, total_budget // len(wiki_hits)), total_budget // len(wiki_hits))
+        per_budget = max(240, per_budget)
         out: list[dict] = []
         for idx, w in enumerate(wiki_hits, 1):
+            exp_text, exp_s, exp_e = self._expand_heading_only_wiki_hit(w, max_chars=per_budget)
             content, shown_s, shown_e, windowed = self._window_block_safely(
-                w.get("text") or "",
+                exp_text,
                 plan=plan,
                 q_idf=w.get("_q_idf"),
                 table_header=w.get("table_header") or "",
                 max_chars=per_budget,
-                base_line_start=w.get("line_start"),
+                base_line_start=exp_s,
             )
             out.append({
                 "id": f"W{idx}",
                 "source": w["source"],
                 "title": w.get("title") or "",
                 "heading": w.get("heading") or "",
-                "line_start": shown_s if shown_s is not None else w.get("line_start"),
-                "line_end": shown_e if shown_e is not None else w.get("line_end"),
+                "line_start": shown_s if shown_s is not None else exp_s,
+                "line_end": shown_e if shown_e is not None else exp_e,
                 "freshness": w.get("freshness") or "unverified",
                 "score": w.get("score"),
                 "windowed": windowed,
                 "content": content,
             })
         return out
+
+    @staticmethod
+    def _align_section_line_start(text: str, sec_s: int | None, sec_e: int | None, mirror_lines: list[str] | None) -> int | None:
+        """P-05(a): Re-align `line_start` when indexed chunk text had leading blank lines stripped."""
+        if not isinstance(sec_s, int) or not text or not mirror_lines:
+            return sec_s
+        first_line = text.splitlines()[0].strip()
+        if not first_line:
+            return sec_s
+        lo = max(0, sec_s - 1)
+        hi = min(len(mirror_lines), (sec_e if isinstance(sec_e, int) else sec_s + 5))
+        if lo < len(mirror_lines) and mirror_lines[lo].strip() == first_line:
+            return sec_s
+        for idx in range(lo, min(len(mirror_lines), lo + 6)):
+            if mirror_lines[idx].strip() == first_line:
+                return idx + 1
+        return sec_s
+
+    @staticmethod
+    def _expand_enumeration_tail(
+        text: str,
+        *,
+        sec_e: int | None,
+        mirror_lines: list[str] | None,
+        question: str,
+        max_chars: int,
+    ) -> tuple[str, int | None]:
+        """P-06: Pull sibling enumeration sub-headings/items immediately after a truncated list header."""
+        if not isinstance(sec_e, int) or not mirror_lines or len(text) >= int(max_chars * 0.70):
+            return text, sec_e
+        has_enum_intent = bool(re.search(r"(?:哪些|哪几|分别|组成|包含|包括|几个|六个|四个|五个|三个|步骤|子系统|分类|清单)", question))
+        has_list_cue = bool(re.search(r"(?:组成|包括|包含|分为|如下|以下|步骤)", text))
+        if not (has_enum_intent or has_list_cue):
+            return text, sec_e
+
+        start_idx = sec_e  # 0-based line right after 1-based sec_e
+        if start_idx >= len(mirror_lines):
+            return text, sec_e
+
+        first_non_blank = ""
+        for j in range(start_idx, min(len(mirror_lines), start_idx + 6)):
+            if mirror_lines[j].strip():
+                first_non_blank = mirror_lines[j].strip()
+                break
+        sibling_re = re.compile(
+            r"^(?:#{1,4}\s+(?:\d+[A-Za-z]\b|[一二三四五六七八九十]+、|\d+[.、\s]|步骤|[（(]\d+[)）])|"
+            r"[-*•]\s+|\d+[.、)）]\s+)"
+        )
+        if not sibling_re.match(first_non_blank):
+            return text, sec_e
+
+        extra: list[str] = []
+        used = len(text) + 16
+        new_e = sec_e
+        for j in range(start_idx, min(len(mirror_lines), start_idx + 65)):
+            ln = mirror_lines[j]
+            st = ln.strip()
+            if j > start_idx and re.match(r"^#{1,2}\s+", st) and not sibling_re.match(st):
+                break
+            if used + len(ln) + 1 > max_chars:
+                break
+            extra.append(ln)
+            used += len(ln) + 1
+            new_e = j + 1
+        while extra and not extra[-1].strip():
+            extra.pop()
+            new_e -= 1
+        if not extra:
+            return text, sec_e
+        return f"{text}\n" + "\n".join(extra), max(sec_e, new_e)
 
     def _format_l2_blocks(
         self,
@@ -1725,14 +2001,16 @@ class ContextPackEngine:
         weights = [lead_w if i == 0 else (1.05 if i == 1 else 0.85) for i in range(n)]
         w_sum = sum(weights) or 1.0
 
-        # Water-filling budget allocation: recycle unused chars from compact blocks to longer top hits
-        allocs = [max(480, int(total_budget * (wt / w_sum))) for wt in weights]
+        # P-07: Proportional per-block floor so tight `max_tokens` budgets stay respected
+        per_floor = min(420, max(160, total_budget // max(n, 1)))
+        keep_floor = min(240, max(120, per_floor))
+        allocs = [max(per_floor, int(total_budget * (wt / w_sum))) for wt in weights]
         text_lens = [len(h.get("text") or "") + len(h.get("table_header") or "") + 16 for h in l2_hits]
         surplus = 0
         needy_indices: list[int] = []
         for i in range(n):
             if text_lens[i] < allocs[i]:
-                freed = allocs[i] - max(240, text_lens[i])
+                freed = allocs[i] - max(keep_floor, text_lens[i])
                 if freed > 0:
                     allocs[i] -= freed
                     surplus += freed
@@ -1746,42 +2024,58 @@ class ContextPackEngine:
         dup_map = getattr(snap, "duplicates_by_source", {}) or {}
         assets_map = getattr(snap, "assets_by_source", {}) or {}
         docs_by_src = {r.get("source"): r for r in (getattr(snap, "docs", ()) or ()) if isinstance(r, dict)}
-        mirror_lines_cache: dict[str, int] = {}
+        mirror_lines_cache: dict[str, list[str] | None] = {}
 
-        def _doc_total_lines(src_name: str) -> int | None:
+        def _get_mirror_lines(src_name: str) -> list[str] | None:
             if src_name in mirror_lines_cache:
                 return mirror_lines_cache[src_name]
-            d_row = docs_by_src.get(src_name) or {}
-            if isinstance(d_row.get("lines"), int) and d_row["lines"] > 0:
-                mirror_lines_cache[src_name] = d_row["lines"]
-                return d_row["lines"]
             if resolve_mirror_fn is not None and self.cfg.is_source_ref(src_name):
                 rel_p = self.cfg.strip_source_prefix(src_name)
                 mp = resolve_mirror_fn(src_name, rel_p)
                 if mp is not None and mp.is_file():
                     try:
-                        cnt = len(mp.read_text(encoding="utf-8", errors="replace").splitlines())
-                        mirror_lines_cache[src_name] = cnt
-                        return cnt
+                        ml = mp.read_text(encoding="utf-8", errors="replace").splitlines()
+                        mirror_lines_cache[src_name] = ml
+                        return ml
                     except OSError:
                         pass
+            mirror_lines_cache[src_name] = None
             return None
+
+        def _doc_total_lines(src_name: str) -> int | None:
+            d_row = docs_by_src.get(src_name) or {}
+            if isinstance(d_row.get("lines"), int) and d_row["lines"] > 0:
+                return d_row["lines"]
+            ml = _get_mirror_lines(src_name)
+            return len(ml) if ml is not None else None
 
         out: list[dict] = []
 
         for idx, (h, alloc) in enumerate(zip(l2_hits, allocs), 1):
+            src = h["source"]
+            raw_text = h.get("text") or ""
+            sec_s = h.get("line_start")
+            sec_e = h.get("line_end")
+            ml = _get_mirror_lines(src) if resolve_mirror_fn is not None else None
+            eff_sec_s = self._align_section_line_start(raw_text, sec_s, sec_e, ml)
+            if idx <= 2 and (h.get("kind") or "section") == "section" and ml is not None:
+                raw_text, sec_e = self._expand_enumeration_tail(
+                    raw_text,
+                    sec_e=sec_e,
+                    mirror_lines=ml,
+                    question=plan.question,
+                    max_chars=alloc,
+                )
+
             content, shown_s, shown_e, windowed = self._window_block_safely(
-                h.get("text") or "",
+                raw_text,
                 plan=plan,
                 q_idf=h.get("_q_idf"),
                 table_header=h.get("table_header") or "",
                 max_chars=alloc,
-                base_line_start=h.get("line_start"),
+                base_line_start=eff_sec_s,
             )
-            src = h["source"]
             tot_l = _doc_total_lines(src)
-            sec_s = h.get("line_start")
-            sec_e = h.get("line_end")
             if tot_l is not None:
                 if isinstance(shown_e, int) and shown_e > tot_l:
                     shown_e = tot_l
@@ -1793,9 +2087,9 @@ class ContextPackEngine:
                 "source": src,
                 "kind": h.get("kind") or "section",
                 "heading": h.get("heading") or "",
-                "line_start": shown_s if shown_s is not None else sec_s,
+                "line_start": shown_s if shown_s is not None else eff_sec_s,
                 "line_end": shown_e if shown_e is not None else sec_e,
-                "section_line_start": sec_s,
+                "section_line_start": eff_sec_s,
                 "section_line_end": sec_e,
                 "page_num": h.get("page_num"),
                 "score": h.get("score"),
@@ -1808,7 +2102,7 @@ class ContextPackEngine:
                 rm_end = min(shown_e + 80, tot_l) if tot_l is not None else (shown_e + 80)
                 already_covers_all = (
                     tot_l is not None
-                    and shown_s <= (sec_s or 1)
+                    and shown_s <= (eff_sec_s or 1)
                     and shown_e >= tot_l
                 )
                 if not already_covers_all and rm_end >= rm_start:
@@ -1832,39 +2126,86 @@ class ContextPackEngine:
             out.append(entry)
         return out
 
+    @staticmethod
+    def _concept_present_in_text(
+        lbl: str,
+        tset: set[str],
+        text_lower: str,
+        compact_text: str,
+        *,
+        synonym_book: SynonymBook | None = None,
+    ) -> bool:
+        low_lbl = lbl.lower().strip()
+        if not low_lbl:
+            return True
+        syns = synonym_book.expand(lbl) if synonym_book is not None else []
+
+        # P-03: Structured standard identifiers (`GB/T 49999`, `TB/T 3590`, `IEC 61373`) must match intact with digit boundary
+        if _STRUCTURED_STD_RE.fullmatch(lbl):
+            m_std = re.match(r"^([a-z/]+)\s*[-–—]?\s*(\d[\d.\-–—]*)$", low_lbl)
+            if m_std:
+                pfx = re.escape(m_std.group(1))
+                num_body = re.sub(r"\s+", "", m_std.group(2))
+                std_pat = rf"(?<![a-z0-9]){pfx}\s*[-–—]?\s*{re.escape(num_body)}(?![0-9])"
+                if re.search(std_pat, text_lower):
+                    return True
+                return any(s.lower() in text_lower for s in syns)
+
+        # P-03: Numeric/alphanumeric codes require token boundaries so `49999` never matches `400001` and `6C` never matches `16C`
+        if re.search(r"\d", low_lbl) and re.fullmatch(r"[a-z0-9._\-/+]+", low_lbl):
+            code_pat = rf"(?<![a-z0-9]){re.escape(low_lbl)}(?![a-z0-9])"
+            if re.search(code_pat, text_lower):
+                return True
+            parts = [re.escape(p) for p in re.split(r"[.\-/+_\s]+", low_lbl) if p]
+            if len(parts) > 1:
+                sep_pat = r"[.\-/+\s_]*".join(parts)
+                if re.search(rf"(?<![a-z0-9]){sep_pat}(?![a-z0-9])", text_lower):
+                    return True
+            return any(
+                re.search(rf"(?<![a-z0-9]){re.escape(s.lower())}(?![a-z0-9])", text_lower)
+                if re.fullmatch(r"[a-z0-9._\-/+]+", s.lower())
+                else (s.lower() in text_lower)
+                for s in syns
+            )
+
+        if low_lbl in text_lower:
+            return True
+        compact_lbl = re.sub(r"[.\-/+_\s]+", "", low_lbl)
+        if len(compact_lbl) >= 3 and compact_lbl in compact_text:
+            return True
+        if any(s.lower() in text_lower for s in syns):
+            return True
+        if len(low_lbl) >= 3 and len(tset) >= 2 and all(t in text_lower for t in tset):
+            return True
+        if 2 <= len(low_lbl) <= 3 and CJK_RUN_RE.fullmatch(low_lbl):
+            if re.search(rf"{re.escape(low_lbl[0])}[\u4e00-\u9fff]{re.escape(low_lbl[1:])}", text_lower):
+                return True
+        if len(low_lbl) >= 4 and CJK_RUN_RE.fullmatch(low_lbl):
+            bgs = [low_lbl[i:i + 2] for i in range(len(low_lbl) - 1)]
+            hits = sum(1 for bg in bgs if bg in text_lower)
+            p1, p2 = re.escape(low_lbl[:2]), re.escape(low_lbl[2:])
+            near_4 = (
+                len(low_lbl) == 4
+                and bool(re.search(rf"{p1}[^\n]{{0,16}}{p2}|{p2}[^\n]{{0,16}}{p1}", text_lower))
+            )
+            if near_4 or (len(bgs) >= 4 and hits >= len(bgs) - 1):
+                return True
+        return False
+
     def _detect_missing_concepts(self, plan: QueryPlan, combined_text_lower: str) -> list[str]:
         if not plan.core_concepts:
             return []
         compact_combined = re.sub(r"[.\-/+_\s]+", "", combined_text_lower)
+        syn_book = getattr(self, "synonym_book", None)
         missing: list[str] = []
         for lbl, tset in plan.core_concepts:
             low_lbl = lbl.lower()
             if low_lbl in _GENERIC_CORE_WORDS or low_lbl in EN_STOPWORDS:
                 continue
-            if low_lbl in combined_text_lower:
-                continue
-            compact_lbl = re.sub(r"[.\-/+_\s]+", "", low_lbl)
-            if len(compact_lbl) >= 3 and compact_lbl in compact_combined:
-                continue
-            syns = self.synonym_book.expand(lbl)
-            if any(s.lower() in combined_text_lower for s in syns):
-                continue
-            if len(low_lbl) >= 3 and len(tset) >= 2 and all(t in combined_text_lower for t in tset):
-                continue
-            if 2 <= len(low_lbl) <= 3 and CJK_RUN_RE.fullmatch(low_lbl):
-                if re.search(rf"{re.escape(low_lbl[0])}[\u4e00-\u9fff]{re.escape(low_lbl[1:])}", combined_text_lower):
-                    continue
-            if len(low_lbl) >= 4 and CJK_RUN_RE.fullmatch(low_lbl):
-                bgs = [low_lbl[i:i + 2] for i in range(len(low_lbl) - 1)]
-                hits = sum(1 for bg in bgs if bg in combined_text_lower)
-                p1, p2 = re.escape(low_lbl[:2]), re.escape(low_lbl[2:])
-                near_4 = (
-                    len(low_lbl) == 4
-                    and bool(re.search(rf"{p1}[^\n]{{0,16}}{p2}|{p2}[^\n]{{0,16}}{p1}", combined_text_lower))
-                )
-                if near_4 or (len(bgs) >= 4 and hits >= len(bgs) - 1):
-                    continue
-            missing.append(lbl)
+            if not ContextPackEngine._concept_present_in_text(
+                lbl, tset, combined_text_lower, compact_combined, synonym_book=syn_book
+            ):
+                missing.append(lbl)
         return missing
 
     def _collect_boundary_notes(

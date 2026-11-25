@@ -185,7 +185,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
   useEffect(() => {
     const dp = activeVault?.domain_profile;
     setProfileDomain(dp?.domain || "");
-    setProfileHints((dp?.entity_hints || []).join(" / "));
+    setProfileHints((dp?.entity_hints || []).join("；"));
     setProfileTips(dp?.query_tips || "");
   }, [activeVault?.id, activeVault?.domain_profile?.domain, activeVault?.domain_profile?.updated_at, activeVault?.domain_profile?.locked]);
 
@@ -194,7 +194,7 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
     setProfileBusy(action);
     try {
       const hints = profileHints
-        .split(/[/、,，\n]+/)
+        .split(/[;；\n]+/)
         .map((s) => s.trim())
         .filter(Boolean)
         .slice(0, 6);
@@ -1552,14 +1552,14 @@ export const VaultsPage: React.FC<VaultsPageProps> = ({
                         htmlFor={`dp-hints-${activeVault.id}`}
                         className="mb-1 block font-medium text-[var(--ink-secondary)]"
                       >
-                        核心实体命名格式（用 / 分隔，3–5 项）
+                        核心实体命名格式（用 ； 或换行分隔，3–5 项）
                       </label>
                       <input
                         id={`dp-hints-${activeVault.id}`}
                         name="entity_hints"
                         value={profileHints}
                         onChange={(e) => setProfileHints(e.target.value)}
-                        placeholder="例：项目号(JCxx-xx) / 线路与车型 / 核心器件与指标(CTA120/导高/拉出值)"
+                        placeholder="例：项目号(JCxx-xx)；合同号(GWYYYYMMxxx)；标准(GB/T、TB/T)；核心器件(CTA120/PAC110)"
                         className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 text-xs text-[var(--ink-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
                       />
                     </div>

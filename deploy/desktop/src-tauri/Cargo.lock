@@ -4908,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "wiki-context-desktop"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "notify",
  "rand",

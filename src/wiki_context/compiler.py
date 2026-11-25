@@ -2158,6 +2158,41 @@ def collect_domain_profile_signals(cfg: VaultConfig) -> dict[str, Any]:
 
     top_dirs_sorted = sorted(top_dirs, key=lambda x: x.lower())[:30]
 
+    subdirs: list[str] = []
+    seen_subdirs: set[str] = set()
+    folder_code_samples: list[str] = []
+    seen_code_samples: set[str] = set()
+    code_stem_re = re.compile(r"\b(?:JC|YF|GW|GB|TB|IEC|EN)[A-Za-z0-9.\-]{2,}", re.I)
+    if cfg.mirrors_root.is_dir():
+        try:
+            for child in sorted(cfg.mirrors_root.iterdir()):
+                if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+                    continue
+                for sub in sorted(child.iterdir()):
+                    if not sub.is_dir() or sub.is_symlink() or sub.name.startswith("."):
+                        continue
+                    sub_clean = _sanitize_profile_signal(sub.name, max_len=32)
+                    if sub_clean and sub_clean.lower() not in seen_subdirs and len(subdirs) < 18:
+                        seen_subdirs.add(sub_clean.lower())
+                        subdirs.append(sub_clean)
+        except OSError:
+            pass
+        for mp in sorted(cfg.mirrors_root.rglob("*.md")):
+            if mp.is_symlink() or len(folder_code_samples) >= 14:
+                continue
+            rel_parts = mp.relative_to(cfg.mirrors_root).parts
+            if not rel_parts or any(p.startswith(".") for p in rel_parts):
+                continue
+            stem = mp.name.removesuffix(".md")
+            if code_stem_re.search(stem):
+                parent_lbl = _sanitize_profile_signal(rel_parts[-2] if len(rel_parts) >= 2 else rel_parts[0], max_len=20)
+                stem_lbl = _sanitize_profile_signal(stem, max_len=36)
+                entry = f"{parent_lbl}: {stem_lbl}" if parent_lbl else stem_lbl
+                low_e = entry.lower()
+                if entry and low_e not in seen_code_samples:
+                    seen_code_samples.add(low_e)
+                    folder_code_samples.append(entry)
+
     wiki_titles: list[str] = []
     seen_titles: set[str] = set()
     if cfg.wiki_root.is_dir():
@@ -2205,6 +2240,8 @@ def collect_domain_profile_signals(cfg: VaultConfig) -> dict[str, Any]:
         "vault_name": cfg.name,
         "layout": cfg.layout,
         "top_dirs": top_dirs_sorted,
+        "subdirectories": subdirs,
+        "folder_code_samples": folder_code_samples,
         "wiki_titles": wiki_titles,
         "synonym_pairs": synonym_pairs,
         "doc_count": doc_count,
@@ -2303,15 +2340,19 @@ def generate_domain_profile(
         f"Output ONLY a valid JSON object in {lang_note} with keys:\n"
         '{"domain": "...", "entity_hints": ["...", "..."], "query_tips": "..."}\n'
         "Strict rules:\n"
-        "1. Summarize ONLY the industry/engineering scope, typical entity naming formats (e.g. project code patterns like JCxx-xx, device/line/standard types), and keyword-extraction tips.\n"
-        "2. NEVER include contract prices/amounts, personal names, confidential client deals, emails, phone numbers, or credentials.\n"
-        "3. `domain` <= 60 chars; `entity_hints`: 3-5 short items <= 28 chars each; `query_tips` <= 60 chars.\n"
-        "4. Return raw JSON only (no markdown fences or explanation)."
+        "1. Summarize ONLY the core industry/engineering scope covered across directories and titles (include major subsystems, e.g. catenary/pantograph, third-rail, track, gauge/clearance, PHM when present).\n"
+        "2. Infer code semantics strictly from folder/title context (e.g., codes inside contract folders like GWYYYYMMxxx are contract IDs, NOT material IDs; distinguish project codes, contract codes, industry standards like GB/T/TB/T/IEC/EN, core equipment, and metrics).\n"
+        "3. `entity_hints`: 3-5 crisp items <= 28 chars each (avoid cluttering items with multiple '/' delimiters); `domain` <= 60 chars; `query_tips` <= 60 chars.\n"
+        "4. `query_tips` must instruct callers to extract concrete entity codes, subsystems, standards, or metrics into `focus_terms` and drop generic inquiry shells.\n"
+        "5. NEVER include contract prices/amounts, personal names, confidential client deals, emails, phone numbers, or credentials.\n"
+        "6. Return raw JSON only (no markdown fences or explanation)."
     )
     user_payload = json.dumps(
         {
             "vault_name": signals["vault_name"],
             "top_directories": signals["top_dirs"],
+            "subdirectories": signals.get("subdirectories") or [],
+            "folder_and_code_samples": signals.get("folder_code_samples") or [],
             "sample_wiki_titles": signals["wiki_titles"],
             "domain_terminology": signals["synonym_pairs"],
             "counts": {"docs": signals["doc_count"], "wiki_pages": signals["wiki_count"]},

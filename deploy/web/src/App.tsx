@@ -159,6 +159,25 @@ const AppInner: React.FC = () => {
     return () => clearInterval(iv);
   }, [hasHydratingVault]);
 
+  // Low-frequency 30s silent heartbeat when remote vaults exist so gateway disconnects surface automatically
+  const hasRemoteVault = Boolean(overview?.vaults?.some((v) => v.kind === "remote"));
+  useEffect(() => {
+    if (!hasRemoteVault) return;
+    const silentProbe = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      void api
+        .overview()
+        .then((ov) => setOverview(ov))
+        .catch(() => {});
+    };
+    const iv = setInterval(silentProbe, 30000);
+    document.addEventListener("visibilitychange", silentProbe);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", silentProbe);
+    };
+  }, [hasRemoteVault]);
+
   // Root-level compile job polling so progress persists across tab switches & transient failures
   const runningCompileKey = Object.entries(compileJobs)
     .filter(([, job]) => job?.status === "running" && job.job_id)
@@ -332,7 +351,7 @@ const AppInner: React.FC = () => {
         });
         setUpdateModalOpen(true);
       } else {
-        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.8"})`);
+        pushToast("info", `当前已是最新版本 (v${overview?.version || "0.5.9"})`);
       }
     } catch {
       pushToast("info", "暂未检测到线上新版本（请确认网络或已发布 GitHub Release）");

@@ -79,6 +79,22 @@ def _extract_first_table_header(lines: list[str]) -> str:
     return ""
 
 
+def _trim_section_lines(lines: list[str], base_start: int) -> tuple[int, int, str]:
+    """Strip leading/trailing blank lines while adjusting 1-based line offsets accurately."""
+    s_idx = 0
+    e_idx = len(lines)
+    while s_idx < e_idx and not lines[s_idx].strip():
+        s_idx += 1
+    while e_idx > s_idx and not lines[e_idx - 1].strip():
+        e_idx -= 1
+    trimmed = lines[s_idx:e_idx]
+    if not trimmed:
+        return base_start, base_start, ""
+    start_line = base_start + s_idx
+    end_line = start_line + len(trimmed) - 1
+    return start_line, end_line, "\n".join(trimmed).strip()
+
+
 def split_markdown_sections(raw_text: str) -> list[dict]:
     """Split Markdown into table-aware sections (`<= MAX_SECTION_LINES` lines each).
 
@@ -124,13 +140,15 @@ def split_markdown_sections(raw_text: str) -> list[dict]:
     for hpath, s_line, e_line, lines in raw_sections:
         sec_table_hdr = _extract_first_table_header(lines)
         if len(lines) <= TARGET_CHUNK_LINES:
-            chunks.append({
-                "heading_path": hpath,
-                "table_header": sec_table_hdr,
-                "line_start": s_line,
-                "line_end": e_line,
-                "text": "\n".join(lines).strip(),
-            })
+            t_start, t_end, t_text = _trim_section_lines(lines, s_line)
+            if t_text:
+                chunks.append({
+                    "heading_path": hpath,
+                    "table_header": sec_table_hdr,
+                    "line_start": t_start,
+                    "line_end": t_end,
+                    "text": t_text,
+                })
             continue
 
         # Sub-chunk long sections at blank lines or complete table row boundaries
@@ -157,28 +175,32 @@ def split_markdown_sections(raw_text: str) -> list[dict]:
             if should_cut and i < len(lines) - 1:
                 slice_lines = lines[sub_start_offset: i + 1]
                 if any(x.strip() for x in slice_lines):
-                    hdr_for_chunk = _extract_first_table_header(slice_lines) or active_tbl_hdr or sec_table_hdr
-                    chunks.append({
-                        "heading_path": hpath,
-                        "table_header": hdr_for_chunk if any(_is_table_line(x) for x in slice_lines) else "",
-                        "line_start": s_line + sub_start_offset,
-                        "line_end": s_line + i,
-                        "text": "\n".join(slice_lines).strip(),
-                    })
+                    t_start, t_end, t_text = _trim_section_lines(slice_lines, s_line + sub_start_offset)
+                    if t_text:
+                        hdr_for_chunk = _extract_first_table_header(slice_lines) or active_tbl_hdr or sec_table_hdr
+                        chunks.append({
+                            "heading_path": hpath,
+                            "table_header": hdr_for_chunk if any(_is_table_line(x) for x in slice_lines) else "",
+                            "line_start": t_start,
+                            "line_end": t_end,
+                            "text": t_text,
+                        })
                 sub_start_offset = i + 1
             i += 1
 
         if sub_start_offset < len(lines):
             tail = lines[sub_start_offset:]
             if any(x.strip() for x in tail):
-                hdr_for_tail = _extract_first_table_header(tail) or active_tbl_hdr or sec_table_hdr
-                chunks.append({
-                    "heading_path": hpath,
-                    "table_header": hdr_for_tail if any(_is_table_line(x) for x in tail) else "",
-                    "line_start": s_line + sub_start_offset,
-                    "line_end": e_line,
-                    "text": "\n".join(tail).strip(),
-                })
+                t_start, t_end, t_text = _trim_section_lines(tail, s_line + sub_start_offset)
+                if t_text:
+                    hdr_for_tail = _extract_first_table_header(tail) or active_tbl_hdr or sec_table_hdr
+                    chunks.append({
+                        "heading_path": hpath,
+                        "table_header": hdr_for_tail if any(_is_table_line(x) for x in tail) else "",
+                        "line_start": t_start,
+                        "line_end": t_end,
+                        "text": t_text,
+                    })
 
     return [c for c in chunks if c["text"]]
 
