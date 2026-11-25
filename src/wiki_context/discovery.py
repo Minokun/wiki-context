@@ -116,7 +116,7 @@ def decode_pairing_code(code: str, *, allow_loopback: bool = False) -> dict[str,
         raise ValueError("不支持的配对码版本")
     exp = int(payload.get("exp") or 0)
     if exp <= int(time.time()):
-        raise ValueError("配对码已过期（有效期 5 分钟），请在提供端重新生成")
+        raise ValueError("配对码已过期，请在提供端重新生成")
     instance_id = str(payload.get("instance_id") or "").strip()
     fp = str(payload.get("fp") or "").strip()
     otp_id = str(payload.get("otp_id") or "").strip()

@@ -731,7 +731,9 @@ pip install certifi
 | `wctx serve --vault <V> [--test]` | 启动本地 Stdio MCP 服务（9 个工具，默认开启凭证脱敏） |
 | `wctx gateway --vault id=path [--test]` | 启动多人多库 Streamable HTTP MCP + REST 知识网关 |
 | `wctx remote [add\|list\|probe\|remove]` | 填入远程电脑网关地址与令牌（`--url` + `--token`），自动发现授权库并一键挂载至本机 AI 客户端 |
+| `wctx remote pair <wctx1_配对码>` | 用提供端生成的一次性配对码（局域网 / Tailscale）换取本机专属密钥，登记远程库并自动同步本机 AI 客户端；控制台「AI 安装指令」即基于此命令 |
 | `wctx bridge --url <URL> --token <T>` | 将本地 Stdio MCP 客户端桥接至远端 HTTP 网关 |
+| `wctx bridge --vault <本地库ID>` | 桥接已通过 `remote add/pair` 登记的远程库，地址与密钥从本机凭据读取，配置文件中不出现明文密钥 |
 
 ---
 

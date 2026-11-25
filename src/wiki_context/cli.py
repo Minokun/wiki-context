@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -154,6 +155,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_br = sub.add_parser("bridge", help="Local stdio -> remote Streamable HTTP MCP bridge")
     p_br.add_argument("--url", help="Remote `/mcp` endpoint URL (or WCTX_REMOTE_URL)")
     p_br.add_argument("--token", help="Bearer token (or WCTX_TOKEN)")
+    p_br.add_argument(
+        "--vault",
+        help="Local ID of a remote vault registered via `wctx remote add/pair`; URL and token are resolved from wctx's own store",
+    )
+    p_br.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
 
     # remember (Layer-4 operational memory & errata)
     p_rem = sub.add_parser("remember", help="Record an operational insight or source-anchored errata note into Layer-4")
@@ -227,7 +233,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "remote",
         help="Connect to a remote wiki-context gateway (URL + Token) and auto-mount into local AI clients",
     )
-    p_remote.add_argument("action", choices=["list", "probe", "add", "remove"], nargs="?", default="list")
+    p_remote.add_argument("action", choices=["list", "probe", "add", "pair", "remove"], nargs="?", default="list")
+    p_remote.add_argument("code", nargs="?", help="One-time pairing code (wctx1_...) for action=pair (or WCTX_PAIR_CODE)")
+    p_remote.add_argument("--label", help="Device label shown on the provider side for action=pair (default: hostname)")
+    p_remote.add_argument("--allow-loopback", action="store_true", help=argparse.SUPPRESS)
     p_remote.add_argument("--url", help="Remote gateway address, e.g. http://192.168.1.25:8090")
     p_remote.add_argument("--token", help="Bearer token issued by remote gateway (wctx_...)")
     p_remote.add_argument("--vault", action="append", default=[], help="Specific remote vault ID(s) to mount (default: all authorized)")
@@ -236,6 +245,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_remote.add_argument("--config-dir", help="Console & token storage directory (default: ~/.wiki-context)")
 
     return p
+
+
+def _resolve_remote_bridge_target(vault_id: str, config_dir: str | None) -> tuple[str, str]:
+    """Resolve (mcp_url, token) for a registered remote vault without exposing the token on argv."""
+    st = ConsoleState(config_dir=config_dir, enable_watcher=False)
+    try:
+        rec = st.get_vault_record(vault_id)
+        if rec.get("kind") != "remote":
+            raise ValueError(f"知识库 '{vault_id}' 不是远程知识库，本地库请使用 `wctx serve`")
+        gw = str(rec.get("gateway_url") or "").rstrip("/")
+        rvid = str(rec.get("remote_vault_id") or vault_id)
+        token = st.get_remote_token(vault_id)
+        if not gw or not token:
+            raise ValueError(f"远程知识库 '{vault_id}' 缺少网关地址或访问令牌，请重新执行 wctx remote add/pair")
+        return f"{gw}/mcp/{rvid}", token
+    finally:
+        st.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -440,6 +466,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "bridge":
+            if args.vault:
+                url, token = _resolve_remote_bridge_target(args.vault, args.config_dir)
+                return run_bridge(url=args.url or url, token=args.token or token)
             return run_bridge(url=args.url, token=args.token)
 
         if args.cmd == "remember":
@@ -591,6 +620,19 @@ def main(argv: list[str] | None = None) -> int:
                 if args.action == "list":
                     remotes = [v for v in st.list_vaults_detailed() if v.get("kind") == "remote"]
                     print(json.dumps({"count": len(remotes), "remotes": remotes}, ensure_ascii=False, indent=2))
+                    return 0
+                if args.action == "pair":
+                    code = (args.code or os.environ.get("WCTX_PAIR_CODE") or "").strip()
+                    if not code:
+                        raise ValueError("Usage: wctx remote pair <wctx1_配对码>（或设置 WCTX_PAIR_CODE）")
+                    res = st.connect_with_pairing_code(
+                        code=code,
+                        client_label=args.label or "",
+                        selected_remote_ids=args.vault or None,
+                        sync_clients=not args.no_sync_clients,
+                        allow_loopback=bool(args.allow_loopback),
+                    )
+                    print(json.dumps(res, ensure_ascii=False, indent=2))
                     return 0
                 if args.action == "add":
                     res = st.connect_remote_gateway(

@@ -723,7 +723,9 @@ Resolution order: `WCTX_CA_BUNDLE` → `SSL_CERT_FILE` → bundled `certifi` →
 | `wctx serve --vault <V> [--test]` | Run local stdio MCP server (9 tools, secret-scrubbed) |
 | `wctx gateway --vault id=path [--test]` | Run multi-user, multi-vault Streamable HTTP MCP + REST gateway |
 | `wctx remote [add\|list\|probe\|remove]` | Connect to a remote gateway (`--url` + `--token`) & auto-configure local AI clients |
+| `wctx remote pair <wctx1_code>` | Redeem a one-time pairing code (LAN / Tailscale) for a device-scoped token, register remote vaults & auto-configure local AI clients; powers the console's "AI install prompt" |
 | `wctx bridge --url <URL> --token <T>` | Bridge local stdio MCP clients to a remote HTTP gateway |
+| `wctx bridge --vault <local_id>` | Bridge a remote vault registered via `remote add/pair`; URL & token are read from wctx's own store, no plaintext token in client configs |
 
 ---
 

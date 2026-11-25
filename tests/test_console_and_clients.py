@@ -4,6 +4,8 @@ Multi-Client MCP Config Sync (DSH, Codex, Claude Code, WorkBuddy, Cursor), and L
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import re
 import sys
@@ -991,6 +993,44 @@ class TestConsoleAndClients(unittest.TestCase):
             # Unconfigured ACL (`acl == {}`) allows paired `reader` tokens full read in their `allowed_vaults`
             paired_tok = consumer_state.get_remote_token(conn1["connected_vaults"][0]["id"])
             self.assertTrue(paired_tok.startswith("wctx_"))
+
+            # 2b. `wctx remote pair <code>` CLI + `wctx bridge --vault` token resolution (AI self-install path)
+            from wiki_context import cli as wctx_cli
+
+            cli_cfg = self.root / "cli-consumer-home"
+            ticket_cli = self.state.pairing.create_pairing_code(
+                host_label="split-host",
+                instance_id=self.state.instance_id,
+                fp=self.state.fp,
+                urls=[f"http://127.0.0.1:{gw_port}"],
+                allowed_vaults=["wiki-split"],
+                groups=["reader"],
+                allow_loopback=True,
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wctx_cli.main([
+                    "remote", "pair", ticket_cli["code"],
+                    "--config-dir", str(cli_cfg), "--label", "Agent Box",
+                    "--allow-loopback", "--no-sync-clients",
+                ])
+            self.assertEqual(rc, 0)
+            pair_out = json.loads(buf.getvalue())
+            self.assertNotIn("token", pair_out)
+            cli_vid = pair_out["connected_vaults"][0]["id"]
+            br_url, br_tok = wctx_cli._resolve_remote_bridge_target(cli_vid, str(cli_cfg))
+            self.assertEqual(br_url, f"http://127.0.0.1:{gw_port}/mcp/wiki-split")
+            self.assertTrue(br_tok.startswith("wctx_"))
+            # Single-use: replaying the same code must fail
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    wctx_cli.main([
+                        "remote", "pair", ticket_cli["code"],
+                        "--config-dir", str(cli_cfg), "--allow-loopback", "--no-sync-clients",
+                    ]),
+                    2,
+                )
+
             mcp_hdrs = {"Authorization": f"Bearer {paired_tok}", "Content-Type": "application/json"}
 
             def _mcp_tool(vault_id: str, tool_name: str, args: dict) -> dict:

@@ -51,7 +51,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
       baseUrl: cfg.baseUrl.replace(/\/+$/, ""),
       adminToken: isAdminSecret ? tok : undefined,
       csrfToken: isAdminSecret ? undefined : tok,
-      version: cfg.version || "0.5.5",
+      version: cfg.version || "0.5.6",
     };
     return cachedBootstrap;
   }
@@ -62,7 +62,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
       mode: "web",
       baseUrl: "",
       csrfToken: injected.csrfToken,
-      version: injected.version || "0.5.5",
+      version: injected.version || "0.5.6",
       instanceId: injected.instanceId,
       fp: injected.fp,
     };
@@ -83,7 +83,7 @@ export async function getBootstrapConfig(): Promise<BootstrapConfig> {
     mode: "web",
     baseUrl: "",
     csrfToken: data.csrfToken,
-    version: data.version || "0.5.5",
+    version: data.version || "0.5.6",
     instanceId: data.instanceId,
     fp: data.fp,
   };

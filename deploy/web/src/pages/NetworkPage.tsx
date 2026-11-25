@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Bot,
   AlertTriangle,
   Check,
   ChevronDown,
@@ -19,6 +20,7 @@ import {
 import { api } from "../api/client";
 import { BrandGlyph } from "../components/BrandIcons";
 import { copyToClipboard } from "../platform/adapter";
+import { buildPairingAgentPrompt } from "../utils/agentInstallPrompt";
 import type {
   AclRule,
   ClientInfo,
@@ -60,7 +62,10 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
     code: string;
     expires_at: number;
     urls: string[];
+    vaultIds: string[];
+    forAgent: boolean;
   } | null>(null);
+  const [copiedAgentPrompt, setCopiedAgentPrompt] = useState(false);
   const [remainSec, setRemainSec] = useState<number>(0);
   const [copiedCode, setCopiedCode] = useState(false);
   const copyCodeTimerRef = useRef<number | null>(null);
@@ -184,6 +189,24 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
     }
   }, [focusPairSignal]);
 
+  const agentPrompt = useMemo(() => {
+    if (!generatedCode) return "";
+    let host = "";
+    try {
+      const b64 = generatedCode.code.slice("wctx1_".length).replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+      const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+      host = String(JSON.parse(new TextDecoder().decode(bytes))?.host || "");
+    } catch {
+      host = "";
+    }
+    const allowAll = generatedCode.vaultIds.includes("*");
+    const vs = (allowAll ? localVaults : localVaults.filter((v) => generatedCode.vaultIds.includes(v.id))).map(
+      (v) => ({ id: v.id, name: v.name || v.id }),
+    );
+    return buildPairingAgentPrompt(generatedCode.code, generatedCode.expires_at, host, vs);
+  }, [generatedCode, localVaults]);
+
   const toggleGateway = async () => {
     try {
       if (lan?.running) {
@@ -199,15 +222,29 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
     }
   };
 
-  const handleGenerateCode = async () => {
+  const handleGenerateCode = async (forAgent = false) => {
     try {
+      const reqVaults = pairVaults.length > 0 ? pairVaults : ["*"];
       const res = await api.createPairingCode({
-        allowed_vaults: pairVaults.length > 0 ? pairVaults : ["*"],
+        allowed_vaults: reqVaults,
         groups: pairGroups.length > 0 ? pairGroups : ["reader"],
-        ttl_sec: 300,
+        // AI agents need time to install wctx before redeeming; the code stays single-use.
+        ttl_sec: forAgent ? 900 : 300,
       });
-      setGeneratedCode({ code: res.code, expires_at: res.expires_at, urls: res.urls });
-      onToast("success", "已生成 5 分钟有效的一次性配对码，用完即失效");
+      setCopiedAgentPrompt(false);
+      setGeneratedCode({
+        code: res.code,
+        expires_at: res.expires_at,
+        urls: res.urls,
+        vaultIds: reqVaults,
+        forAgent,
+      });
+      onToast(
+        "success",
+        forAgent
+          ? "已生成 15 分钟有效的 AI 安装指令（内含一次性配对码），复制发给同事即可"
+          : "已生成 5 分钟有效的一次性配对码，用完即失效",
+      );
       onRefresh();
     } catch (e) {
       onToast("error", e instanceof Error ? e.message : String(e));
@@ -803,7 +840,7 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
                 共享给另一台电脑
               </div>
               <p className="mt-1 text-[var(--ink-muted)]">
-                生成 5 分钟有效的一次性配对码，用完即失效，无需手动填写 IP 地址。
+                生成一次性配对码（用完即失效，无需手动填写 IP 地址）；或生成 AI 安装指令，让对方的 AI 自动安装 wctx 并完成配对。
               </p>
 
               <div className="mt-3 space-y-2.5">
@@ -863,13 +900,24 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => void handleGenerateCode()}
-                  className="w-full rounded-lg bg-[var(--accent)] py-2 font-semibold text-white hover:bg-[var(--accent-hover)]"
-                >
-                  生成一次性配对码
-                </button>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateCode(false)}
+                    className="rounded-lg border border-[var(--accent)] bg-[var(--bg-surface)] py-2 font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                  >
+                    生成一次性配对码
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateCode(true)}
+                    title="生成 15 分钟有效的一次性配对码，并包装成可直接粘贴给 AI 的安装指令"
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-[var(--accent)] py-2 font-semibold text-white hover:bg-[var(--accent-hover)]"
+                  >
+                    <Bot className="h-3.5 w-3.5" />
+                    生成 AI 安装指令
+                  </button>
+                </div>
 
                 {/* OTP Ticket Readout */}
                 {generatedCode && (
@@ -910,6 +958,46 @@ export const NetworkPage: React.FC<NetworkPageProps> = ({
                     </div>
                     <div className="mt-1.5 select-all break-all rounded-md border border-[var(--border-default)] bg-[var(--bg-subtle)] p-2 font-mono text-xs text-emerald-700 dark:text-emerald-300">
                       {generatedCode.code}
+                    </div>
+                    <div className="mt-2.5 space-y-1.5 border-t border-[var(--border-default)] pt-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-[var(--ink-secondary)]">
+                          {generatedCode.forAgent ? "AI 安装指令（推荐发给同事）" : "也可以发 AI 安装指令"}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={remainSec <= 0}
+                          onClick={() =>
+                            void copyToClipboard(agentPrompt).then((ok) => {
+                              if (ok) {
+                                setCopiedAgentPrompt(true);
+                                onToast("info", "已复制 AI 安装指令：对方粘贴给 AI 即可自动安装 wctx 并完成配对");
+                              } else {
+                                onToast("error", "浏览器限制自动复制，请展开预览手动复制");
+                              }
+                            })
+                          }
+                          className="inline-flex items-center gap-1 font-semibold text-[var(--accent)] hover:underline disabled:opacity-40"
+                        >
+                          {copiedAgentPrompt ? (
+                            <Check className="h-3.5 w-3.5 text-emerald-500" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                          {copiedAgentPrompt ? "已复制" : "复制 AI 安装指令"}
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-[var(--ink-muted)]">
+                        对方粘贴给 Claude Code / Codex / Cursor 等 AI，AI 会安装 wctx 并执行 <code className="font-mono">wctx remote pair</code> 完成接入；配对码只能用一次，过期后需重新生成。
+                      </p>
+                      <details>
+                        <summary className="cursor-pointer select-none text-[11px] font-medium text-[var(--ink-secondary)] hover:text-[var(--accent)]">
+                          预览指令内容
+                        </summary>
+                        <pre className="mt-1.5 max-h-56 select-all overflow-auto whitespace-pre-wrap rounded-md border border-[var(--border-default)] bg-[var(--bg-subtle)] p-2 font-mono text-[11px]">
+                          {agentPrompt}
+                        </pre>
+                      </details>
                     </div>
                   </div>
                 )}
