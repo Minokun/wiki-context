@@ -64,6 +64,32 @@ class RetrievalQualityV059Test(unittest.TestCase):
         miss5 = ContextPackEngine._detect_missing_concepts(dummy, plan5, irrelevant.lower())
         self.assertNotIn("GB/T 25119", miss5)
 
+        # Prefix-only synonym (`GB/T` <-> `标准和中国国家标准`) must NEVER satisfy `GB/T 49999`
+        syn_file = self.root / "syns_gb.json"
+        syn_file.write_text('{"groups":[{"canonical":["标准和中国国家标准"],"aliases":["GB/T"]}]}', encoding="utf-8")
+        dummy_syn = type("DummySyn", (), {"synonym_book": SynonymBook(syn_file)})()
+        miss_syn = ContextPackEngine._detect_missing_concepts(
+            dummy_syn,
+            plan4,
+            "中华人民共和国国家标准 gb/t 25119-2010 接触网检测装置".lower(),
+        )
+        self.assertIn("GB/T 49999", miss_syn)
+
+        # Long unsegmented CJK negative entities (`量子弓网检测技术`, `包银高铁接触网检测项目`) must keep entity roots
+        p_q = build_query_plan("量子弓网检测技术的检测原理是什么？")
+        self.assertIn("量子弓网", [lbl for lbl, _ in p_q.core_concepts])
+        self.assertIn("量子弓网", ContextPackEngine._detect_missing_concepts(dummy, p_q, "接触网检测原理常规说明"))
+
+        p_b = build_query_plan("包银高铁接触网检测项目的合同金额是多少？")
+        self.assertIn("包银高铁", [lbl for lbl, _ in p_b.core_concepts])
+        self.assertIn("包银高铁", ContextPackEngine._detect_missing_concepts(dummy, p_b, "广深港接触网合同"))
+
+        # D09-2 & D13-1 filler words (`同时`, `物料`) should not be flagged as gaps
+        p_d09 = build_query_plan("天津5号线第3期纪要中，同时由成都弓网科技负责的事项是什么？")
+        self.assertNotIn("同时", [lbl for lbl, _ in p_d09.core_concepts])
+        p_d13 = build_query_plan("物料编号 GW202112577 对应什么物料、哪家供应商？")
+        self.assertNotIn("物料", [lbl for lbl, _ in p_d13.core_concepts])
+
     def test_p05_section_line_offset_exact_after_frontmatter_blank_line(self) -> None:
         raw = "---\nsource: test\n---\n\n会议在沈阳召开。\n\n1. 事项一\n2. 事项二\n"
         secs = split_markdown_sections(raw)
@@ -94,11 +120,12 @@ class RetrievalQualityV059Test(unittest.TestCase):
             "## 6C - 接触网及供电设备地面监测装置\n",
             encoding="utf-8",
         )
-        # Competing textbook exam-question section that previously outranked real course
+        # Competing textbook spaced exam-question & question-mark headings that previously outranked real course
         (src / "教材" / "城市轨道交通概论.md").write_text(
             "# 城市轨道交通概论\n\n"
             + "\n".join(f"第{i}章 概论\n\n讲述城市轨道交通的发展历史若干内容。\n" for i in range(1, 5))
-            + "\n## 复习思考题\n\n"
+            + "\n## 3. 接触网由哪几部分组成？\n\n答：接触悬挂部分和定位装置。\n"
+            + "\n## 复 习 题\n\n"
             "1. 接触网由哪几部分组成？\n"
             "2. 什么是导高和拉出值？\n"
             "3. 简述6C检测系统的组成。\n"

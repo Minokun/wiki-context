@@ -399,7 +399,7 @@ _CJK_INTERROGATIVE_RE = re.compile(
 _SPURIOUS_TRAILING_CJK_RE = re.compile(r"[的了着过在用做以和与及向从对把被是有为里中上下项]$")
 
 _EXAM_HEADING_RE = re.compile(
-    r"(?:复习(?:思考)?题|思考题|简答题|问答题|选择题|填空题|判断题|计算题|习题|课后练习|练习题|自测题|模拟题|考试题|试题)"
+    r"(?:复习(?:思考)?题|思考题|简答题|问答题|选择题|填空题|判断题|计算题|习题|课后练习|练习题|自测题|模拟题|考试题|试题|课堂训练|巩固练习|测评|思考与练习|单元练习|课后题|自测)"
 )
 _QUERY_WANTS_EXAM_RE = re.compile(r"(?:复习题|思考题|简答题|习题|考题|试题|练习题|自测|选择题|填空题|判断题)")
 
@@ -410,8 +410,8 @@ _GENERIC_CORE_WORDS = frozenset({
     "严重", "合格", "正常", "超标", "超限", "背景", "需求", "核心", "内容", "目标", "功能",
     "定位", "概述", "简介", "结论", "结果", "信息", "具体", "详情", "详细", "基本",
     "简要", "简明", "大致", "整体", "总体", "进展", "动态", "方面", "相关", "主要",
-    "简称", "全称", "名称", "标准名称", "主题", "编号", "物料编号", "项目编号", "合同编号",
-    "时间", "日期", "签订时间", "签订日期", "交货期", "完成时限", "参会", "我方", "对方",
+    "简称", "全称", "名称", "标准名称", "主题", "编号", "物料", "物料编号", "项目编号", "合同编号",
+    "时间", "日期", "签订时间", "签订日期", "交货期", "完成时限", "同时", "两家", "三家", "参会", "我方", "对方",
     "改动", "变化", "修改", "字母", "开头", "字母开头", "组成", "部分", "分别", "各自",
     "验收要求", "编写要求", "技术要求", "技术项点要求", "各项技术要求", "文档编写规范", "模板章节要求",
     "基本情况", "项目背景", "交付范围", "设备构成", "最近进展", "最新进展", "最新动态", "项目基本情况",
@@ -423,6 +423,7 @@ _GENERIC_CORE_WORDS = frozenset({
 
 _COMPOUND_HEAD_ANCHORS = frozenset({
     "报告", "保单", "服务器", "数据库", "说明书", "手册", "合同", "清单", "配置", "账号",
+    "高铁", "地铁", "铁路", "城轨", "线路",
 })
 _PAREN_ENUM_RE = re.compile(r"[（(]([^（）()]{4,160})[）)]")
 
@@ -495,8 +496,6 @@ def _is_spurious_cjk_concept(sp: str, *, anchor_set: frozenset[str] | set[str]) 
         return True
     if len(sp) == 4 and sp[:2] in _GENERIC_CORE_WORDS and sp[2:] in _GENERIC_CORE_WORDS:
         return True
-    if len(sp) > 6 and sp not in anchor_set and not any(sp.endswith(a) for a in _COMPOUND_HEAD_ANCHORS):
-        return True
     return False
 
 
@@ -551,13 +550,14 @@ def build_query_plan(
         *(synonym_book.anchor_terms() if synonym_book is not None else ()),
         *_COMPOUND_HEAD_ANCHORS,
         "标准", "规范", "规则", "接口", "协议", "阈值", "范围", "架构",
+        "接触网", "检测", "监测", "技术", "项目", "装置", "系统", "工程", "设备", "原理",
     ]))
     anchor_set = frozenset(anchors)
     clause_filler_re = re.compile(
         r"(?:有一台|有一个|有一份|有一张|有一|有个|我的|你的|他的|她的|我方|对方|咱们|怎么样|怎样|"
         r"(?:第[一二三四五六七八九十百\d]{1,4}|[这那每各]?[几两三四五六七八九十]+|哪(?:几|两|三|一)?)[次期批轮节条项步类种部分个套台名位]|"
         r"哪个|哪几|哪两|哪三|哪家|哪天|哪年|哪月|哪日|哪一|哪类|哪些|哪儿|哪里|谁|多少|几个|几部分|几类|几种|"
-        r"请列出|列出|指出|给出|请问|告诉我|分别|各自|"
+        r"请列出|列出|指出|给出|请问|告诉我|分别|各自|同时|两家|三家|"
         r"与|和|及|或|或者|对|在|从|将|把|被|向|由|跟|的|了|着|过|但|而|中|内|上|下|有|是|"
         r"是否|能否|可不可以|有没有|是不是|为什么|怎么|如何|什么|"
         r"简称|全称|主题|名称|开头|结尾|属于|包含|包括|组成|提出|负责|参与|参会|改动|"
@@ -1058,6 +1058,7 @@ class ContextPackEngine:
         if l2_candidates and not _QUERY_WANTS_EXAM_RE.search(q):
             for h in l2_candidates:
                 hd = str(h.get("heading") or "")
+                hd_compact = re.sub(r"\s+", "", hd)
                 tx = str(h.get("text") or "")
                 non_empty = [ln.strip() for ln in tx.splitlines() if ln.strip() and not ln.strip().startswith("#")]
                 q_line_ratio = (
@@ -1065,10 +1066,10 @@ class ContextPackEngine:
                     if len(non_empty) >= 3
                     else 0.0
                 )
-                if _EXAM_HEADING_RE.search(hd):
+                if _EXAM_HEADING_RE.search(hd_compact):
                     h["score"] = round(float(h.get("score") or 0.0) * 0.22, 4)
-                elif q_line_ratio >= 0.60:
-                    h["score"] = round(float(h.get("score") or 0.0) * 0.30, 4)
+                elif hd.rstrip().endswith(("?", "？")) or q_line_ratio >= 0.60:
+                    h["score"] = round(float(h.get("score") or 0.0) * 0.28, 4)
             l2_candidates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
 
         if include_debug and not acl_filter.allow_all:
@@ -2149,7 +2150,8 @@ class ContextPackEngine:
                 std_pat = rf"(?<![a-z0-9]){pfx}\s*[-–—]?\s*{re.escape(num_body)}(?![0-9])"
                 if re.search(std_pat, text_lower):
                     return True
-                return any(s.lower() in text_lower for s in syns)
+                # Only accept synonyms that preserve the standard's numeric code (never bare prefix synonyms like `GB/T` -> `中国国家标准`)
+                return any(num_body in s.lower() and s.lower() in text_lower for s in syns)
 
         # P-03: Numeric/alphanumeric codes require token boundaries so `49999` never matches `400001` and `6C` never matches `16C`
         if re.search(r"\d", low_lbl) and re.fullmatch(r"[a-z0-9._\-/+]+", low_lbl):

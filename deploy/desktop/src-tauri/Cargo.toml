@@ -1,6 +1,6 @@
 [package]
 name = "wiki-context-desktop"
-version = "0.5.9"
+version = "0.5.10"
 description = "wiki-context Cross-Platform Control Center & Knowledge Gateway"
 authors = ["wiki-context contributors"]
 edition = "2021"
