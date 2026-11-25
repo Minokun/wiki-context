@@ -243,22 +243,28 @@ class GatewayRoutesMixin:
 
     def _send_json(self, status: int, payload: dict | list, extra_headers: dict[str, str] | None = None) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)  # type: ignore[attr-defined]
-        self.send_header("Content-Type", "application/json; charset=utf-8")  # type: ignore[attr-defined]
-        self.send_header("Content-Length", str(len(raw)))  # type: ignore[attr-defined]
-        if extra_headers:
-            for hk, hv in extra_headers.items():
-                self.send_header(hk, hv)  # type: ignore[attr-defined]
-        self.end_headers()  # type: ignore[attr-defined]
-        self.wfile.write(raw)  # type: ignore[attr-defined]
+        try:
+            self.send_response(status)  # type: ignore[attr-defined]
+            self.send_header("Content-Type", "application/json; charset=utf-8")  # type: ignore[attr-defined]
+            self.send_header("Content-Length", str(len(raw)))  # type: ignore[attr-defined]
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)  # type: ignore[attr-defined]
+            self.end_headers()  # type: ignore[attr-defined]
+            self.wfile.write(raw)  # type: ignore[attr-defined]
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _send_empty(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
-        self.send_response(status)  # type: ignore[attr-defined]
-        self.send_header("Content-Length", "0")  # type: ignore[attr-defined]
-        if extra_headers:
-            for hk, hv in extra_headers.items():
-                self.send_header(hk, hv)  # type: ignore[attr-defined]
-        self.end_headers()  # type: ignore[attr-defined]
+        try:
+            self.send_response(status)  # type: ignore[attr-defined]
+            self.send_header("Content-Length", "0")  # type: ignore[attr-defined]
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)  # type: ignore[attr-defined]
+            self.end_headers()  # type: ignore[attr-defined]
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _require_auth(self) -> Principal | None:
         p = self.gateway.tokens.authenticate(self.headers.get("Authorization") or "")  # type: ignore[attr-defined]

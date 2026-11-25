@@ -3177,13 +3177,14 @@ class ConsoleState:
         gen_dir = snap.index._resolve_generation_dir()
         wiki_jsonl = gen_dir / "wiki_sections.jsonl"
         if wiki_jsonl.is_file():
-            for line in wiki_jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                w = json.loads(line)
-                ws = str(w.get("source") or "")
-                if ws and ws not in seen_wiki:
-                    seen_wiki[ws] = list(w.get("sources") or [])
+            with wiki_jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    w = json.loads(line)
+                    ws = str(w.get("source") or "")
+                    if ws and ws not in seen_wiki:
+                        seen_wiki[ws] = list(w.get("sources") or [])
 
         allowed_wiki: list[str] = []
         denied_wiki: list[str] = []
@@ -3475,26 +3476,32 @@ def create_console_server(
 
         def _send_html(self, status: int, html_text: str) -> None:
             raw = html_text.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Frame-Options", "DENY")
-            for hk, hv in self._cors_headers().items():
-                self.send_header(hk, hv)
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Frame-Options", "DENY")
+                for hk, hv in self._cors_headers().items():
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
 
         def _send_bytes(self, status: int, data: bytes, content_type: str, cache_control: str = "public, max-age=3600") -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", cache_control)
-            self.send_header("X-Frame-Options", "DENY")
-            for hk, hv in self._cors_headers().items():
-                self.send_header(hk, hv)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", cache_control)
+                self.send_header("X-Frame-Options", "DENY")
+                for hk, hv in self._cors_headers().items():
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
 
         def _require_admin_csrf(self) -> bool:
             if not self._is_allowed_host():
@@ -3799,6 +3806,9 @@ def create_console_server(
                         q_f = (qs.get("q") or [""])[0]
                         self._send_json(200, state.list_memories(vid, status=st_f, kind=kd_f, query=q_f))
                         return
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+                    return
                 except Exception as exc:
                     self._send_json(400, {"error": str(exc)})
                     return
@@ -4227,6 +4237,9 @@ def create_console_server(
                     return
 
                 self._send_json(404, {"error": f"Unknown API endpoint: {path}"})
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+                return
             except Exception as exc:
                 self._send_json(400, {"error": str(exc)})
 

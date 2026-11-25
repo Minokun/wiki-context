@@ -165,17 +165,18 @@ def load_indexed_hashes(cfg: VaultConfig) -> dict[str, str]:
     docs_jsonl = cfg.index_root / "docs.jsonl"
     hashes: dict[str, str] = {}
     if docs_jsonl.is_file():
-        for line in docs_jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            src = row.get("source")
-            sh = row.get("source_hash")
-            if isinstance(src, str) and isinstance(sh, str) and sh:
-                hashes[cfg.normalize_source_ref(src)] = sh
+        with docs_jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                src = row.get("source")
+                sh = row.get("source_hash")
+                if isinstance(src, str) and isinstance(sh, str) and sh:
+                    hashes[cfg.normalize_source_ref(src)] = sh
     manifest_p = cfg.mirrors_root / ".manifest.json"
     if manifest_p.is_file():
         try:

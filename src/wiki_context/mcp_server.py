@@ -318,21 +318,22 @@ class KBSnapshot:
             duplicates_by_source: dict[str, list[str]] = {}
             docs_p = self.gen_dir / "docs.jsonl"
             if docs_p.is_file():
-                for line in docs_p.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
-                    src = row.get("source") or ""
-                    if is_excluded_source(src, self.exclude_patterns):
-                        continue
-                    docs.append(row)
-                    m_rel = self.cfg.strip_mirror_prefix(row.get("mirror") or "")
-                    if m_rel:
-                        cand = (self.cfg.mirrors_root / m_rel).resolve()
-                        if row.get("manifest") is not False or src not in mirror_by_source:
-                            mirror_by_source[src] = cand
-                    if row.get("duplicates"):
-                        duplicates_by_source[src] = list(row["duplicates"])
+                with docs_p.open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        src = row.get("source") or ""
+                        if is_excluded_source(src, self.exclude_patterns):
+                            continue
+                        docs.append(row)
+                        m_rel = self.cfg.strip_mirror_prefix(row.get("mirror") or "")
+                        if m_rel:
+                            cand = (self.cfg.mirrors_root / m_rel).resolve()
+                            if row.get("manifest") is not False or src not in mirror_by_source:
+                                mirror_by_source[src] = cand
+                        if row.get("duplicates"):
+                            duplicates_by_source[src] = list(row["duplicates"])
             self._mirror_by_source_cache = mirror_by_source
             self._duplicates_by_source_cache = duplicates_by_source
             self._docs_cache = docs
@@ -346,14 +347,68 @@ class KBSnapshot:
             pages_by_source: dict[str, list[dict]] = {}
             pages_p = self.gen_dir / "pages.jsonl"
             if pages_p.is_file():
-                for line in pages_p.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
-                    src = row.get("source") or ""
-                    if not is_excluded_source(src, self.exclude_patterns):
-                        pages_by_source.setdefault(src, []).append(row)
+                with pages_p.open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        src = row.get("source") or ""
+                        if not is_excluded_source(src, self.exclude_patterns):
+                            pages_by_source.setdefault(src, []).append(row)
             self._pages_by_source_cache = pages_by_source
+
+    def read_page_from_sidecar(
+        self,
+        source: str,
+        rel_from_sources: str,
+        page_num: int,
+    ) -> tuple[bool, dict | None]:
+        """Read a single page directly from per-doc sidecar JSON without loading `pages.jsonl`."""
+        m_root = self.cfg.mirrors_root.resolve()
+        cands: list[Path] = [(m_root / f"{rel_from_sources}.json").resolve()]
+        m_mapped = self.mirror_by_source.get(source)
+        if m_mapped is not None:
+            cands.append(Path(str(m_mapped.with_suffix("")) + ".json").resolve())
+
+        sc_path: Path | None = None
+        for cand in cands:
+            if m_root not in cand.parents or cand.is_symlink() or not cand.is_file():
+                continue
+            sc_path = cand
+            break
+        if sc_path is None:
+            return False, None
+
+        max_sidecar_bytes = max(self.cfg.max_doc_bytes * 4, 32 * 1024 * 1024)
+        try:
+            if sc_path.stat().st_size > max_sidecar_bytes:
+                return False, None
+            sc = json.loads(sc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False, None
+
+        pages = sc.get("pages") if isinstance(sc, dict) else None
+        if not isinstance(pages, list):
+            return False, None
+
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            if p.get("page_num") != page_num:
+                continue
+            b_texts = [
+                b.get("content", "")
+                for b in (p.get("blocks") or [])
+                if isinstance(b, dict) and b.get("format") != "placeholder"
+            ]
+            ptxt = "\n".join(x for x in b_texts if x).strip()
+            return True, {
+                "source": source,
+                "page_num": page_num,
+                "page_label": p.get("page_label") or f"Page {page_num + 1}",
+                "text": ptxt,
+            }
+        return True, None
 
     def _ensure_assets_loaded(self) -> None:
         if self._assets_by_source_cache is not None:
@@ -805,9 +860,20 @@ class KBService:
             if not self.policy.can_access_source(user, norm_src):
                 return {"error": f"Access denied (无权访问): {norm_src}"}
 
+            rel_s = self.cfg.strip_source_prefix(norm_src)
             page_num = args.get("page_num")
             if page_num is not None:
                 p_int = int(page_num)
+                found_sc, sc_page = snap.read_page_from_sidecar(norm_src, rel_s, p_int)
+                if found_sc:
+                    if sc_page is not None:
+                        return {
+                            "source": norm_src,
+                            "page_num": p_int,
+                            "page_label": sc_page.get("page_label"),
+                            "text": scrub_secrets(sc_page.get("text") or ""),
+                        }
+                    return {"error": f"Page {p_int} not found for {norm_src}"}
                 plist = snap.pages_by_source.get(norm_src) or []
                 for p in plist:
                     if p.get("page_num") == p_int:
@@ -819,7 +885,6 @@ class KBService:
                         }
                 return {"error": f"Page {p_int} not found for {norm_src}"}
 
-            rel_s = self.cfg.strip_source_prefix(norm_src)
             mpath = self._resolve_mirror_jailed(snap, norm_src, rel_s)
             if mpath is None:
                 return {"error": f"Mirror not found for {norm_src}"}

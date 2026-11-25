@@ -24,8 +24,8 @@ import threading
 import urllib.error
 import urllib.request
 import zlib
-from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -120,11 +120,19 @@ NUM_MEASURE_RE = re.compile(
 CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{1,}")
 
 EN_STOPWORDS = frozenset({
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could", "did", "do", "does",
-    "for", "from", "give", "has", "have", "how", "i", "if", "in", "into", "is", "it",
-    "its", "me", "my", "of", "on", "or", "our", "out", "please", "should", "show", "tell",
-    "that", "the", "their", "them", "there", "these", "this", "those", "to", "us", "was",
-    "we", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+    "a", "about", "above", "after", "against", "all", "also", "an", "and", "another",
+    "any", "are", "around", "as", "at", "be", "because", "been", "before", "being",
+    "between", "both", "but", "by", "can", "could", "did", "do", "does", "during",
+    "each", "either", "even", "every", "for", "from", "give", "had", "has", "have",
+    "here", "how", "however", "i", "if", "in", "into", "is", "it", "its", "just",
+    "many", "may", "me", "might", "more", "most", "much", "must", "my", "neither",
+    "no", "nor", "not", "now", "of", "on", "only", "or", "other", "our", "out",
+    "over", "own", "please", "same", "several", "shall", "should", "show", "since",
+    "so", "some", "still", "such", "tell", "than", "that", "the", "their", "them",
+    "then", "there", "these", "this", "those", "through", "to", "too", "under",
+    "up", "upon", "us", "very", "was", "we", "were", "what", "when", "where",
+    "whether", "which", "while", "who", "whom", "whose", "why", "will", "with",
+    "within", "without", "would", "yet", "you", "your",
 })
 
 CJK_STOP_CHARS = frozenset(
@@ -814,6 +822,14 @@ class BM25Index:
         self._con_lock = threading.Lock()
         self._closed = False
 
+        # Thread-safe memory-bounded decoded unit stats cache & vocab df cache for SQLite backend
+        self._unit_cache_lock = threading.Lock()
+        self._unit_cache: OrderedDict[int, tuple[tuple, dict[str, float], set[str], int]] = OrderedDict()
+        self._unit_cache_bytes = 0
+        self._unit_cache_max_bytes = 48 * 1024 * 1024
+        self._vocab_df_cache: dict[str, int] = {}
+        self._n_sources_cached = 0
+
         # Memory backend fields
         self.units: list[dict] = []
         self.lengths: list[int] = []
@@ -881,6 +897,10 @@ class BM25Index:
             self._closed = True
             cons = list(self._all_cons)
             self._all_cons.clear()
+        with self._unit_cache_lock:
+            self._unit_cache.clear()
+            self._unit_cache_bytes = 0
+            self._vocab_df_cache.clear()
         while True:
             try:
                 self._con_pool.get_nowait()
@@ -891,6 +911,68 @@ class BM25Index:
                 c.close()
             except sqlite3.Error:
                 pass
+
+    def _put_cached_units(
+        self, items: list[tuple[int, tuple, dict[str, float], set[str], int]]
+    ) -> None:
+        if not items or self._closed:
+            return
+        max_single = self._unit_cache_max_bytes // 2
+        with self._unit_cache_lock:
+            for uid, meta_tuple, tf_map, body_set, est_bytes in items:
+                if est_bytes > max_single:
+                    continue
+                if uid in self._unit_cache:
+                    self._unit_cache.move_to_end(uid)
+                    continue
+                self._unit_cache[uid] = (meta_tuple, tf_map, body_set, est_bytes)
+                self._unit_cache_bytes += est_bytes
+            while self._unit_cache_bytes > self._unit_cache_max_bytes and self._unit_cache:
+                _, (_, _, _, evicted_bytes) = self._unit_cache.popitem(last=False)
+                self._unit_cache_bytes -= evicted_bytes
+
+    def tokens_df(self, tokens: Iterable[str]) -> dict[str, int]:
+        """Batch lookup of source document frequency (`df_sources`) per token."""
+        uniq = list(dict.fromkeys(t for t in tokens if t))
+        if not uniq:
+            return {}
+        if self.backend_name != "sqlite":
+            return {t: int(self.df_sources.get(t, 0)) for t in uniq}
+        out: dict[str, int] = {}
+        missing: list[str] = []
+        with self._unit_cache_lock:
+            for t in uniq:
+                if t in self._vocab_df_cache:
+                    out[t] = self._vocab_df_cache[t]
+                else:
+                    missing.append(t)
+        if missing and self._sqlite_path is not None and not self._closed:
+            fetched: dict[str, int] = {}
+            with self._borrow_con() as con:
+                for i in range(0, len(missing), 400):
+                    chunk = missing[i : i + 400]
+                    ph = ",".join("?" for _ in chunk)
+                    for tok, df in con.execute(f"SELECT tok, df_sources FROM vocab WHERE tok IN ({ph})", chunk):
+                        fetched[tok] = int(df or 0)
+            with self._unit_cache_lock:
+                for t in missing:
+                    val = fetched.get(t, 0)
+                    if len(self._vocab_df_cache) < 50000:
+                        self._vocab_df_cache[t] = val
+                    out[t] = val
+        return out
+
+    def token_df(self, token: str) -> int:
+        if not token:
+            return 0
+        return self.tokens_df((token,)).get(token, 0)
+
+    def token_idf(self, token: str) -> float:
+        df = self.token_df(token)
+        if df <= 0:
+            return 0.0
+        n = (self._n_sources_cached if self.backend_name == "sqlite" else self.n_sources) or 1
+        return math.log(1 + (n - df + 0.5) / (df + 0.5))
 
     def _resolve_generation_dir(self) -> Path:
         cur_file = self.cfg.index_root / "current.json"
@@ -918,6 +1000,7 @@ class BM25Index:
                     self._has_acl_pfx = "acl_pfx" in fts_cols
                     meta_map = dict(con.execute("SELECT key, value FROM meta").fetchall())
                     n_u = int(meta_map.get("n_units", "0"))
+                    self._n_sources_cached = int(meta_map.get("n_sources", "0")) or n_u
                     w_meta = dict(con.execute("SELECT key, value FROM wiki_meta").fetchall())
                     n_w = int(w_meta.get("n_units", "0"))
             except IndexUnavailableError:
@@ -941,48 +1024,50 @@ class BM25Index:
         sources_with_sec: set[str] = set()
         raw_l2: list[dict] = []
         if sec_path.is_file():
-            for line in sec_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                src = row.get("source") or ""
-                if self._excluded(src):
-                    continue
-                sources_with_sec.add(src)
-                raw_l2.append({
-                    "kind": "section",
-                    "source": src,
-                    "heading": row.get("heading_path") or row.get("heading") or "",
-                    "table_header": row.get("table_header") or "",
-                    "line_start": row.get("line_start"),
-                    "line_end": row.get("line_end"),
-                    "page_num": None,
-                    "mirror": row.get("mirror") or "",
-                    "text": row.get("text") or "",
-                })
+            with sec_path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    src = row.get("source") or ""
+                    if self._excluded(src):
+                        continue
+                    sources_with_sec.add(src)
+                    raw_l2.append({
+                        "kind": "section",
+                        "source": src,
+                        "heading": row.get("heading_path") or row.get("heading") or "",
+                        "table_header": row.get("table_header") or "",
+                        "line_start": row.get("line_start"),
+                        "line_end": row.get("line_end"),
+                        "page_num": None,
+                        "mirror": row.get("mirror") or "",
+                        "text": row.get("text") or "",
+                    })
 
         if page_path.is_file():
-            for line in page_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                src = row.get("source") or ""
-                if self._excluded(src) or src in sources_with_sec:
-                    continue
-                txt = row.get("text") or ""
-                if not txt.strip():
-                    continue
-                raw_l2.append({
-                    "kind": "page",
-                    "source": src,
-                    "heading": row.get("page_label") or "",
-                    "table_header": "",
-                    "line_start": None,
-                    "line_end": None,
-                    "page_num": row.get("page_num"),
-                    "mirror": row.get("mirror") or "",
-                    "text": txt,
-                })
+            with page_path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    src = row.get("source") or ""
+                    if self._excluded(src) or src in sources_with_sec:
+                        continue
+                    txt = row.get("text") or ""
+                    if not txt.strip():
+                        continue
+                    raw_l2.append({
+                        "kind": "page",
+                        "source": src,
+                        "heading": row.get("page_label") or "",
+                        "table_header": "",
+                        "line_start": None,
+                        "line_end": None,
+                        "page_num": row.get("page_num"),
+                        "mirror": row.get("mirror") or "",
+                        "text": txt,
+                    })
 
         src_sets: dict[str, set[str]] = defaultdict(set)
         all_srcs: set[str] = set()
@@ -1014,28 +1099,29 @@ class BM25Index:
         if wiki_path.is_file():
             w_src_sets: dict[str, set[str]] = defaultdict(set)
             all_w_srcs: set[str] = set()
-            for line in wiki_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                wsrc = row.get("source") or ""
-                if self._excluded(wsrc):
-                    continue
-                widx = len(self.wiki_units)
-                all_w_srcs.add(wsrc)
-                btoks = tokenize(row.get("text") or "")
-                htoks = tokenize(f"{row.get('title') or ''} {row.get('heading') or ''}")
-                tf_w: dict[str, float] = defaultdict(float)
-                for t in btoks:
-                    tf_w[t] += 1.0
-                for t in htoks:
-                    tf_w[t] += self.HEADING_BOOST
-                dl_w = max(1, len(btoks) + len(htoks))
-                self.wiki_units.append(row)
-                self.wiki_lengths.append(dl_w)
-                for tok, freq in tf_w.items():
-                    self.wiki_postings[tok][widx] = freq
-                    w_src_sets[tok].add(wsrc)
+            with wiki_path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    wsrc = row.get("source") or ""
+                    if self._excluded(wsrc):
+                        continue
+                    widx = len(self.wiki_units)
+                    all_w_srcs.add(wsrc)
+                    btoks = tokenize(row.get("text") or "")
+                    htoks = tokenize(f"{row.get('title') or ''} {row.get('heading') or ''}")
+                    tf_w: dict[str, float] = defaultdict(float)
+                    for t in btoks:
+                        tf_w[t] += 1.0
+                    for t in htoks:
+                        tf_w[t] += self.HEADING_BOOST
+                    dl_w = max(1, len(btoks) + len(htoks))
+                    self.wiki_units.append(row)
+                    self.wiki_lengths.append(dl_w)
+                    for tok, freq in tf_w.items():
+                        self.wiki_postings[tok][widx] = freq
+                        w_src_sets[tok].add(wsrc)
             self.wiki_n_sources = len(all_w_srcs)
             self.wiki_avg_len = (sum(self.wiki_lengths) / len(self.wiki_lengths)) if self.wiki_lengths else 1.0
             self.wiki_df_sources = {t: len(s) for t, s in w_src_sets.items()}
@@ -1424,24 +1510,53 @@ class BM25Index:
                 return []
 
             c_ids = list(cand_set)
-            c_ph = ",".join("?" for _ in c_ids)
-            u_rows = con.execute(
-                f"SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z "
-                f"FROM units WHERE id IN ({c_ph})",
-                c_ids,
-            ).fetchall()
+            cached_entries: list[tuple[int, tuple, dict[str, float], set[str]]] = []
+            missing_ids: list[int] = []
+            with self._unit_cache_lock:
+                for cid in c_ids:
+                    entry = self._unit_cache.get(cid)
+                    if entry is not None:
+                        self._unit_cache.move_to_end(cid)
+                        meta_tuple, tf_map, body_set, _ = entry
+                        cached_entries.append((cid, meta_tuple, tf_map, body_set))
+                    else:
+                        missing_ids.append(cid)
+
+            u_rows: list[tuple] = []
+            if missing_ids:
+                for i in range(0, len(missing_ids), 500):
+                    chunk_ids = missing_ids[i : i + 500]
+                    c_ph = ",".join("?" for _ in chunk_ids)
+                    u_rows.extend(
+                        con.execute(
+                            f"SELECT id, kind, source, heading, table_header, line_start, line_end, page_num, mirror, dl, tf_z, body_toks_z "
+                            f"FROM units WHERE id IN ({c_ph})",
+                            chunk_ids,
+                        ).fetchall()
+                    )
+
+            decoded_entries: list[tuple[int, tuple, dict[str, float], set[str]]] = []
+            to_cache: list[tuple[int, tuple, dict[str, float], set[str], int]] = []
+            for uid, ukind, source, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z in u_rows:
+                tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
+                body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
+                meta_tuple = (ukind, source, heading, table_header, ls, le, pnum, mirror, dl)
+                est_bytes = len(tf_z) * 6 + len(btoks_z) * 6 + 384
+                decoded_entries.append((uid, meta_tuple, tf_map, body_set))
+                to_cache.append((uid, meta_tuple, tf_map, body_set, est_bytes))
+            if to_cache:
+                self._put_cached_units(to_cache)
 
             scored_meta: list[tuple[int, float, dict]] = []
             matched_map: dict[int, list[str]] = {}
-            for uid, ukind, source, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z in u_rows:
+            for uid, meta_tuple, tf_map, body_set in (*cached_entries, *decoded_entries):
+                ukind, source, heading, table_header, ls, le, pnum, mirror, dl = meta_tuple
                 if kind and ukind != kind:
                     continue
                 if self._excluded(source):
                     continue
                 if acl_filter is not None and not acl_filter.allow_all and not acl_filter.allows_source(source):
                     continue
-                tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
-                body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
                 sc = 0.0
                 cov_toks: set[str] = set()
                 matched_toks: list[str] = []
@@ -1773,8 +1888,19 @@ class BM25Index:
                 ).fetchall()
             candidates: list[tuple[float, dict]] = []
             for uid, ukind, src, heading, table_header, ls, le, pnum, mirror, dl, tf_z, btoks_z, text_z in u_rows:
-                tf_map: dict[str, float] = json.loads(zlib.decompress(tf_z).decode("utf-8"))
-                body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
+                with self._unit_cache_lock:
+                    cached = self._unit_cache.get(uid)
+                    if cached is not None:
+                        self._unit_cache.move_to_end(uid)
+                        tf_map, body_set = cached[1], cached[2]
+                    else:
+                        tf_map = None
+                        body_set = None
+                if tf_map is None or body_set is None:
+                    tf_map = json.loads(zlib.decompress(tf_z).decode("utf-8"))
+                    body_set = set(json.loads(zlib.decompress(btoks_z).decode("utf-8")))
+                    meta_tuple = (ukind, src, heading, table_header, ls, le, pnum, mirror, dl)
+                    self._put_cached_units([(uid, meta_tuple, tf_map, body_set, len(tf_z) * 6 + len(btoks_z) * 6 + 384)])
                 sc = 0.0
                 cov: set[str] = set()
                 matched: list[str] = []
@@ -1871,6 +1997,11 @@ FACT_PATTERNS: list[tuple[str, str]] = [
 ]
 
 MULTI_Q_RE = re.compile(r"[？?].*[？?]|并且|同时|顺便|另外|以及|\b(?:and\s+also|in\s+addition)\b", re.I)
+_EN_MULTIHOP_CLAUSE_RE = re.compile(
+    r",\s*(?:and|while|whereas|according\s+to|as\s+reported\s+by|reported\s+by)\b|"
+    r"\b(?:according\s+to|as\s+reported\s+by|reported\s+by|article\s+(?:from|by|in|on)|report\s+(?:from|by|in|on))\b",
+    re.I,
+)
 LENGTH_COMPLEX_ZH = 60
 LENGTH_COMPLEX_EN = 160
 
@@ -1896,6 +2027,13 @@ def route(question: str) -> dict:
     len_limit = LENGTH_COMPLEX_ZH if cjk_count >= 4 else LENGTH_COMPLEX_EN
     if len(q) > len_limit:
         reasons.append(f"len>{len_limit}")
+    if cjk_count < 4 and (
+        (_EN_MULTIHOP_CLAUSE_RE.search(q) and len(q) >= 95)
+        or (q.count(",") >= 2 and len(q) >= 115)
+    ):
+        if "en_multihop_clause" not in complex_hits:
+            complex_hits.append("en_multihop_clause")
+        reasons.append("complex:en_multihop_clause")
 
     pure_definition = fact_hits == ["definition"] and not complex_hits
     if complex_hits and not pure_definition:

@@ -15,6 +15,7 @@ evidence bundle (`<wiki_context>`) combining:
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -419,7 +420,29 @@ _GENERIC_CORE_WORDS = frozenset({
     "specification", "standard", "requirement", "requirements", "background", "overview",
     "summary", "status", "issue", "problem", "error", "method", "value", "values", "limit",
     "limits", "threshold", "range", "default", "policy", "rule", "rules", "process", "data",
+    "article", "articles", "report", "reports", "reported", "reporting", "news",
+    "individual", "individuals", "figure", "person", "company", "companies",
+    "suggest", "suggests", "suggested", "according", "regarding", "considering",
+    "discussing", "discussed", "mentioned", "detailing", "published", "portrayal",
+    "compared", "comparing", "consistent", "consistency", "indicate", "indicates",
+    "indicated", "claim", "claims", "claimed", "event", "events", "action", "actions",
+    "nature", "information", "associated", "related", "alleged", "accused",
+    "implicated", "similar", "different", "earlier", "later", "first", "single",
+    "letter", "character", "recently", "practices", "personal", "story", "stories",
 })
+
+_EN_PROPER_PHRASE_RE = re.compile(
+    r"(?<![A-Za-z0-9\-])[A-Z][a-z][A-Za-z0-9'\-]*"
+    r"(?:(?:\s+(?:of|the|and|in|on|for))?\s+[A-Z][a-z][A-Za-z0-9'\-]*){1,3}(?![A-Za-z0-9\-])"
+)
+_EN_PHRASE_LEAD_STOP = frozenset({
+    "who", "which", "what", "where", "when", "why", "how", "does", "did", "do",
+    "is", "are", "was", "were", "has", "have", "had", "can", "could", "would",
+    "should", "considering", "according", "between", "both", "while", "after",
+    "before", "during", "the", "a", "an", "in", "on", "at", "for", "from",
+    "to", "with", "by", "as", "if", "of",
+})
+_EN_PHRASE_TRAIL_GENERIC = frozenset({"article", "articles", "report", "reports", "story", "stories"})
 
 _COMPOUND_HEAD_ANCHORS = frozenset({
     "报告", "保单", "服务器", "数据库", "说明书", "手册", "合同", "清单", "配置", "账号",
@@ -582,6 +605,28 @@ def build_query_plan(
                 local_seen.add(low_std)
                 covered_spans.append((m.start(), m.end()))
                 found.append((raw_std, set(toks)))
+
+        for m in _EN_PROPER_PHRASE_RE.finditer(text_src):
+            if _overlaps(m.start(), m.end()):
+                continue
+            words = m.group(0).split()
+            while words and words[0].lower() in _EN_PHRASE_LEAD_STOP:
+                words.pop(0)
+            while words and words[-1].lower() in _EN_PHRASE_TRAIL_GENERIC:
+                words.pop()
+            cap_words = [w for w in words if w and w[0].isupper()]
+            if len(words) < 2 or len(cap_words) < 2:
+                continue
+            phrase = " ".join(words)
+            low_p = phrase.lower()
+            if low_p in local_seen or low_p in EN_STOPWORDS or low_p in _GENERIC_CORE_WORDS:
+                continue
+            toks, _ = tokenize_query(low_p)
+            sig_toks = {t for t in toks if t not in EN_STOPWORDS and t not in _GENERIC_CORE_WORDS}
+            if len(sig_toks) >= 2:
+                local_seen.add(low_p)
+                covered_spans.append((m.start(), m.end()))
+                found.append((phrase, sig_toks))
 
         for m in LATIN_NUM_RE.finditer(text_src):
             if _overlaps(m.start(), m.end()):
@@ -786,8 +831,28 @@ def build_query_plan(
         if not facet_source_concepts:
             facet_source_concepts = core_concepts
 
+    cjk_q_count = sum(1 for ch in q if "\u4e00" <= ch <= "\u9fff")
+    ordered_facet_cands = list(facet_source_concepts)
+    if cjk_q_count < 4 and len(ordered_facet_cands) > 1:
+        def _en_facet_rank(item: tuple[str, set[str]]) -> tuple[int, int, str]:
+            lbl, _ = item
+            if _STRUCTURED_STD_RE.fullmatch(lbl) or _TECH_CODE_RE.match(lbl) or any(ch.isdigit() for ch in lbl):
+                tier = 0
+            elif " " in lbl:
+                tier = 1
+            elif lbl and lbl[0].isupper():
+                is_special = any(ch.isupper() for ch in lbl[1:]) or bool(
+                    re.search(rf"(?<!^)\b{re.escape(lbl)}\b", core_text_clean)
+                )
+                tier = 2 if is_special else 3
+            else:
+                tier = 4
+            return (tier, -len(lbl), lbl.lower())
+
+        ordered_facet_cands.sort(key=_en_facet_rank)
+
     facets: list[tuple[str, set[str]]] = []
-    for lbl, tset in facet_source_concepts:
+    for lbl, tset in ordered_facet_cands:
         if not any(tset & prev_set for _, prev_set in facets):
             facets.append((lbl, tset))
 
@@ -1077,7 +1142,42 @@ class ContextPackEngine:
             for sh_hit in index.search_weighted(plan.weighted_tokens, plan.groups, k=10, max_per_source=3, query_text=q):
                 allowed_l2(sh_hit.get("source") or "", hit=sh_hit)
 
-        if len(plan.facets) >= 2:
+        active_facets: list[tuple[str, set[str]]] = list(plan.facets)
+        concept_df_map: dict[str, int] = {}
+        has_cjk_q = any("\u4e00" <= ch <= "\u9fff" for ch in q)
+        if not has_cjk_q and len(plan.core_concepts) >= 2:
+            all_c_toks = [t for _, tset in plan.core_concepts for t in tset]
+            concept_df_map = index.tokens_df(all_c_toks)
+            n_src_est = (getattr(index, "_n_sources_cached", 0) or getattr(index, "n_sources", 0) or 1)
+            scored_f: list[tuple[int, float, int, str, set[str]]] = []
+            for lbl, tset in plan.core_concepts:
+                in_vault_idfs = [
+                    math.log(1 + (n_src_est - concept_df_map[t] + 0.5) / (concept_df_map[t] + 0.5))
+                    for t in tset
+                    if concept_df_map.get(t, 0) > 0
+                ]
+                if not in_vault_idfs:
+                    continue
+                is_prop = int(bool(
+                    _STRUCTURED_STD_RE.fullmatch(lbl)
+                    or _TECH_CODE_RE.match(lbl)
+                    or any(ch.isdigit() for ch in lbl)
+                    or " " in lbl
+                    or (lbl and lbl[0].isupper())
+                ))
+                scored_f.append((is_prop, max(in_vault_idfs), len(lbl), lbl, tset))
+            if scored_f:
+                scored_f.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+                idf_facets: list[tuple[str, set[str]]] = []
+                for _, _, _, lbl, tset in scored_f:
+                    if not any(tset & prev_set for _, prev_set in idf_facets):
+                        idf_facets.append((lbl, tset))
+                        if len(idf_facets) >= 4:
+                            break
+                if idf_facets:
+                    active_facets = idf_facets
+
+        if len(active_facets) >= 2:
             wiki_candidates, l2_candidates = self._ensure_facet_candidates(
                 index=index,
                 plan=plan,
@@ -1086,6 +1186,7 @@ class ContextPackEngine:
                 allowed_wiki=allowed_wiki,
                 allowed_l2=allowed_l2,
                 acl_filter=acl_filter,
+                facets=active_facets,
             )
 
         # Step 3: Controlled 1-hop Wiki provenance
@@ -1174,7 +1275,7 @@ class ContextPackEngine:
         merged_pool = self._merge_adjacent_candidates(l2_candidates, resolve_mirror_fn=resolve_mirror_fn)
         selected_l2 = self._select_l2_with_elastic_cap(
             merged_pool,
-            plan.facets,
+            active_facets,
             max_k=target_l2_k,
             route_mode=plan.route_mode,
             q_idf=q_idf_sample,
@@ -1321,7 +1422,27 @@ class ContextPackEngine:
         combined_text, top_l2_sc = _compose_combined_text(
             formatted_wiki, formatted_l2, pinned_errata_texts, memory_blocks
         )
-        missing_concepts = self._detect_missing_concepts(plan, combined_text)
+        uncovered_facets: list[str] = []
+        if plan.route_mode == "complex" and len(active_facets) >= 2:
+            l2_cov_blob = "\n".join(
+                f"{s.get('source', '')} {s.get('heading', '')} {s.get('content', '')}"
+                for s in formatted_l2
+            ).lower()
+            if not concept_df_map and active_facets:
+                concept_df_map = index.tokens_df(t for _, tset in active_facets for t in tset)
+            for flbl, ftoks in active_facets:
+                if any(concept_df_map.get(t, 0) > 0 for t in ftoks) and not self._facet_covered_in_blob(
+                    flbl, ftoks, l2_cov_blob, q_idf=q_idf_sample
+                ):
+                    uncovered_facets.append(flbl)
+
+        missing_concepts = self._detect_missing_concepts(
+            plan,
+            combined_text,
+            index=index,
+            vault_gap_only_en=True,
+            top_l2_score=top_l2_sc,
+        )
         boundary_notes = self._collect_boundary_notes(
             snap,
             formatted_l2,
@@ -1329,6 +1450,7 @@ class ContextPackEngine:
             missing_concepts=missing_concepts,
             top_l2_score=top_l2_sc,
             allowed_l2=allowed_l2,
+            uncovered_facets=uncovered_facets,
         )
 
         context_md = self._render_markdown(
@@ -1380,6 +1502,42 @@ class ContextPackEngine:
 
     # -- Pipeline Helpers --------------------------------------------------- #
 
+    @staticmethod
+    def _facet_covered_in_blob(
+        lbl: str,
+        f_toks: set[str],
+        blob: str,
+        q_idf: dict[str, float] | None = None,
+    ) -> bool:
+        low_lbl = lbl.lower().strip()
+        if not low_lbl:
+            return True
+        if CJK_RUN_RE.search(lbl):
+            return (low_lbl in blob) or any(t in blob for t in f_toks if len(t) >= 2)
+        if re.fullmatch(r"[a-z0-9._\-/+ ]+", low_lbl) and " " in low_lbl:
+            if re.search(rf"(?<![a-z0-9]){re.escape(low_lbl)}(?![a-z0-9])", blob):
+                return True
+        sig = [t for t in f_toks if len(t) >= 2 and t not in EN_STOPWORDS and t not in _GENERIC_CORE_WORDS]
+        if not sig:
+            return True
+        hits = [
+            t
+            for t in sig
+            if (
+                re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", blob)
+                if re.fullmatch(r"[a-z0-9._\-/+]+", t)
+                else (t in blob)
+            )
+        ]
+        if len(sig) == 1:
+            return len(hits) == 1
+        if q_idf:
+            top_sig = max(sig, key=lambda t: q_idf.get(t, 0.0))
+            return top_sig in hits and len(hits) >= max(2, math.ceil(len(sig) * 0.6))
+        if len(sig) <= 3:
+            return len(hits) == len(sig)
+        return len(hits) >= max(2, len(sig) - 1)
+
     def _ensure_facet_candidates(
         self,
         *,
@@ -1390,7 +1548,9 @@ class ContextPackEngine:
         allowed_wiki: Callable[[dict], bool],
         allowed_l2: Callable[[str], bool],
         acl_filter: ACLFilter | None = None,
+        facets: list[tuple[str, set[str]]] | None = None,
     ) -> tuple[list[dict], list[dict]]:
+        use_facets = facets if facets is not None else plan.facets
         top_l2_text = " ".join(
             f"{h.get('source', '')} {h.get('heading', '')} {h.get('text', '')[:500]}"
             for h in l2_candidates[:6]
@@ -1399,18 +1559,21 @@ class ContextPackEngine:
             f"{w.get('source', '')} {w.get('title', '')} {w.get('heading', '')} {w.get('text', '')[:400]}"
             for w in wiki_candidates[:3]
         ).lower()
+        q_idf_sample = (l2_candidates[0].get("_q_idf") if l2_candidates else None) or {}
 
         seen_l2 = {(h.get("source"), h.get("line_start"), h.get("page_num")) for h in l2_candidates}
         seen_w = {(w.get("source"), w.get("line_start")) for w in wiki_candidates}
+        main_top_l2_sc = max((float(h.get("score") or 0.0) for h in l2_candidates), default=0.0)
+        main_top_wiki_sc = max((float(w.get("score") or 0.0) for w in wiki_candidates), default=0.0)
 
-        for lbl, f_toks in plan.facets:
+        for lbl, f_toks in use_facets:
             sub_weights = {t: 1.5 for t in f_toks}
             for k_tok, v_w in plan.core_weighted_tokens.items():
                 if k_tok not in sub_weights:
                     sub_weights[k_tok] = v_w * 0.25
             sub_groups = [set(f_toks)]
 
-            if lbl.lower() not in top_l2_text and not any(t in top_l2_text for t in f_toks if len(t) >= 2):
+            if not self._facet_covered_in_blob(lbl, f_toks, top_l2_text, q_idf=q_idf_sample):
                 for sh in index.search_weighted(
                     sub_weights,
                     sub_groups,
@@ -1421,14 +1584,18 @@ class ContextPackEngine:
                 ):
                     key = (sh.get("source"), sh.get("line_start"), sh.get("page_num"))
                     if key not in seen_l2 and allowed_l2(sh.get("source") or ""):
+                        if main_top_l2_sc > 0.0:
+                            sh["score"] = round(min(float(sh.get("score") or 0.0), main_top_l2_sc * 0.55), 4)
                         sh["facet_rescued"] = lbl
                         l2_candidates.append(sh)
                         seen_l2.add(key)
 
-            if lbl.lower() not in top_wiki_text and not any(t in top_wiki_text for t in f_toks if len(t) >= 2):
+            if not self._facet_covered_in_blob(lbl, f_toks, top_wiki_text, q_idf=q_idf_sample):
                 for sw in index.search_wiki_weighted(sub_weights, sub_groups, k=1, max_per_source=1):
                     wkey = (sw.get("source"), sw.get("line_start"))
                     if wkey not in seen_w and allowed_wiki(sw):
+                        if main_top_wiki_sc > 0.0:
+                            sw["score"] = round(min(float(sw.get("score") or 0.0), main_top_wiki_sc * 0.65), 4)
                         sw["facet_rescued"] = lbl
                         wiki_candidates.append(sw)
                         seen_w.add(wkey)
@@ -1587,13 +1754,19 @@ class ContextPackEngine:
         return picked
 
     @staticmethod
-    def _fold_into_picked(cand: dict, picked: list[dict], picked_sets: list[set[str]]) -> bool:
+    def _fold_into_picked(
+        cand: dict,
+        picked: list[dict],
+        picked_sets: list[set[str]],
+        *,
+        cand_toks: set[str] | None = None,
+    ) -> bool:
         """Return True if ``cand`` is a cross-source near-duplicate of an already-picked chunk (recording provenance)."""
         cand_text = cand.get("text") or ""
         cand_src = cand.get("source") or ""
         if not cand_text or not picked:
             return False
-        ctoks = set(tokenize(cand_text[:1200]))
+        ctoks = cand_toks if cand_toks is not None else set(tokenize(cand_text[:1200]))
         if len(ctoks) < 10:
             return False
         for p, pset in zip(picked, picked_sets):
@@ -1660,23 +1833,37 @@ class ContextPackEngine:
             (float(c.get("score") or 0.0) for c in filtered if c.get("source") != top_src),
             default=0.0,
         )
+        cand_tok_cache: dict[int, set[str]] = {}
+
+        def _cand_toks(c: dict) -> set[str]:
+            cid = id(c)
+            toks = cand_tok_cache.get(cid)
+            if toks is None:
+                toks = set(tokenize((c.get("text") or "")[:1200]))
+                cand_tok_cache[cid] = toks
+            return toks
+
         picked: list[dict] = []
         picked_sets: list[set[str]] = []
         per_src: dict[str, int] = {}
-        reserve = 1 if len(facets) >= 2 and max_k >= 3 else 0
+        is_multi_facet_complex = route_mode == "complex" and len(facets) >= 2 and max_k >= 4
+        reserve = min(len(facets) - 1, 2) if is_multi_facet_complex else (1 if len(facets) >= 2 and max_k >= 3 else 0)
         main_cap = max(1, max_k - reserve)
 
         for c in filtered:
             src = c.get("source") or ""
             cnt = per_src.get(src, 0)
-            if src == top_src:
+            if is_multi_facet_complex:
+                limit = 2 if (src == top_src and float(c.get("score") or 0.0) >= other_best * 1.8) else 1
+            elif src == top_src:
                 limit = 4 if float(c.get("score") or 0.0) >= other_best * 1.4 else 3
             else:
                 limit = 1 if dist_subj_toks else 3
-            if cnt >= limit or self._fold_into_picked(c, picked, picked_sets):
+            ctoks = _cand_toks(c)
+            if cnt >= limit or self._fold_into_picked(c, picked, picked_sets, cand_toks=ctoks):
                 continue
             picked.append(c)
-            picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
+            picked_sets.append(ctoks)
             per_src[src] = cnt + 1
             if len(picked) >= main_cap:
                 break
@@ -1689,19 +1876,35 @@ class ContextPackEngine:
             for lbl, f_toks in facets:
                 if len(picked) >= max_k:
                     break
-                if lbl.lower() in cov_blob or any(t in cov_blob for t in f_toks if len(t) >= 2):
+                if self._facet_covered_in_blob(lbl, f_toks, cov_blob, q_idf=q_idf):
                     continue
-                for c in filtered:
-                    if c in picked or self._fold_into_picked(c, picked, picked_sets):
-                        continue
-                    c_blob = f"{c.get('source', '')} {c.get('heading', '')} {c.get('text', '')[:800]}".lower()
-                    if lbl.lower() in c_blob or any(t in c_blob for t in f_toks):
-                        picked.append(c)
-                        picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
+                chosen = None
+                chosen_blob = ""
+                for require_unseen in (True, False):
+                    for c in filtered:
+                        if c in picked:
+                            continue
                         src = c.get("source") or ""
-                        per_src[src] = per_src.get(src, 0) + 1
-                        cov_blob += " " + c_blob
+                        if require_unseen and per_src.get(src, 0) > 0:
+                            continue
+                        if not require_unseen and per_src.get(src, 0) >= 2:
+                            continue
+                        ctoks = _cand_toks(c)
+                        if self._fold_into_picked(c, picked, picked_sets, cand_toks=ctoks):
+                            continue
+                        c_blob = f"{c.get('source', '')} {c.get('heading', '')} {c.get('text', '')[:800]}".lower()
+                        if self._facet_covered_in_blob(lbl, f_toks, c_blob, q_idf=q_idf):
+                            chosen = c
+                            chosen_blob = c_blob
+                            break
+                    if chosen is not None:
                         break
+                if chosen is not None:
+                    picked.append(chosen)
+                    picked_sets.append(_cand_toks(chosen))
+                    src = chosen.get("source") or ""
+                    per_src[src] = per_src.get(src, 0) + 1
+                    cov_blob += " " + chosen_blob
 
         for c in filtered:
             if len(picked) >= max_k:
@@ -1709,13 +1912,65 @@ class ContextPackEngine:
             if c in picked:
                 continue
             src = c.get("source") or ""
-            sec_limit = 1 if (dist_subj_toks and src != top_src) else 3
-            if per_src.get(src, 0) >= sec_limit or self._fold_into_picked(c, picked, picked_sets):
+            sec_limit = 1 if (dist_subj_toks and src != top_src) else (2 if is_multi_facet_complex else 3)
+            ctoks = _cand_toks(c)
+            if per_src.get(src, 0) >= sec_limit or self._fold_into_picked(c, picked, picked_sets, cand_toks=ctoks):
                 continue
             picked.append(c)
-            picked_sets.append(set(tokenize((c.get("text") or "")[:1200])))
+            picked_sets.append(ctoks)
             per_src[src] = per_src.get(src, 0) + 1
         return picked
+
+    @staticmethod
+    def _prepare_virtual_lines(raw_lines: list[str]) -> tuple[list[str], list[int], str]:
+        """Split single-line HTML table rows into virtual sub-lines preserving 0-based original offsets."""
+        lines: list[str] = []
+        line_offsets: list[int] = []
+        html_tbl_hdr = ""
+        for orig_idx, raw_ln in enumerate(raw_lines):
+            if len(raw_ln) > 300 and "</tr>" in raw_ln.lower() and "<tr" in raw_ln.lower():
+                parts = [p for p in re.split(r"(?i)(?<=</tr>)\s*(?=<tr\b)", raw_ln) if p]
+                if len(parts) >= 2:
+                    if not html_tbl_hdr and len(parts[0]) <= 320:
+                        html_tbl_hdr = parts[0]
+                    for pt in parts:
+                        lines.append(pt)
+                        line_offsets.append(orig_idx)
+                    continue
+            lines.append(raw_ln)
+            line_offsets.append(orig_idx)
+        return lines, line_offsets, html_tbl_hdr
+
+    @staticmethod
+    def _build_window_tok_vals(
+        plan: QueryPlan,
+        q_idf: dict[str, float] | None,
+        hdr_low: str,
+    ) -> dict[str, float]:
+        tok_val: dict[str, float] = {}
+        for tok, qw in plan.weighted_tokens.items():
+            idf = (q_idf or {}).get(tok, 1.0)
+            base_v = qw * (max(0.25, idf) ** 1.35) if q_idf else (qw * max(0.25, idf))
+            if re.search(r"\d", tok):
+                base_v *= 1.25
+            if hdr_low and tok in hdr_low:
+                base_v *= 0.08
+            tok_val[tok] = base_v
+        return tok_val
+
+    @staticmethod
+    def _score_document_lines(lines: list[str], tok_val: dict[str, float]) -> tuple[list[set[str]], list[int]]:
+        line_tok_sets: list[set[str]] = []
+        line_lens: list[int] = []
+        tok_keys = set(tok_val)
+        for ln in lines:
+            low_ln = ln.lower()
+            matched_t = {t for t in tok_val if t in low_ln}
+            if not matched_t:
+                matched_t = set(tokenize(low_ln)) & tok_keys
+            line_tok_sets.append(matched_t)
+            line_lens.append(len(ln) + 1)
+        return line_tok_sets, line_lens
 
     def _window_block_safely(
         self,
@@ -1738,49 +1993,14 @@ class ContextPackEngine:
         if not raw_lines:
             return "", base_line_start, base_line_start, False
 
-        # Split compressed single-line HTML `<table><tr>...</tr></table>` rows into virtual sub-lines
-        # while preserving exact 1-based file line offsets for `wiki_read` alignment.
-        lines: list[str] = []
-        line_offsets: list[int] = []
-        html_tbl_hdr = ""
-        for orig_idx, raw_ln in enumerate(raw_lines):
-            if len(raw_ln) > 300 and "</tr>" in raw_ln.lower() and "<tr" in raw_ln.lower():
-                parts = [p for p in re.split(r"(?i)(?<=</tr>)\s*(?=<tr\b)", raw_ln) if p]
-                if len(parts) >= 2:
-                    if not html_tbl_hdr and len(parts[0]) <= 320:
-                        html_tbl_hdr = parts[0]
-                    for pt in parts:
-                        lines.append(pt)
-                        line_offsets.append(orig_idx)
-                    continue
-            lines.append(raw_ln)
-            line_offsets.append(orig_idx)
-
+        lines, line_offsets, html_tbl_hdr = ContextPackEngine._prepare_virtual_lines(raw_lines)
         hdr = (table_header or "").strip() or html_tbl_hdr
         hdr_low = hdr.lower()
         hdr_cost = (len(hdr) + 2) if hdr else 0
         body_budget = max(min(220, max_chars), max_chars - hdr_cost)
 
-        tok_val: dict[str, float] = {}
-        for tok, qw in plan.weighted_tokens.items():
-            idf = (q_idf or {}).get(tok, 1.0)
-            base_v = qw * max(0.25, idf)
-            # Because `table_header` is automatically pinned above any window slice,
-            # column-header tokens already present in `hdr` must not anchor the window
-            # at row 0 at the expense of row-specific entity keys deeper in the table.
-            if hdr_low and tok in hdr_low:
-                base_v *= 0.08
-            tok_val[tok] = base_v
-
-        line_tok_sets: list[set[str]] = []
-        line_lens: list[int] = []
-        for ln in lines:
-            low_ln = ln.lower()
-            matched_t = {t for t in tok_val if t in low_ln}
-            if not matched_t:
-                matched_t = set(tokenize(low_ln)) & set(tok_val)
-            line_tok_sets.append(matched_t)
-            line_lens.append(len(ln) + 1)
+        tok_val = ContextPackEngine._build_window_tok_vals(plan, q_idf, hdr_low)
+        line_tok_sets, line_lens = ContextPackEngine._score_document_lines(lines, tok_val)
 
         best_l, best_r = 0, 0
         best_unique_sc = -1.0
@@ -1837,6 +2057,112 @@ class ContextPackEngine:
         shown_s = (base_line_start + line_offsets[best_l]) if base_line_start is not None else None
         shown_e = (base_line_start + line_offsets[best_r]) if base_line_start is not None else None
         return out_text, shown_s, shown_e, (not is_full_span)
+
+    def _find_other_matches(
+        self,
+        text: str,
+        *,
+        plan: QueryPlan,
+        q_idf: dict[str, float] | None,
+        table_header: str,
+        base_line_start: int | None,
+        shown_start: int | None,
+        shown_end: int | None,
+        tot_lines: int | None,
+        max_matches: int = 3,
+    ) -> list[dict]:
+        """Locate up to ``max_matches`` non-overlapping residual spans outside ``[shown_start..shown_end]``."""
+        if not text or base_line_start is None or shown_start is None or shown_end is None:
+            return []
+        raw_lines = text.splitlines()
+        if len(raw_lines) < 6:
+            return []
+
+        lines, line_offsets, html_tbl_hdr = self._prepare_virtual_lines(raw_lines)
+        hdr = (table_header or "").strip() or html_tbl_hdr
+        tok_val = self._build_window_tok_vals(plan, q_idf, hdr.lower())
+        if not tok_val:
+            return []
+        line_tok_sets, line_lens = self._score_document_lines(lines, tok_val)
+
+        # Residual downweighting: tokens already displayed in the primary window get 0.20x weight
+        covered_in_shown: set[str] = set()
+        for off, tset in zip(line_offsets, line_tok_sets):
+            abs_ln = base_line_start + off
+            if shown_start <= abs_ln <= shown_end:
+                covered_in_shown.update(tset)
+        res_tok_val = {
+            t: (w * 0.20 if t in covered_in_shown else w)
+            for t, w in tok_val.items()
+        }
+
+        disjoint_indices = [
+            idx
+            for idx, off in enumerate(line_offsets)
+            if (base_line_start + off) < shown_start or (base_line_start + off) > shown_end
+        ]
+        if len(disjoint_indices) < 2:
+            return []
+
+        span_char_cap = 420
+        span_line_cap = 10
+        candidates: list[tuple[float, int, int, set[str]]] = []
+        i = 0
+        while i < len(lines):
+            abs_i = base_line_start + line_offsets[i]
+            if shown_start <= abs_i <= shown_end or not line_tok_sets[i]:
+                i += 1
+                continue
+            cur_c = 0
+            unique_t: set[str] = set()
+            r = i
+            while r < len(lines) and (r - i) < span_line_cap:
+                abs_r = base_line_start + line_offsets[r]
+                if shown_start <= abs_r <= shown_end:
+                    break
+                if r > i and cur_c + line_lens[r] > span_char_cap:
+                    break
+                cur_c += line_lens[r]
+                unique_t.update(line_tok_sets[r])
+                r += 1
+            end_idx = r - 1
+            if unique_t and end_idx >= i:
+                sc = sum(res_tok_val.get(t, 0.0) for t in unique_t)
+                candidates.append((sc, i, end_idx, unique_t))
+            i = max(i + 1, end_idx + 1)
+
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        floor_sc = max(0.8, candidates[0][0] * 0.25)
+
+        picked_ranges: list[tuple[int, int]] = []
+        out: list[dict] = []
+        for sc, l_idx, r_idx, utoks in candidates:
+            if sc < floor_sc:
+                break
+            m_s = base_line_start + line_offsets[l_idx]
+            m_e = base_line_start + line_offsets[r_idx]
+            if tot_lines is not None and m_e > tot_lines:
+                m_e = tot_lines
+            if m_e < m_s:
+                continue
+            if any(not (m_e < ps or m_s > pe) for ps, pe in picked_ranges):
+                continue
+            picked_ranges.append((m_s, m_e))
+            ranked_toks = sorted(utoks, key=lambda t: (-res_tok_val.get(t, 0.0), t))[:5]
+            raw_snip = " ".join(ln.strip() for ln in lines[l_idx : r_idx + 1] if ln.strip())
+            clean_snip = self._scrub(raw_snip)[:180]
+            out.append({
+                "start": m_s,
+                "end": m_e,
+                "matched": ranked_toks,
+                "snippet": clean_snip,
+            })
+            if len(out) >= max_matches:
+                break
+        out.sort(key=lambda item: item["start"])
+        return out
 
     def _expand_heading_only_wiki_hit(self, w: dict, *, max_chars: int) -> tuple[str, int | None, int | None]:
         """P-09: When a Wiki hit contains only an H1/title line, append its opening `## 概览` / body lines."""
@@ -1932,6 +2258,31 @@ class ContextPackEngine:
         return sec_s
 
     @staticmethod
+    def _text_end_line(text: str, sec_s: int | None, mirror_lines: list[str] | None) -> int | None:
+        """1-based file line of ``text``'s last line, or ``None`` when ``text`` is not a verbatim contiguous
+        run of mirror lines starting at ``sec_s`` (and at least one following line exists).
+
+        Indexed section text is stored ``strip()``ped, so with a legacy index its ``line_end`` can sit past the
+        text's real last line (trailing blank lines). Anything appended "after the section" must therefore
+        start right after the *text*, not after ``line_end``: otherwise the lines in between vanish from the
+        display while ``L<a>-L<b>`` labels are still derived from line counts. Checking the whole chunk against
+        the mirror also keeps a stale index from appending lines at a guessed position.
+        """
+        if not isinstance(sec_s, int) or sec_s < 1 or not mirror_lines or not text:
+            return None
+        text_lines = text.splitlines()
+        end_line = sec_s + text.count("\n")  # same derivation as the displayed `L<a>-L<b>` label
+        if end_line >= len(mirror_lines):
+            return None
+        # `text` spans file lines sec_s..end_line; a trailing newline stands for a final blank line
+        # (merged chunks are read verbatim from the mirror and keep it).
+        for offset, mirror_line in enumerate(mirror_lines[sec_s - 1:end_line]):
+            text_line = text_lines[offset] if offset < len(text_lines) else ""
+            if mirror_line.strip() != text_line.strip():
+                return None
+        return end_line
+
+    @staticmethod
     def _expand_enumeration_tail(
         text: str,
         *,
@@ -1939,8 +2290,15 @@ class ContextPackEngine:
         mirror_lines: list[str] | None,
         question: str,
         max_chars: int,
+        sec_s: int | None,
     ) -> tuple[str, int | None]:
-        """P-06: Pull sibling enumeration sub-headings/items immediately after a truncated list header."""
+        """P-06: Pull sibling enumeration sub-headings/items immediately after a truncated list header.
+
+        ``sec_s`` is the aligned file line of ``text``'s first line (``None``: unknown, nothing is appended).
+        Appended lines are the mirror's own lines directly following ``text``, so the result stays one
+        contiguous file slice and the ``L<a>-L<b>`` label derived from its line count stays exact (windowed or
+        not).
+        """
         if not isinstance(sec_e, int) or not mirror_lines or len(text) >= int(max_chars * 0.70):
             return text, sec_e
         has_enum_intent = bool(re.search(r"(?:哪些|哪几|分别|组成|包含|包括|几个|六个|四个|五个|三个|步骤|子系统|分类|清单)", question))
@@ -1948,12 +2306,15 @@ class ContextPackEngine:
         if not (has_enum_intent or has_list_cue):
             return text, sec_e
 
-        start_idx = sec_e  # 0-based line right after 1-based sec_e
+        text_end = ContextPackEngine._text_end_line(text, sec_s, mirror_lines)
+        if text_end is None:
+            return text, sec_e
+        start_idx = text_end  # 0-based index of the line right after `text`
         if start_idx >= len(mirror_lines):
             return text, sec_e
 
         first_non_blank = ""
-        for j in range(start_idx, min(len(mirror_lines), start_idx + 6)):
+        for j in range(start_idx, min(len(mirror_lines), max(start_idx, sec_e) + 6)):
             if mirror_lines[j].strip():
                 first_non_blank = mirror_lines[j].strip()
                 break
@@ -1967,7 +2328,7 @@ class ContextPackEngine:
         extra: list[str] = []
         used = len(text) + 16
         new_e = sec_e
-        for j in range(start_idx, min(len(mirror_lines), start_idx + 65)):
+        for j in range(start_idx, min(len(mirror_lines), max(start_idx, sec_e) + 65)):
             ln = mirror_lines[j]
             st = ln.strip()
             if j > start_idx and re.match(r"^#{1,2}\s+", st) and not sibling_re.match(st):
@@ -2062,6 +2423,7 @@ class ContextPackEngine:
             if idx <= 2 and (h.get("kind") or "section") == "section" and ml is not None:
                 raw_text, sec_e = self._expand_enumeration_tail(
                     raw_text,
+                    sec_s=eff_sec_s,
                     sec_e=sec_e,
                     mirror_lines=ml,
                     question=plan.question,
@@ -2112,6 +2474,18 @@ class ContextPackEngine:
                         "start": rm_start,
                         "end": rm_end,
                     }
+                other_m = self._find_other_matches(
+                    raw_text,
+                    plan=plan,
+                    q_idf=h.get("_q_idf"),
+                    table_header=h.get("table_header") or "",
+                    base_line_start=eff_sec_s,
+                    shown_start=shown_s,
+                    shown_end=shown_e,
+                    tot_lines=tot_l,
+                )
+                if other_m:
+                    entry["other_matches"] = other_m
             elif h.get("kind") == "page" and h.get("page_num") is not None and windowed:
                 entry["read_more"] = {"source": src, "page_num": h.get("page_num")}
 
@@ -2179,6 +2553,33 @@ class ContextPackEngine:
             return True
         if len(low_lbl) >= 3 and len(tset) >= 2 and all(t in text_lower for t in tset):
             return True
+        if re.fullmatch(r"[a-z]{5,}", low_lbl):
+            stem = low_lbl
+            if low_lbl.endswith("ies") and len(low_lbl) >= 6:
+                stem = low_lbl[:-3] + "y"
+            elif low_lbl.endswith(("ches", "shes", "sses", "xes", "zes")) and len(low_lbl) >= 6:
+                stem = low_lbl[:-2]
+            elif low_lbl.endswith("ied") and len(low_lbl) >= 6:
+                stem = low_lbl[:-3] + "y"
+            elif low_lbl.endswith("ing") and len(low_lbl) >= 7:
+                stem = low_lbl[:-3]
+            elif low_lbl.endswith("ed") and len(low_lbl) >= 6:
+                stem = low_lbl[:-2]
+            elif low_lbl.endswith("s") and not low_lbl.endswith("ss"):
+                stem = low_lbl[:-1]
+            if len(stem) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(stem)}[a-z]{{0,4}}(?![a-z0-9])", text_lower):
+                return True
+        if " " in low_lbl and len(tset) >= 2 and re.fullmatch(r"[a-z0-9.\-/+ '\-]+", low_lbl):
+            if all(
+                re.search(rf"(?<![a-z0-9]){re.escape(t[:max(4, len(t) - 2)])}[a-z]{{0,4}}(?![a-z0-9])", text_lower)
+                if (re.fullmatch(r"[a-z]+", t) and len(t) >= 5)
+                else bool(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", text_lower))
+                for t in tset
+            ):
+                return True
+            hyphen_toks = [w for w in low_lbl.split() if "-" in w and len(w) >= 7]
+            if hyphen_toks and any(hw in text_lower for hw in hyphen_toks):
+                return True
         if 2 <= len(low_lbl) <= 3 and CJK_RUN_RE.fullmatch(low_lbl):
             if re.search(rf"{re.escape(low_lbl[0])}[\u4e00-\u9fff]{re.escape(low_lbl[1:])}", text_lower):
                 return True
@@ -2194,20 +2595,53 @@ class ContextPackEngine:
                 return True
         return False
 
-    def _detect_missing_concepts(self, plan: QueryPlan, combined_text_lower: str) -> list[str]:
+    def _detect_missing_concepts(
+        self,
+        plan: QueryPlan,
+        combined_text_lower: str,
+        *,
+        index: BM25Index | None = None,
+        vault_gap_only_en: bool = False,
+        top_l2_score: float = 0.0,
+    ) -> list[str]:
         if not plan.core_concepts:
             return []
         compact_combined = re.sub(r"[.\-/+_\s]+", "", combined_text_lower)
         syn_book = getattr(self, "synonym_book", None)
+        df_map: dict[str, int] = {}
+        is_en_q = not CJK_RUN_RE.search(plan.question)
+        if vault_gap_only_en and index is not None and is_en_q:
+            df_map = index.tokens_df(t for _, tset in plan.core_concepts for t in tset)
+
         missing: list[str] = []
         for lbl, tset in plan.core_concepts:
             low_lbl = lbl.lower()
             if low_lbl in _GENERIC_CORE_WORDS or low_lbl in EN_STOPWORDS:
                 continue
-            if not ContextPackEngine._concept_present_in_text(
+            if ContextPackEngine._concept_present_in_text(
                 lbl, tset, combined_text_lower, compact_combined, synonym_book=syn_book
             ):
-                missing.append(lbl)
+                continue
+            if (
+                vault_gap_only_en
+                and index is not None
+                and is_en_q
+                and not CJK_RUN_RE.search(lbl)
+                and not _STRUCTURED_STD_RE.fullmatch(lbl)
+                and not _TECH_CODE_RE.match(lbl)
+                and not re.search(r"\d", lbl)
+            ):
+                sig_toks = [t for t in tset if t not in EN_STOPWORDS and t not in _GENERIC_CORE_WORDS]
+                if not sig_toks:
+                    continue
+                if lbl.islower() and lbl.isalpha() and " " not in lbl:
+                    all_zero = all(df_map.get(t, 0) == 0 for t in sig_toks)
+                    if top_l2_score >= 3.0 or not all_zero:
+                        continue
+                else:
+                    if not any(df_map.get(t, 0) == 0 for t in sig_toks):
+                        continue
+            missing.append(lbl)
         return missing
 
     def _collect_boundary_notes(
@@ -2219,6 +2653,7 @@ class ContextPackEngine:
         missing_concepts: list[str] | None = None,
         top_l2_score: float = 0.0,
         allowed_l2: Callable[[str], bool] | None = None,
+        uncovered_facets: list[str] | None = None,
     ) -> list[str]:
         notes: list[str] = []
         summary = getattr(snap, "summary", {}) or {}
@@ -2282,7 +2717,15 @@ class ContextPackEngine:
                     else f"'{src}' contains {len(vpages)} visual/diagram page(s); plain-text mirror may omit figure details"
                 )
 
-        if failed_srcs and len(notes) < 3:
+        if uncovered_facets and len(notes) < 4:
+            shown_f = ", ".join(uncovered_facets[:3])
+            notes.append(
+                f"多面问题中关于「{shown_f}」的证据未完整进槽，建议对其单独调用 wiki_search / wiki_read"
+                if is_zh
+                else f"In-vault facet(s) [{shown_f}] were not fully covered in this top-K pack; run wiki_search / wiki_read for those terms"
+            )
+
+        if failed_srcs and len(notes) < 4:
             notes.append(
                 f"全库另有 {len(failed_srcs)} 份史料转换失败未入索引"
                 if is_zh
@@ -2369,6 +2812,13 @@ class ContextPackEngine:
                         lines.append(f'> 🖼️ 关联高清附图: {va_list}（可按需调用 wiki_inspect_visual(source="{s["source"]}") 查看原图）')
                     else:
                         lines.append(f'> 🖼️ Visual figures available: {va_list} (call wiki_inspect_visual(source="{s["source"]}") to view image)')
+                if s.get("other_matches") and plan.token_budget > 1500:
+                    om_parts = [
+                        f"L{m['start']}-L{m['end']} ({', '.join(m['matched'])})"
+                        for m in s["other_matches"][:3]
+                    ]
+                    om_lbl = "本文其他命中位置" if is_zh else "Other matching spans"
+                    lines.append(f"> 📍 {om_lbl}: {'; '.join(om_parts)}")
                 for ep in (s.get("errata_pins") or ()):
                     if is_zh:
                         lines.append(f"> 📌 [原件勘误/变更通知 {ep['id']} by {ep['author']}]: {ep['text']}")
