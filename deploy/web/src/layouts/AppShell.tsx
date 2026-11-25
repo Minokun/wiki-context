@@ -133,11 +133,11 @@ export const AppShell: React.FC<AppShellProps> = ({
               title={checkingUpdate ? "正在检查更新..." : "点击检查在线更新"}
               className="hidden rounded px-1 py-0.5 font-mono text-xs text-[var(--ink-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--ink-primary)] disabled:opacity-60 xl:inline"
             >
-              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.5.3"}`}
+              {checkingUpdate ? "检查中..." : `v${overview?.version || "0.5.4"}`}
             </button>
           ) : (
             <span className="hidden font-mono text-xs text-[var(--ink-muted)] xl:inline">
-              v{overview?.version || "0.5.3"}
+              v{overview?.version || "0.5.4"}
             </span>
           )}
           {mode === "desktop" && availableUpdateVersion && onOpenUpdateModal && (
