@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 #: Explicit user overrides, highest priority first. ``SSL_CERT_FILE`` is honoured
 #: because it is the OpenSSL-native way to point at a bundle.
@@ -285,3 +286,105 @@ def format_network_error(exc: BaseException, *, target: str = "", timeout_sec: f
         return f"目标拒绝连接{where}，请确认服务地址与端口是否正确"
 
     return f"无法连接{where}：{text}"
+
+
+#: Official API hostnames allowed to receive ambient vendor-specific environment keys.
+#: Custom / third-party base URLs must use an explicit ``api_key`` or ``WCTX_API_KEY``
+#: so ambient ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / ``DEEPSEEK_API_KEY`` secrets
+#: are never sent to unintended hosts.
+VENDOR_API_KEY_HOSTS: dict[str, frozenset[str]] = {
+    "OPENAI_API_KEY": frozenset({"api.openai.com"}),
+    "ANTHROPIC_API_KEY": frozenset({"api.anthropic.com"}),
+    "DEEPSEEK_API_KEY": frozenset({"api.deepseek.com"}),
+}
+
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when ``host`` is a local loopback address."""
+    return (host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def validate_llm_base_url(url: str, *, allow_insecure_http: bool = False) -> str:
+    """Validate an outbound LLM/VLM endpoint URL before transmitting API credentials.
+
+    Enforces:
+    - ``https://`` scheme for all non-loopback hosts (unless explicitly opted in via
+      ``allow_insecure_http=True`` or ``WCTX_ALLOW_INSECURE_HTTP=1``);
+    - No embedded userinfo credentials (``user:pass@host``);
+    - Optional strict host allowlist via ``WCTX_ALLOWED_LLM_HOSTS`` (comma-separated).
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("LLM endpoint URL must not be empty")
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").strip().lower()
+    if scheme not in {"http", "https"} or not host:
+        raise ValueError(f"Invalid LLM endpoint URL (expected https:// or local http://): {raw}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("LLM endpoint URL must not embed username/password credentials")
+    if scheme == "http" and not is_loopback_host(host):
+        env_allow = os.environ.get("WCTX_ALLOW_INSECURE_HTTP", "").strip() == "1"
+        if not (allow_insecure_http or env_allow):
+            raise ValueError(
+                f"Refusing plaintext HTTP LLM request to non-local host '{host}'. "
+                "Use https:// or set WCTX_ALLOW_INSECURE_HTTP=1 explicitly."
+            )
+    raw_allowlist = os.environ.get("WCTX_ALLOWED_LLM_HOSTS", "").strip()
+    if raw_allowlist and not is_loopback_host(host):
+        allowed_hosts = {h.strip().lower() for h in raw_allowlist.split(",") if h.strip()}
+        if host not in allowed_hosts:
+            raise ValueError(
+                f"LLM endpoint host '{host}' is not permitted by WCTX_ALLOWED_LLM_HOSTS"
+            )
+    return raw.rstrip("/")
+
+
+def resolve_llm_api_key(
+    base_url: str,
+    *,
+    explicit_key: str | None = None,
+    protocol: str = "openai",
+    vlm: bool = False,
+) -> str:
+    """Resolve the API key for ``base_url`` without leaking vendor keys to foreign hosts.
+
+    Resolution order:
+    1. Explicit ``explicit_key`` argument;
+    2. ``WCTX_VLM_API_KEY`` (when ``vlm=True``) or ``WCTX_API_KEY`` (explicitly bound to wiki-context);
+    3. Ambient vendor keys (``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, ``DEEPSEEK_API_KEY``),
+       **only** when ``base_url`` targets that vendor's official hostname.
+    """
+    if explicit_key and explicit_key.strip():
+        return explicit_key.strip()
+    if vlm:
+        vlm_key = os.environ.get("WCTX_VLM_API_KEY", "").strip()
+        if vlm_key:
+            return vlm_key
+    wctx_key = os.environ.get("WCTX_API_KEY", "").strip()
+    if wctx_key:
+        return wctx_key
+
+    try:
+        host = (urlparse((base_url or "").strip()).hostname or "").strip().lower()
+    except ValueError:
+        host = ""
+    if not host:
+        return ""
+
+    proto = (protocol or "openai").strip().lower()
+    if proto == "anthropic":
+        candidates: tuple[str, ...] = ("ANTHROPIC_API_KEY",)
+    elif vlm:
+        candidates = ("OPENAI_API_KEY",)
+    else:
+        candidates = ("OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+
+    for env_name in candidates:
+        if host in VENDOR_API_KEY_HOSTS.get(env_name, frozenset()):
+            val = os.environ.get(env_name, "").strip()
+            if val:
+                return val
+    return ""

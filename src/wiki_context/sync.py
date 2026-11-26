@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .config import VaultConfig
-from .net import ssl_context
+from .net import resolve_llm_api_key, ssl_context, validate_llm_base_url
 from .state_lock import atomic_write_text, file_lock, resolve_external_tool
 from .extract import (
     ExtractedDocument,
@@ -125,7 +125,7 @@ class HttpVLMProvider:
     def __init__(self, *, model: str, api_key: str, base_url: str = "https://api.openai.com/v1", timeout_sec: int = 90):
         self.model = model
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = validate_llm_base_url(base_url)
         self.timeout_sec = timeout_sec
 
     @classmethod
@@ -133,19 +133,18 @@ class HttpVLMProvider:
         model = os.environ.get("WCTX_VLM_MODEL", "").strip()
         if not model:
             return None
-        key = (
-            os.environ.get("WCTX_VLM_API_KEY")
-            or os.environ.get("WCTX_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or ""
-        ).strip()
-        if not key:
-            return None
-        base_url = (
+        raw_base_url = (
             os.environ.get("WCTX_VLM_BASE_URL")
             or os.environ.get("WCTX_BASE_URL")
             or "https://api.openai.com/v1"
         ).strip()
+        try:
+            base_url = validate_llm_base_url(raw_base_url)
+        except ValueError:
+            return None
+        key = resolve_llm_api_key(base_url, vlm=True)
+        if not key:
+            return None
         return cls(model=model, api_key=key, base_url=base_url)
 
     def caption_image(self, image_path: Path) -> str:
@@ -172,8 +171,9 @@ class HttpVLMProvider:
                 }
             ],
         }).encode("utf-8")
+        endpoint = validate_llm_base_url(f"{self.base_url}/chat/completions")
         req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            endpoint,
             data=payload,
             headers={
                 "Content-Type": "application/json",

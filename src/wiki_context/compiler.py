@@ -43,7 +43,9 @@ from .net import (
     TLSUnavailable,
     describe_trust_store,
     format_network_error,
+    resolve_llm_api_key,
     ssl_context,
+    validate_llm_base_url,
 )
 from .policy import IMAGE_EXTS, mirror_skip_reason
 from .search import is_excluded_source
@@ -330,6 +332,7 @@ def post_llm_json(
     with an empty OpenSSL trust store, where the default context silently trusts
     nothing and ``urlopen`` only reports ``CERTIFICATE_VERIFY_FAILED``.
     """
+    url = validate_llm_base_url(url)
     max_attempts = max(1, int(retries) + 1)
     raw = ""
     for attempt in range(max_attempts):
@@ -437,11 +440,11 @@ def build_http_llm_caller(
     """Create a zero-dependency stdlib HTTP LLM caller (`openai` or `anthropic` wire format)."""
     proto = (protocol or os.environ.get("WCTX_LLM_PROTOCOL") or "openai").strip().lower()
     if proto == "anthropic":
-        key = api_key or os.environ.get("WCTX_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or ""
-        url = (base_url or os.environ.get("WCTX_BASE_URL") or "https://api.anthropic.com/v1").rstrip("/")
+        url = validate_llm_base_url(base_url or os.environ.get("WCTX_BASE_URL") or "https://api.anthropic.com/v1")
+        key = resolve_llm_api_key(url, explicit_key=api_key, protocol="anthropic")
         mdl = model or os.environ.get("WCTX_MODEL") or "claude-sonnet-4-20250514"
         if not key and not is_local_llm_url(url):
-            raise ValueError("Missing API key: set WCTX_API_KEY or ANTHROPIC_API_KEY")
+            raise ValueError("Missing API key: set WCTX_API_KEY or ANTHROPIC_API_KEY (for api.anthropic.com)")
         eff_max_tok = int(max_tokens) if (max_tokens is not None and max_tokens > 0) else 4096
         anth_budget_lock = threading.Lock()
         anth_budget = {"min_max_tokens": eff_max_tok}
@@ -497,17 +500,13 @@ def build_http_llm_caller(
 
         return _call_anthropic
 
-    key = (
-        api_key
-        or os.environ.get("WCTX_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("DEEPSEEK_API_KEY")
-        or ""
-    ).strip()
-    url = (base_url or os.environ.get("WCTX_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    url = validate_llm_base_url(base_url or os.environ.get("WCTX_BASE_URL") or "https://api.openai.com/v1")
+    key = resolve_llm_api_key(url, explicit_key=api_key, protocol="openai")
     mdl = model or os.environ.get("WCTX_MODEL") or "gpt-4o-mini"
     if not key and not is_local_llm_url(url):
-        raise ValueError("Missing API key: set WCTX_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY")
+        raise ValueError(
+            "Missing API key: set WCTX_API_KEY (or OPENAI_API_KEY / DEEPSEEK_API_KEY for official endpoints)"
+        )
 
     thinking_lock = threading.Lock()
     thinking_state = {"kwarg_supported": bool(disable_thinking)}

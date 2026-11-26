@@ -113,6 +113,13 @@ TOOLS_SPEC: list[dict] = [
             "Combines synonym alignment, compiled Wiki synthesis + primary source FTS5 retrieval, table-header pinning, "
             "and missing-concept hallucination guardrails."
         ),
+        "annotations": {
+            "title": "Assemble Deterministic Knowledge Context",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -148,6 +155,13 @@ TOOLS_SPEC: list[dict] = [
             "Low-level lexical BM25/FTS5 lookup returning primary hits (`hits`) and compiled Wiki hits (`wiki_hits`). "
             "Prefer `wiki_context` first for answering questions; use `wiki_search` only for targeted keyword probing when `wiki_context` is insufficient."
         ),
+        "annotations": {
+            "title": "Lexical BM25/FTS5 Knowledge Search",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -168,6 +182,13 @@ TOOLS_SPEC: list[dict] = [
             "Read exact line ranges (`start`..`end`, <=400 lines) or `page_num` (0-based) from derived primary mirrors, "
             "compiled Wiki pages, or the vault catalog."
         ),
+        "annotations": {
+            "title": "Read Exact Source Lines or Page",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -182,6 +203,13 @@ TOOLS_SPEC: list[dict] = [
     {
         "name": "wiki_route",
         "description": "Classify whether a question is a single-lookup `fact` or multi-hop `complex` query.",
+        "annotations": {
+            "title": "Classify Query Complexity",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {"question": {"type": "string"}},
@@ -194,6 +222,13 @@ TOOLS_SPEC: list[dict] = [
             "List indexed documents in the vault (with optional path substring filter). "
             "For answering domain or factual questions, call `wiki_context` directly instead of listing files first."
         ),
+        "annotations": {
+            "title": "List Indexed Vault Documents",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -208,6 +243,13 @@ TOOLS_SPEC: list[dict] = [
             "Return crisp visual diagrams, embedded Office figures, standalone images, or rendered PDF visual pages "
             "as native MCP multimodal `image` content blocks so VLM agents can visually inspect charts and schematics."
         ),
+        "annotations": {
+            "title": "Inspect Visual Figure or PDF Page",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -230,6 +272,13 @@ TOOLS_SPEC: list[dict] = [
             "`notes/` (`记忆/`). Never mutates read-only `sources/`; automatically inherits `PrefixACLPolicy` from `related_sources`. "
             "Do not put credentials (passwords, keys, tokens) in notes; they are redacted."
         ),
+        "annotations": {
+            "title": "Save Operational Memory Note",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -260,6 +309,13 @@ TOOLS_SPEC: list[dict] = [
     {
         "name": "wiki_forget",
         "description": "Archive/retract an obsolete or mistaken Layer-4 memory note by `note_id`.",
+        "annotations": {
+            "title": "Retract Operational Memory Note",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -271,6 +327,13 @@ TOOLS_SPEC: list[dict] = [
     {
         "name": "wiki_status",
         "description": "Return index generation id, document/section counts, skip statistics, and coverage boundaries.",
+        "annotations": {
+            "title": "Inspect Vault Index Status",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
@@ -666,6 +729,8 @@ class KBService:
             if allowed is not None and name not in allowed:
                 continue
             item = dict(t)
+            if "annotations" in t:
+                item["annotations"] = dict(t["annotations"])
             desc = t["description"]
             if name == "wiki_context" and profile_summary:
                 if is_zh:

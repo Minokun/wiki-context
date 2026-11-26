@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from wiki_context import net  # noqa: E402
 from wiki_context.compiler import build_http_llm_caller, test_llm_connection  # noqa: E402
+from wiki_context.sync import HttpVLMProvider  # noqa: E402
 
 
 def _reset() -> None:
@@ -228,6 +229,93 @@ class TestLLMCallerTLS(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 test_llm_connection(model="m", base_url="https://llm.test/v1", api_key="k")
         self.assertIn("TLS", str(ctx.exception))
+
+
+class TestLLMEndpointAndKeySafety(unittest.TestCase):
+    def test_validate_llm_base_url_enforces_https_and_rejects_bad_urls(self):
+        self.assertEqual(net.validate_llm_base_url("https://api.openai.com/v1/"), "https://api.openai.com/v1")
+        self.assertEqual(net.validate_llm_base_url("http://127.0.0.1:11434/v1"), "http://127.0.0.1:11434/v1")
+        self.assertEqual(net.validate_llm_base_url("http://localhost:8080/v1"), "http://localhost:8080/v1")
+
+        # Non-local plaintext HTTP must be refused by default
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ValueError):
+                net.validate_llm_base_url("http://proxy.example.com/v1")
+
+        # Explicit opt-in allows enterprise LAN plaintext HTTP
+        with mock.patch.dict("os.environ", {"WCTX_ALLOW_INSECURE_HTTP": "1"}, clear=True):
+            self.assertEqual(
+                net.validate_llm_base_url("http://192.168.1.10:8080/v1"),
+                "http://192.168.1.10:8080/v1",
+            )
+
+        # Reject non-HTTP(S) schemes and embedded credentials
+        for bad in (
+            "file:///etc/passwd",
+            "ftp://api.openai.com/v1",
+            "https://user:pass@api.openai.com/v1",
+            "",
+        ):
+            with self.assertRaises(ValueError):
+                net.validate_llm_base_url(bad)
+
+        # Optional WCTX_ALLOWED_LLM_HOSTS allowlist
+        with mock.patch.dict("os.environ", {"WCTX_ALLOWED_LLM_HOSTS": "api.openai.com,api.deepseek.com"}, clear=True):
+            self.assertEqual(net.validate_llm_base_url("https://api.deepseek.com/v1"), "https://api.deepseek.com/v1")
+            self.assertEqual(net.validate_llm_base_url("http://127.0.0.1:8080/v1"), "http://127.0.0.1:8080/v1")
+            with self.assertRaises(ValueError):
+                net.validate_llm_base_url("https://untrusted.example.com/v1")
+
+    def test_vendor_env_keys_do_not_leak_to_foreign_hosts(self):
+        ambient = {
+            "OPENAI_API_KEY": "sk-openai-ambient",
+            "DEEPSEEK_API_KEY": "sk-deepseek-ambient",
+            "ANTHROPIC_API_KEY": "sk-anthropic-ambient",
+        }
+        with mock.patch.dict("os.environ", ambient, clear=True):
+            # Official hosts receive their matching ambient vendor keys
+            self.assertEqual(net.resolve_llm_api_key("https://api.openai.com/v1"), "sk-openai-ambient")
+            self.assertEqual(net.resolve_llm_api_key("https://api.deepseek.com/v1"), "sk-deepseek-ambient")
+            self.assertEqual(
+                net.resolve_llm_api_key("https://api.anthropic.com/v1", protocol="anthropic"),
+                "sk-anthropic-ambient",
+            )
+            # Foreign/custom hosts must NOT receive ambient vendor keys
+            self.assertEqual(net.resolve_llm_api_key("https://custom-proxy.example.com/v1"), "")
+            self.assertEqual(
+                net.resolve_llm_api_key("https://custom-proxy.example.com/v1", protocol="anthropic"),
+                "",
+            )
+            with self.assertRaises(ValueError):
+                build_http_llm_caller(base_url="https://custom-proxy.example.com/v1")
+
+            # VLM provider also refuses to forward ambient OPENAI_API_KEY to foreign hosts
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    **ambient,
+                    "WCTX_VLM_MODEL": "gpt-4o-mini",
+                    "WCTX_VLM_BASE_URL": "https://custom-proxy.example.com/v1",
+                },
+                clear=True,
+            ):
+                self.assertIsNone(HttpVLMProvider.from_env())
+
+            # Explicit WCTX_API_KEY / WCTX_VLM_API_KEY works with custom HTTPS endpoints
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    **ambient,
+                    "WCTX_API_KEY": "sk-wctx-explicit",
+                    "WCTX_VLM_MODEL": "qwen-vl",
+                    "WCTX_VLM_BASE_URL": "https://custom-proxy.example.com/v1",
+                },
+                clear=True,
+            ):
+                self.assertEqual(net.resolve_llm_api_key("https://custom-proxy.example.com/v1"), "sk-wctx-explicit")
+                vlm = HttpVLMProvider.from_env()
+                assert vlm is not None
+                self.assertEqual(vlm.api_key, "sk-wctx-explicit")
 
 
 if __name__ == "__main__":

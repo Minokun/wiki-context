@@ -73,7 +73,7 @@ from .gateway import (
 )
 from .lint import lint_vault
 from .mcp_server import scrub_secrets
-from .net import describe_trust_store
+from .net import describe_trust_store, resolve_llm_api_key
 from .memory import MemoryNote, MemoryStore
 from .ops import run_doctor
 from .scaffold import (
@@ -929,13 +929,7 @@ class ConsoleState:
         skip_csv = cfg["skip_csv"] if isinstance(cfg.get("skip_csv"), bool) else True
         project_rollup = cfg["project_rollup"] if isinstance(cfg.get("project_rollup"), bool) else True
 
-        env_key = (
-            os.environ.get("WCTX_API_KEY")
-            or (os.environ.get("ANTHROPIC_API_KEY") if protocol == "anthropic" else "")
-            or os.environ.get("DEEPSEEK_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or ""
-        ).strip()
+        env_key = resolve_llm_api_key(base_url, protocol=protocol)
 
         eff_key = saved_key or env_key
         key_optional = (provider == "local") or is_local_llm_url(base_url)
